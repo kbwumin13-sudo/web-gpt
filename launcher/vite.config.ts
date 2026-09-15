@@ -11,6 +11,9 @@ export default defineConfig({
     target: "chrome138",
     sourcemap: false,
   },
+  define: {
+    __WEB_GPT_FRONTEND__: JSON.stringify(process.env.VITE_LAUNCHER_FRONTEND === "web-gpt"),
+  },
   server: {
     host: "127.0.0.1",
     port: 4178,

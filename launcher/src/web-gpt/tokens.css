@@ -1,0 +1,53 @@
+:root {
+  --wg-paper: oklch(15% 0.016 252);
+  --wg-paper-2: oklch(18% 0.018 252);
+  --wg-paper-3: oklch(22% 0.02 252);
+  --wg-paper-4: oklch(27% 0.022 252);
+  --wg-ink: oklch(97% 0.008 252);
+  --wg-ink-soft: oklch(78% 0.014 252);
+  --wg-ink-muted: oklch(59% 0.018 252);
+  --wg-ink-faint: oklch(43% 0.016 252);
+  --wg-accent: oklch(78% 0.12 190);
+  --wg-accent-strong: oklch(68% 0.14 190);
+  --wg-accent-wash: oklch(72% 0.09 190 / 0.14);
+  --wg-positive: oklch(75% 0.15 150);
+  --wg-warning: oklch(80% 0.15 78);
+  --wg-danger: oklch(70% 0.17 28);
+  --wg-line: oklch(100% 0 0 / 0.09);
+  --wg-line-soft: oklch(100% 0 0 / 0.055);
+  --wg-focus: oklch(78% 0.12 190 / 0.9);
+  --wg-shadow: oklch(0% 0 0 / 0.3);
+  --wg-shadow-heavy: oklch(0% 0 0 / 0.42);
+  --wg-overlay: oklch(0% 0 0 / 0.42);
+
+  --wg-font-ui: "OpenAI Sans", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", "Yu Gothic UI", "Meiryo", "Segoe UI", sans-serif;
+  --wg-font-display: "Avenir Next", "SF Pro Display", var(--wg-font-ui);
+  --wg-font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+
+  --wg-text-xs: 11px;
+  --wg-text-sm: 12px;
+  --wg-text-md: 14px;
+  --wg-text-lg: 17px;
+  --wg-text-xl: 25px;
+  --wg-text-2xl: 34px;
+  --wg-space-1: 4px;
+  --wg-space-2: 8px;
+  --wg-space-3: 12px;
+  --wg-space-4: 16px;
+  --wg-space-5: 20px;
+  --wg-space-6: 24px;
+  --wg-space-8: 32px;
+  --wg-space-10: 40px;
+  --wg-space-12: 48px;
+  --wg-sidebar: 252px;
+  --wg-titlebar: 46px;
+  --wg-content: 720px;
+  --wg-radius-sm: 7px;
+  --wg-radius-md: 12px;
+  --wg-radius-lg: 18px;
+  --wg-radius-round: 999px;
+  --wg-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --wg-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --wg-duration-fast: 140ms;
+  --wg-duration-panel: 260ms;
+}

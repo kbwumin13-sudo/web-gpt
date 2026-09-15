@@ -14,11 +14,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
-  <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
-  <img src="https://img.shields.io/badge/Linux-x64-fcc624?logo=linux&logoColor=black" alt="Linux x64">
   <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="Free AI with no API fees">
 </p>
 
@@ -69,16 +67,10 @@ Codex 会保留原生任务、上下文生命周期、界面和工具 harness。
 安装或更新桌面启动器。若要更新或修复现有安装，请先退出启动器，然后再次运行同一条命令；它会
 替换应用程序和内置运行时，同时保留 ChatGPT 配置文件和启动器配置。
 
-**macOS 或 Linux**
+**macOS 13+**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
-```
-
-**Windows PowerShell**
-
-```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+curl -fsSL https://github.com/kbwumin13-sudo/web-gpt/releases/latest/download/install-launcher.sh | sh
 ```
 
 然后在应用中完成三项检查：
@@ -102,7 +94,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 **从源码运行**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/kbwumin13-sudo/web-gpt.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```
@@ -130,7 +122,7 @@ bun run app
 > **限制**
 >
 > 有关 **GPT-5.6 Sol Pro** 和 **GPT-6 Astra** 当前的 ChatGPT 消息额度，请参阅
-> [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)。Token 上下文上限取决于
+> [Limits](https://github.com/kbwumin13-sudo/web-gpt/discussions/309)。Token 上下文上限取决于
 > 账户类型和所选 effort。Plus 的 Medium/High 使用实测的 90,000-token 窗口；启用实验性的
 > **3× context** 后最高为 270,000 tokens，并且全程支持原生 Codex compaction。
 
@@ -182,9 +174,8 @@ codex-chatgpt-web runner-mcp
   失败，而不是静默切换模型或传输方式。
 - 浏览器状态是敏感的登录凭据，loopback 监听器也可被同一本地用户运行的进程访问。切勿共享
   启动器 profile，并仅在可信工作站上使用。
-- 发布包目前支持 macOS 13+（arm64/x64）、Windows x64 和 Linux x64。运行时、测试和打包会在
-  CI 中对三种系统进行检查；依赖账户的浏览器与 MCP 流程使用单独的
-  [发布验证](docs/release-validation.md)。
+- 公开发布包目前只提供 macOS 13+（arm64/x64）。内部 CI 仍保留 Windows 和 Linux 兼容性检查；
+  依赖账户的浏览器与 MCP 流程使用单独的[发布验证](docs/release-validation.md)。
 - 构建目前尚未进行平台签名，因此 Gatekeeper 或 SmartScreen 可能会显示警告。安装程序会在安装前
   验证已发布的 SHA-256 清单。
 
@@ -226,11 +217,11 @@ DEV tunnel 就绪，具名聊天按需连接 broker。正式凭据和 `Codex Nat
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=miuuyy%2Fcodex-chatgpt-web&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=kbwumin13-sudo%2Fweb-gpt&type=date&legend=top-left">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&theme=dark&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&theme=dark&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
   </picture>
 </a>
 

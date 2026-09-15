@@ -1,15 +1,15 @@
 {
   "name": "codex-chatgpt-web",
-  "version": "5.0.7-local.22",
+  "version": "5.0.7",
   "private": true,
   "description": "A focused local Responses bridge that runs Codex tasks through a user-authenticated ChatGPT web session.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/miuuyy/codex-chatgpt-web.git"
+    "url": "git+https://github.com/kbwumin13-sudo/web-gpt.git"
   },
-  "homepage": "https://github.com/miuuyy/codex-chatgpt-web#readme",
+  "homepage": "https://github.com/kbwumin13-sudo/web-gpt#readme",
   "bugs": {
-    "url": "https://github.com/miuuyy/codex-chatgpt-web/issues"
+    "url": "https://github.com/kbwumin13-sudo/web-gpt/issues"
   },
   "packageManager": "bun@1.4.0",
   "type": "module",

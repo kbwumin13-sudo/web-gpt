@@ -14,11 +14,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT ライセンス"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 および x64">
-  <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
-  <img src="https://img.shields.io/badge/Linux-x64-fcc624?logo=linux&logoColor=black" alt="Linux x64">
   <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="API 料金なしの AI">
 </p>
 
@@ -75,16 +73,10 @@ Full モードでは、次のコンパクション境界まで、MCP が ChatGPT
 ランチャーを終了して同じコマンドをもう一度実行してください。ChatGPT プロファイルとランチャー設定を保持したまま、
 アプリケーションと内蔵ランタイムが置き換えられます。
 
-**macOS または Linux**
+**macOS 13+**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
-```
-
-**Windows PowerShell**
-
-```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+curl -fsSL https://github.com/kbwumin13-sudo/web-gpt/releases/latest/download/install-launcher.sh | sh
 ```
 
 アプリ内で次の 3 項目を完了します。
@@ -105,7 +97,7 @@ Free/Go アカウントでは Luna のみが表示され、Pro はサインイ�
 **ソースから実行**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/kbwumin13-sudo/web-gpt.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```
@@ -133,7 +125,7 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 > **Limits**
 >
 > **GPT-5.6 Sol Pro** と **GPT-6 Astra** の現在の ChatGPT メッセージ上限については、
-> [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) を参照してください。
+> [Limits](https://github.com/kbwumin13-sudo/web-gpt/discussions/309) を参照してください。
 > Token コンテキスト上限は、アカウント種別と選択した effort によって異なります。Plus の
 > Medium/High は実測 90,000-token ウィンドウを使用し、実験的な **3× context** を有効にすると
 > 最大 270,000 tokens まで拡張されます。いずれの場合もネイティブ Codex compaction に対応します。
@@ -190,8 +182,7 @@ codex-chatgpt-web runner-mcp
   差異が発生した場合、モデルや転送方式を黙って切り替えず、明示的に失敗します。
 - ブラウザー状態は機密性の高いログイン情報です。また、loopback リスナーには同じローカルユーザーで動作する
   プロセスからアクセスできます。ランチャープロファイルを共有せず、信頼できるワークステーションを使用してください。
-- リリースパッケージは現在、macOS 13+（arm64/x64）、Windows x64、Linux x64 を対象としています。
-  ランタイム、テスト、パッケージングは CI で 3 プラットフォームすべてに対して検証されます。
+- 公開リリースパッケージは現在、macOS 13+（arm64/x64）のみを対象としています。内部 CI では Windows と Linux の互換性も検証します。
   アカウント依存のブラウザー／MCP フローには、個別の[リリース検証](docs/release-validation.md)を使用します。
 - ビルドはまだプラットフォーム署名されていないため、Gatekeeper または SmartScreen が警告を表示する場合があります。
   インストーラーは、インストール前に公開 SHA-256 マニフェストを検証します。
@@ -237,11 +228,11 @@ Browser-only チャットは外側のツールを公開しません。Responses 
 
 ## Star の履歴
 
-<a href="https://www.star-history.com/?repos=miuuyy%2Fcodex-chatgpt-web&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=kbwumin13-sudo%2Fweb-gpt&type=date&legend=top-left">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&theme=dark&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
-    <img alt="Star 履歴チャート" src="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&theme=dark&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <img alt="Star 履歴チャート" src="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
   </picture>
 </a>
 

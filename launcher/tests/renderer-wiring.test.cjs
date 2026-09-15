@@ -124,7 +124,7 @@ test("macOS passkey sign-in is additive to the unchanged embedded login action",
   assert.match(appSource, /passkeyWaiting \? continuePasskeyLogin : openPasskeyLogin/);
   assert.match(preloadSource, /openPasskeyLogin:[\s\S]*?launcher:browser-passkey-login/);
   assert.match(preloadSource, /continuePasskeyLogin:[\s\S]*?launcher:browser-passkey-login-continue/);
-  assert.match(electronMain, /launcher:browser-passkey-login[\s\S]*?browserHost\.openPasskeyLogin\(\)/);
+  assert.match(electronMain, /launcher:browser-passkey-login[\s\S]*?(?:browserHost|ensureLauncherBrowserHost\(\)\))\.openPasskeyLogin\(\)/);
   assert.match(electronMain, /loginWithPasskey: \(\) => runtimeHost\.capturePasskeyLogin\(\)/);
   assert.match(browserHostSource, /await this\.waitForAuthenticated\(60_000\)[\s\S]*?runSessionInspection\(false\)/);
 });
@@ -150,7 +150,7 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
     electronMain.indexOf('handle("launcher:browser-interaction-mode"'),
     electronMain.indexOf('handle("launcher:set-preference"'),
   );
-  const modeTransaction = modeSwitchHandler.indexOf("await browserHost.withInteractionModeChange(");
+  const modeTransaction = modeSwitchHandler.indexOf("await host.withInteractionModeChange(");
   const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady)");
   const stateModeCommit = modeSwitchHandler.indexOf("const state = stateStore.update({");
   assert.ok(modeTransaction >= 0 && modeTransaction < runtimeModeCommit);
@@ -161,7 +161,7 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
     electronMain.indexOf('handle("launcher:set-mcp-step"'),
   );
   const runtimeMcpCommit = mcpSetupHandler.indexOf("const runSetup = afterRuntimeReady => setup({");
-  const mcpTransaction = mcpSetupHandler.indexOf("await browserHost.withInteractionModeChange(interactionMode, runSetup)");
+  const mcpTransaction = mcpSetupHandler.indexOf("await (await ensureLauncherBrowserHost()).withInteractionModeChange(interactionMode, runSetup)");
   const stateMcpCommit = mcpSetupHandler.indexOf("const state = stateStore.update({");
   assert.ok(runtimeMcpCommit >= 0 && runtimeMcpCommit < mcpTransaction);
   assert.ok(mcpTransaction < stateMcpCommit);

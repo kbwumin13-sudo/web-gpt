@@ -14,11 +14,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
-  <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
-  <img src="https://img.shields.io/badge/Linux-x64-fcc624?logo=linux&logoColor=black" alt="Linux x64">
   <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="Free AI with no API fees">
 </p>
 
@@ -78,16 +76,10 @@ Install or update the desktop launcher. To update or repair an existing installa
 launcher and run the same command again; it replaces the application and embedded runtime while
 preserving the ChatGPT profile and launcher configuration.
 
-**macOS or Linux**
+**macOS 13+**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
-```
-
-**Windows PowerShell**
-
-```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+curl -fsSL https://github.com/kbwumin13-sudo/web-gpt/releases/latest/download/install-launcher.sh | sh
 ```
 
 Then complete the checks in the app:
@@ -113,7 +105,7 @@ have been idle for the configured grace period.
 **Run from source**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/kbwumin13-sudo/web-gpt.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```
@@ -155,7 +147,7 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 
 > **Limits**
 >
-> See [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) for the current
+> See [Limits](https://github.com/kbwumin13-sudo/web-gpt/discussions/309) for the current
 > ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Astra**. Context limits depend on
 > the account type and selected effort. Plus Medium/High uses a measured 90,000-token window, or
 > up to 270,000 tokens with experimental **3× context** enabled, with native Codex compaction
@@ -208,9 +200,8 @@ codex-chatgpt-web runner-mcp
   drift fails explicitly instead of silently switching model or transport.
 - Browser state is a sensitive login artifact, and the loopback listener is reachable by processes
   running as the same local user. Never share the launcher profile; use a trusted workstation.
-- Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. Runtime,
-  tests, and packaging are gated on all three in CI; account-bound browser and MCP flows use the
-  separate [release validation](docs/release-validation.md).
+- Public release packages currently target macOS 13+ (arm64/x64). Internal CI keeps Windows and Linux
+  compatibility checks; account-bound browser and MCP flows use the separate [release validation](docs/release-validation.md).
 - Builds are not yet platform-signed, so Gatekeeper or SmartScreen may warn. The installers verify
   the published SHA-256 manifest before installation.
 
@@ -256,11 +247,11 @@ reused implicitly. See
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=miuuyy%2Fcodex-chatgpt-web&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=kbwumin13-sudo%2Fweb-gpt&type=date&legend=top-left">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&theme=dark&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=miuuyy/codex-chatgpt-web&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&theme=dark&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kbwumin13-sudo/web-gpt&type=date&legend=top-left&sealed_token=hBVvg_eOjfMFDrfyeo5FPQkIwcvBEmXc6F7ZoOKnfFE4KPCs67o34w4XwVuM-bHGnKR-SKCAN_TSTWrzuqSBNU-RjNZCLT4f-xNs9qcDhciQtemxHKuuFj0N5YNqZIihdaQfakrh2ANhOrvP0K2LmLXX2zbsYyVaYZknyTnlYeIS_mOGvMcO32ZmPCHK">
   </picture>
 </a>
 
