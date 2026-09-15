@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -10,6 +10,8 @@ import {
 } from "../src/adapters/chatgpt-web/turn-execution";
 import { defaultConfig, saveConfig } from "../src/config";
 import { installCodexIntegration } from "../src/codex-integration";
+import { augmentNativeModelCatalog } from "../src/model-catalog";
+import { startGateway, type GatewayServer } from "../src/gateway";
 import { startServer } from "../src/server";
 
 const codex = resolve(process.argv[2] ?? "/Applications/ChatGPT.app/Contents/Resources/codex");
@@ -36,8 +38,29 @@ let adapterStarted = false;
 let adapterAborted = false;
 let browserAborted = false;
 chatGptTurnSessions.clear();
-const config = { ...defaultConfig("browser-only"), port: 0, subagentProtocol: "native" as const };
+const config = {
+  ...defaultConfig("browser-only"),
+  nativeGatewayPort: 0,
+  port: 0,
+  browserHost: "managed-chrome" as const,
+  subagentProtocol: "native" as const,
+};
 config.runtimeCommand = [resolve(process.execPath), resolve("src/cli.ts")];
+const catalogPath = join(root, "augmented-models.json");
+const augmentedCatalog = augmentNativeModelCatalog(nativeCatalog, {
+  ...config,
+  extraHighAvailable: true,
+  proAvailable: true,
+});
+writeFileSync(catalogPath, `${JSON.stringify(augmentedCatalog)}\n`);
+writeFileSync(join(codexHome, "config.toml"), [
+  `model_catalog_json = ${JSON.stringify(catalogPath)}`,
+  "",
+  "[features]",
+  "multi_agent = true",
+  "multi_agent_v2 = false",
+  "",
+].join("\n"));
 const server = startServer(config, {
   fetchUpstream: async request => {
     if (new URL(request.url).pathname.endsWith("/models")) return Response.json(nativeCatalog);
@@ -83,6 +106,16 @@ const server = startServer(config, {
 });
 if (server.port === undefined) throw new Error("Interrupt smoke server did not bind a port");
 config.port = server.port;
+let gateway: GatewayServer | undefined;
+gateway = startGateway(config, {
+  fetchBackend: request => {
+    const incoming = new URL(request.url);
+    const target = `http://${config.host}:${config.port}${incoming.pathname}${incoming.search}`;
+    return fetch(new Request(target, request));
+  },
+});
+if (gateway.port === undefined) throw new Error("Interrupt smoke gateway did not bind a port");
+config.nativeGatewayPort = gateway.port;
 saveConfig(config);
 const journal = installCodexIntegration(config);
 
@@ -184,6 +217,36 @@ class AppServerClient {
   }
 }
 
+async function runInterruptHook(threadId: string, turnId: string): Promise<void> {
+  const child = Bun.spawn([
+    process.execPath,
+    resolve("src/cli.ts"),
+    "hook",
+    "interrupt",
+  ], {
+    cwd: root,
+    env: { ...process.env, CODEX_HOME: codexHome, CODEX_CHATGPT_WEB_HOME: appHome },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (typeof child.stdin === "number" || child.stdin === undefined
+    || !(child.stdout instanceof ReadableStream) || !(child.stderr instanceof ReadableStream)) {
+    throw new Error("Codex Interrupt hook pipes are unavailable");
+  }
+  const payload = JSON.stringify({ hook_event_name: "Interrupt", session_id: threadId, turn_id: turnId });
+  await child.stdin.write(`${payload}\n`);
+  await child.stdin.end();
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`Codex Interrupt hook failed with exit ${exitCode}: ${stderr || stdout}`);
+  }
+}
+
 const client = new AppServerClient();
 let smokeError: unknown;
 try {
@@ -236,13 +299,7 @@ try {
     );
   }
 
-  await client.request("turn/interrupt", { threadId, turnId });
-  await client.waitForNotification(
-    "turn/completed",
-    message => message.params?.threadId === threadId
-      && message.params?.turn?.id === turnId
-      && message.params?.turn?.status === "interrupted",
-  );
+  await runInterruptHook(threadId, turnId);
 
   const releasedDeadline = Date.now() + 5_000;
   do {
@@ -266,6 +323,7 @@ try {
 } finally {
   const { stderr } = await client.close();
   chatGptTurnSessions.clear();
+  await gateway?.shutdown();
   await server.stop(true);
   rmSync(root, { recursive: true, force: true });
   delete process.env.CODEX_HOME;

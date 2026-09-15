@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { unzipSync } from "fflate";
 import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
-import { runCommand, runChecked } from "./process";
+import { macOsLaunchdProxyEnvironment, runCommand, runChecked } from "./process";
 
 export const TUNNEL_VERSION = "0.0.12";
 const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
@@ -218,8 +218,11 @@ function tunnelCommandQuoted(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
-export function mcpCommand(config: AppConfig, platform = process.platform): string {
-  const contract = config.browserInteractionMode === "manual" ? "safe" : "native";
+export function mcpCommandForContract(
+  config: AppConfig,
+  contract: "native" | "safe" | "reader",
+  platform = process.platform,
+): string {
   const command = [
     ...config.runtimeCommand,
     "mcp",
@@ -232,6 +235,14 @@ export function mcpCommand(config: AppConfig, platform = process.platform): stri
     return command.map(tunnelCommandQuoted).join(" ");
   }
   return command.map(shellQuote).join(" ");
+}
+
+export function mcpCommand(config: AppConfig, platform = process.platform): string {
+  return mcpCommandForContract(config, config.browserInteractionMode === "manual" ? "safe" : "native", platform);
+}
+
+export function readerMcpCommand(config: AppConfig, platform = process.platform): string {
+  return mcpCommandForContract(config, "reader", platform);
 }
 
 function tunnel(config: AppConfig): TunnelConfig {
@@ -252,7 +263,10 @@ export function connectTunnel(config: AppConfig): void {
     "--runtime-api-key", `file:${settings.runtimeKeyFile}`,
     "--mcp-command", mcpCommand(config),
     "--json",
-  ], { timeout: TUNNEL_READY_TIMEOUT_MS });
+  ], {
+    timeout: TUNNEL_READY_TIMEOUT_MS,
+    env: macOsLaunchdProxyEnvironment(),
+  });
   const structuredOutput = result.stdout.trim();
   const launchError = structuredOutput
     ? tunnelConnectLaunchError(structuredOutput)
@@ -271,13 +285,26 @@ export function stopTunnel(config: AppConfig): void {
   const result = runCommand(
     settings.binaryPath,
     ["runtimes", "stop", settings.alias, "--json"],
-    { timeout: 15_000 },
+    {
+      timeout: 15_000,
+      env: macOsLaunchdProxyEnvironment(),
+    },
   );
   if (result.status !== 0
+    && !tunnelStopReachedTerminalState(tunnelCommandOutput(result))
     && !/not found|not running|unknown alias|\balias\b[^\r\n]{0,160}\bis not known\b/i.test(
       `${result.stdout}\n${result.stderr}`,
     )) {
     throw new Error(`Failed to stop tunnel runtime: ${result.stderr.trim() || result.stdout.trim()}`);
+  }
+}
+
+export function tunnelStopReachedTerminalState(output: string): boolean {
+  try {
+    const parsed = JSON.parse(output) as Record<string, unknown>;
+    return parsed.process_running === false && parsed.runtime_state === "stopped";
+  } catch {
+    return false;
   }
 }
 
@@ -288,6 +315,92 @@ export interface TunnelRuntimeStatus {
   ready: boolean;
   state?: string;
   detail: string;
+}
+
+function loopbackHealthBaseUrl(value: string): string | undefined {
+  try {
+    const parsed = new URL(value.trim());
+    if (parsed.protocol !== "http:"
+      || !["127.0.0.1", "[::1]", "::1"].includes(parsed.hostname)
+      || !parsed.port) return undefined;
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return undefined;
+  }
+}
+
+export function tunnelHealthFileFromInventory(
+  output: string,
+  alias: string,
+): string | undefined {
+  try {
+    const parsed = JSON.parse(output) as { aliases?: unknown };
+    if (!Array.isArray(parsed.aliases)) return undefined;
+    const entry = parsed.aliases.find(candidate => candidate
+      && typeof candidate === "object"
+      && !Array.isArray(candidate)
+      && (candidate as { alias?: unknown }).alias === alias) as { health_url_file?: unknown } | undefined;
+    return typeof entry?.health_url_file === "string" && isAbsolute(entry.health_url_file)
+      ? entry.health_url_file
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function localTunnelStatus(config: AppConfig): Promise<TunnelRuntimeStatus | undefined> {
+  const settings = tunnel(config);
+  const inventory = runCommand(
+    settings.binaryPath,
+    ["runtimes", "list", "--json"],
+    {
+      timeout: 5_000,
+      env: macOsLaunchdProxyEnvironment(),
+    },
+  );
+  if (inventory.status !== 0) return undefined;
+  const healthFile = tunnelHealthFileFromInventory(inventory.stdout, settings.alias);
+  if (!healthFile) return undefined;
+  try {
+    const metadata = lstatSync(healthFile);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 4_096) {
+      throw new Error("health endpoint file is not a small regular file");
+    }
+    if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+      throw new Error("health endpoint file is owned by another user");
+    }
+    if ((metadata.mode & 0o077) !== 0) throw new Error("health endpoint file permissions are unsafe");
+    const baseUrl = loopbackHealthBaseUrl(readFileSync(healthFile, "utf8"));
+    if (!baseUrl) throw new Error("health endpoint is not an authenticated loopback URL");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_500);
+    try {
+      const [health, ready] = await Promise.all([
+        fetch(`${baseUrl}/healthz`, { signal: controller.signal }),
+        fetch(`${baseUrl}/readyz`, { signal: controller.signal }),
+      ]);
+      const ok = health.ok && ready.ok;
+      return {
+        ok,
+        processRunning: true,
+        healthy: health.ok,
+        ready: ready.ok,
+        state: ok ? "ready" : "degraded",
+        detail: `local healthz=${health.status} readyz=${ready.status}`,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      processRunning: false,
+      healthy: false,
+      ready: false,
+      state: "starting",
+      detail: `local tunnel health is not ready: ${safeTunnelDetail(error instanceof Error ? error.message : error)}`,
+    };
+  }
 }
 
 export function tunnelCommandOutput(result: {
@@ -398,7 +511,10 @@ export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
   const result = runCommand(
     settings.binaryPath,
     ["runtimes", "status", settings.alias, "--json"],
-    { timeout: 10_000 },
+    {
+      timeout: 10_000,
+      env: macOsLaunchdProxyEnvironment(),
+    },
   );
   return parseTunnelStatus(tunnelCommandOutput(result), result.status);
 }
@@ -408,10 +524,13 @@ export async function waitForTunnelReady(
   timeoutMs = TUNNEL_READY_TIMEOUT_MS,
 ): Promise<TunnelRuntimeStatus> {
   const deadline = Date.now() + timeoutMs;
-  let status = tunnelStatus(config);
+  const observe = async (): Promise<TunnelRuntimeStatus> => (
+    await localTunnelStatus(config) ?? tunnelStatus(config)
+  );
+  let status = await observe();
   while (!status.ok && Date.now() < deadline) {
     await new Promise(resolveWait => setTimeout(resolveWait, TUNNEL_STATUS_POLL_INTERVAL_MS));
-    status = tunnelStatus(config);
+    status = await observe();
   }
   return status;
 }

@@ -595,6 +595,8 @@ export class DevChatDriver {
     const inputTokens = estimateChatGptWebInputTokens(parsed, {
       localToolsEnabled: this.config.mode === "full",
       solAvailable: this.config.solAvailable,
+      extraHighAvailable:
+        this.config.extraHighAvailable === true || this.config.proAvailable,
       proAvailable: this.config.proAvailable,
     });
     const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, this.config);

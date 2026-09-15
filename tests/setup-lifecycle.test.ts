@@ -25,6 +25,7 @@ test("launcher setup refreshes account capabilities only when missing or explici
   const verifiedLauncher = {
     browserHost: "launcher",
     solAvailable: true,
+    extraHighAvailable: false,
     proAvailable: false,
   };
 

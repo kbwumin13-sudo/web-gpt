@@ -5,12 +5,21 @@ import { join } from "node:path";
 import {
   browserLoginStateExists,
   captureSystemBrowserLogin,
+  chromeProxyArguments,
   loginToChatGpt,
   loginVerificationMarkerPath,
   sanitizeBrowserLoginStorageState,
 } from "../src/browser-login";
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
 import { defaultConfig } from "../src/config";
+
+test("Chrome login receives a safe proxy endpoint without forwarding credentials", () => {
+  expect(chromeProxyArguments({ HTTPS_PROXY: "http://127.0.0.1:7891" })).toEqual([
+    "--proxy-server=http://127.0.0.1:7891",
+  ]);
+  expect(chromeProxyArguments({ HTTPS_PROXY: "http://user:secret@127.0.0.1:7891" })).toEqual([]);
+  expect(chromeProxyArguments({ HTTPS_PROXY: "not-a-proxy" })).toEqual([]);
+});
 
 test("login starts with normal Chrome and captures state in a headed Keychain-aware context", async () => {
   if (process.platform === "win32") return;

@@ -499,7 +499,7 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
       { headers: new Headers() },
       () => {},
     );
-    expect(fullPrompt).toContain("Earlier answer already visible in ChatGPT.");
+    expect(fullPrompt).not.toContain("Earlier answer already visible in ChatGPT.");
     expect(fullPrompt).toContain("Continue with only this new request.");
     expect(resumePrompt).not.toContain("Earlier answer already visible in ChatGPT.");
     expect(resumePrompt).toContain("Continue with only this new request.");

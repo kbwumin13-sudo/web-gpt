@@ -1,6 +1,7 @@
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
+  chatGptExtraHighAvailable,
 } from "../../chatgpt-web-models";
 
 export const CHATGPT_WEB_MODEL_ID = CHATGPT_WEB_BACKEND_MODEL;
@@ -9,6 +10,7 @@ export const CHATGPT_WEB_LUNA_MODEL_ID = CHATGPT_WEB_LUNA_BACKEND_MODEL;
 export interface ChatGptWebCapabilities {
   localToolsEnabled: boolean;
   solAvailable: boolean;
+  extraHighAvailable?: boolean;
   proAvailable: boolean;
 }
 
@@ -59,7 +61,7 @@ export function resolveChatGptWebModelMode(
     case "high":
       return { modelId, effort, displayLabel: "High", uiEffortIndex: 2, thinkEnabled: false, localTools: capabilities.localToolsEnabled };
     case "xhigh":
-      if (!capabilities.proAvailable) throw new Error("ChatGPT Extra High effort is not available for this account");
+      if (!chatGptExtraHighAvailable(capabilities)) throw new Error("ChatGPT Extra High effort is not available for this account");
       return { modelId, effort, displayLabel: "Extra High", uiEffortIndex: 3, thinkEnabled: false, localTools: capabilities.localToolsEnabled };
     case "max":
       if (!capabilities.proAvailable) throw new Error("ChatGPT Pro effort is not available for this account");

@@ -255,7 +255,8 @@ test("launcher session verification uses the authenticated control channel inste
       authenticated: true,
       temporary: true,
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true,
+      proAvailable: false,
       url: "https://chatgpt.com/?temporary-chat=true",
     }));
   });
@@ -269,7 +270,8 @@ test("launcher session verification uses the authenticated control channel inste
     const path = descriptorFile(`http://127.0.0.1:${address.port}`);
     expect(await inspectLauncherBrowserHost(path, { detectCapabilities: true })).toEqual({
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true,
+      proAvailable: false,
       url: "https://chatgpt.com/?temporary-chat=true",
     });
   } finally {

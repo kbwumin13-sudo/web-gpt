@@ -3,7 +3,7 @@ import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { AppConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
-import { runCommand, runChecked } from "./process";
+import { macOsSystemProxyEnvironment, runCommand, runChecked } from "./process";
 
 const LABEL = "io.github.codex-chatgpt-web.tunnel";
 
@@ -52,6 +52,12 @@ export function tunnelServiceDefinition(config: AppConfig): string {
   const tunnel = settings(config);
   const logDir = join(getConfigDir(), "logs");
   const args = [tunnel.binaryPath, "run", "--profile-dir", tunnel.profileDir, "--profile", tunnel.profileName];
+  const environment = macOsSystemProxyEnvironment();
+  const proxyEnvironment = ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
+    .flatMap(key => typeof environment[key] === "string" && environment[key]!.trim()
+      ? [`    <key>${key}</key>`, `    <string>${xml(environment[key]!)}</string>`]
+      : [])
+    .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -66,6 +72,7 @@ ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
   <dict>
     <key>CODEX_CHATGPT_WEB_HOME</key>
     <string>${xml(getConfigDir())}</string>
+${proxyEnvironment}
   </dict>
   <key>RunAtLoad</key>
   <true/>

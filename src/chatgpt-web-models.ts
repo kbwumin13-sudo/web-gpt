@@ -34,7 +34,9 @@ export const CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT = 32_000;
 export const CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW = CHATGPT_WEB_INSTANT_CONTEXT_WINDOW * 3;
 export const CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT = CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT * 3;
 export const CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW = 90_000;
-export const CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT = 80_000;
+/** Leave room for the next-turn system/runtime envelope before Codex reaches its hard effective window. */
+export const CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT = 72_000;
+export const CHATGPT_WEB_MEDIUM_HIGH_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95;
 export const CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT = 211_256;
 export const CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT = 1_048_572;
 /** Hidden ChatGPT product prompt and Codex Native schema reserve included in usage estimates. */
@@ -79,6 +81,15 @@ export interface ChatGptWebContextLimits {
   autoCompactTokenLimit: number;
 }
 
+export function chatGptExtraHighAvailable(
+  capabilities: Pick<ChatGptWebAccountCapabilities, "extraHighAvailable" | "proAvailable">,
+): boolean {
+  // Older v3 configurations used proAvailable for both Extra High and Pro. Keep that legacy
+  // implication only when the new field is absent; an explicit false must remain authoritative.
+  return capabilities.extraHighAvailable === true
+    || (capabilities.extraHighAvailable === undefined && capabilities.proAvailable === true);
+}
+
 export interface ChatGptWebTransportLimits {
   browserMessageTokenLimit?: number;
   browserComposerCharLimit?: number;
@@ -94,12 +105,14 @@ export function isChatGptWebZeroRiskBackendModel(
 function contextLimits(
   contextWindow: number,
   autoCompactTokenLimit: number,
+  effectiveContextWindowPercent = Math.round((autoCompactTokenLimit / contextWindow) * 100),
 ): ChatGptWebContextLimits {
   return {
     contextWindow,
-    // Codex reports this effective window in its context indicator. Align it with the practical
-    // pre-compaction budget instead of exposing an unreachable underlying model window.
-    effectiveContextWindowPercent: Math.round((autoCompactTokenLimit / contextWindow) * 100),
+    // Codex reports this effective window in its context indicator. Keep an explicit reserve for
+    // the next turn's system/runtime envelope when the browser route compacts below its measured
+    // 90k browser request ceiling.
+    effectiveContextWindowPercent,
     autoCompactTokenLimit,
   };
 }
@@ -145,10 +158,12 @@ export function resolveChatGptWebContextLimits(
       CHATGPT_WEB_INSTANT_CONTEXT_WINDOW,
       CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT,
     );
-  } else if (effort === "medium" || effort === "high") {
+  } else if (effort === "medium" || effort === "high"
+    || (effort === "xhigh" && chatGptExtraHighAvailable(capabilities))) {
     limits = contextLimits(
       CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW,
       CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT,
+      CHATGPT_WEB_MEDIUM_HIGH_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
     );
   } else {
     throw new Error(`ChatGPT Plus context limit is not defined for unavailable effort: ${effort}`);
@@ -172,7 +187,8 @@ export function resolveChatGptWebTransportLimits(
     if (effort === "low") {
       return { browserComposerCharLimit: CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT };
     }
-    if (effort === "medium" || effort === "high") {
+    if (effort === "medium" || effort === "high"
+      || (effort === "xhigh" && chatGptExtraHighAvailable(capabilities))) {
       return { browserComposerCharLimit: CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT };
     }
     throw new Error(`ChatGPT Plus transport limit is not defined for unavailable effort: ${effort}`);
@@ -222,6 +238,7 @@ interface ChatGptWebModelRouteBase {
   description: string;
   codexEffort: ChatGptWebCodexEffort;
   requiresPro: boolean;
+  requiresExtraHigh?: boolean;
 }
 
 export interface ChatGptWebAutomaticModelRoute extends ChatGptWebModelRouteBase {
@@ -241,6 +258,7 @@ export type ChatGptWebModelRoute = ChatGptWebAutomaticModelRoute | ChatGptWebZer
 
 export interface ChatGptWebAccountCapabilities {
   solAvailable: boolean;
+  extraHighAvailable?: boolean;
   proAvailable: boolean;
   experimentalBiggerContext?: boolean;
   browserInteractionMode?: "automatic" | "manual";
@@ -343,7 +361,8 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "xhigh",
     adapterEffort: "xhigh",
-    requiresPro: true,
+    requiresPro: false,
+    requiresExtraHigh: true,
   },
   {
     slug: "chatgpt-web/pro",
@@ -383,9 +402,10 @@ export function availableChatGptWebModelRoutes(
       : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE];
   }
   if (!capabilities.solAvailable) return CHATGPT_WEB_LUNA_MODEL_ROUTES;
-  return capabilities.proAvailable
-    ? CHATGPT_WEB_MODEL_ROUTES
-    : CHATGPT_WEB_MODEL_ROUTES.filter(route => !route.requiresPro);
+  return CHATGPT_WEB_MODEL_ROUTES.filter(route => (
+    (route.requiresPro ? capabilities.proAvailable : true)
+      && (route.requiresExtraHigh ? chatGptExtraHighAvailable(capabilities) : true)
+  ));
 }
 
 export function requireChatGptWebModelRoute(
@@ -419,6 +439,9 @@ export function requireChatGptWebModelRoute(
     throw new Error(`${route.displayName} is not available for this Luna-only account`);
   }
   if (route.requiresPro && !capabilities.proAvailable) {
+    throw new Error(`${route.displayName} is not available for this account`);
+  }
+  if (route.requiresExtraHigh && !chatGptExtraHighAvailable(capabilities)) {
     throw new Error(`${route.displayName} is not available for this account`);
   }
   return route;

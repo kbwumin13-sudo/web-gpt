@@ -32,8 +32,9 @@ function parsed(modelId: string, reasoning = "medium"): CodexParsedRequest {
 }
 
 describe("fixed ChatGPT Web model routes", () => {
-  const plus = { solAvailable: true, proAvailable: false };
-  const pro = { solAvailable: true, proAvailable: true };
+  const plus = { solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const extraHigh = { solAvailable: true, extraHighAvailable: true, proAvailable: false };
+  const pro = { solAvailable: true, extraHighAvailable: true, proAvailable: true };
 
   test("uses unique stable slugs and one explicit adapter effort per model", () => {
     expect(new Set(CHATGPT_WEB_MODEL_ROUTES.map(route => route.slug)).size).toBe(CHATGPT_WEB_MODEL_ROUTES.length);
@@ -53,7 +54,14 @@ describe("fixed ChatGPT Web model routes", () => {
       "chatgpt-web/medium",
       "chatgpt-web/high",
     ]);
-    expect(availableChatGptWebModelRoutes({ solAvailable: true, proAvailable: true }))
+    expect(availableChatGptWebModelRoutes(extraHigh).map(route => route.slug)).toEqual([
+      "chatgpt-web/light",
+      "chatgpt-web/medium",
+      "chatgpt-web/high",
+      "chatgpt-web/extra-high",
+    ]);
+    expect(() => requireChatGptWebModelRoute("chatgpt-web/extra-high", extraHigh)).not.toThrow();
+    expect(availableChatGptWebModelRoutes(pro))
       .toEqual(CHATGPT_WEB_MODEL_ROUTES);
     expect(() => requireChatGptWebModelRoute("chatgpt-web/extra-high", plus))
       .toThrow("Extra High is not available for this account");
@@ -132,13 +140,13 @@ describe("fixed ChatGPT Web model routes", () => {
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toEqual({
       contextWindow: 90_000,
-      effectiveContextWindowPercent: 89,
-      autoCompactTokenLimit: 80_000,
+      effectiveContextWindowPercent: 95,
+      autoCompactTokenLimit: 72_000,
     });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "high", plus)).toEqual({
       contextWindow: 90_000,
-      effectiveContextWindowPercent: 89,
-      autoCompactTokenLimit: 80_000,
+      effectiveContextWindowPercent: 95,
+      autoCompactTokenLimit: 72_000,
     });
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
       browserComposerCharLimit: 211_256,
@@ -148,6 +156,11 @@ describe("fixed ChatGPT Web model routes", () => {
     });
     expect(() => resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", plus))
       .toThrow("unavailable effort");
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", extraHigh)).toEqual({
+      contextWindow: 90_000,
+      effectiveContextWindowPercent: 95,
+      autoCompactTokenLimit: 72_000,
+    });
   });
 
   test("publishes the usable Pro browser window instead of the unreachable underlying model window", () => {

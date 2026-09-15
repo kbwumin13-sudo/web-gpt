@@ -51,6 +51,7 @@ describe("native /models augmentation", () => {
     const nativeSnapshot = structuredClone(native);
     const config = defaultConfig("full");
     config.subagentProtocol = "native";
+    config.extraHighAvailable = true;
     config.proAvailable = true;
     const result = augmentNativeModelCatalog(native, config);
     const models = result.models as Array<Record<string, unknown>>;
@@ -87,6 +88,7 @@ describe("native /models augmentation", () => {
 
   test("publishes Bigger Context limits in the Codex model catalog", () => {
     const config = defaultConfig("full");
+    config.extraHighAvailable = true;
     config.proAvailable = true;
     config.experimentalBiggerContext = true;
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
@@ -98,6 +100,7 @@ describe("native /models augmentation", () => {
   test("keeps native Sol selectable in the bounded Compatibility V1 registry", () => {
     const config = defaultConfig("full");
     config.subagentProtocol = "compatibility-v1";
+    config.extraHighAvailable = true;
     config.proAvailable = true;
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const parent = models.find(model => model.slug === "gpt-5.6-sol")!;
@@ -136,6 +139,7 @@ describe("native /models augmentation", () => {
     const nativeModels = snapshot.models as Array<Record<string, unknown>>;
     const config = defaultConfig("full");
     config.subagentProtocol = "native";
+    config.extraHighAvailable = true;
     config.proAvailable = true;
 
     const models = augmentNativeModelCatalog(native, config).models as Array<Record<string, unknown>>;
@@ -164,7 +168,7 @@ describe("native /models augmentation", () => {
     const models = second.models as Array<Record<string, unknown>>;
     const web = models.filter(model => String(model.slug).startsWith("chatgpt-web/"));
     expect(web.map(model => model.slug)).toEqual(
-      CHATGPT_WEB_MODEL_ROUTES.filter(route => !route.requiresPro).map(route => route.slug),
+      CHATGPT_WEB_MODEL_ROUTES.filter(route => !route.requiresPro && !route.requiresExtraHigh).map(route => route.slug),
     );
     expect(web.every(model => model.tool_mode === null)).toBe(true);
     expect(web.every(model => model.multi_agent_version === "v2")).toBe(true);
@@ -175,8 +179,22 @@ describe("native /models augmentation", () => {
       autoCompactTokenLimit: model.auto_compact_token_limit,
     }))).toEqual([
       { contextWindow: 41_000, effectiveContextWindowPercent: 78, autoCompactTokenLimit: 32_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
-      { contextWindow: 90_000, effectiveContextWindowPercent: 89, autoCompactTokenLimit: 80_000 },
+      { contextWindow: 90_000, effectiveContextWindowPercent: 95, autoCompactTokenLimit: 72_000 },
+      { contextWindow: 90_000, effectiveContextWindowPercent: 95, autoCompactTokenLimit: 72_000 },
+    ]);
+  });
+
+  test("publishes Extra High independently of Pro when the slider has four options", () => {
+    const config = defaultConfig("browser-only");
+    config.extraHighAvailable = true;
+    config.proAvailable = false;
+    const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    const web = models.filter(model => String(model.slug).startsWith("chatgpt-web/"));
+    expect(web.map(model => model.slug)).toEqual([
+      "chatgpt-web/light",
+      "chatgpt-web/medium",
+      "chatgpt-web/high",
+      "chatgpt-web/extra-high",
     ]);
   });
 

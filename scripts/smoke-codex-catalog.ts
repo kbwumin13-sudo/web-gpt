@@ -22,19 +22,26 @@ function runCodex(args: string[], env = process.env): { stdout: string; stderr: 
 
 const bundled = runCodex(["debug", "models", "--bundled"]);
 const sourceCatalog = JSON.parse(bundled.stdout) as { models?: unknown[] };
-if (!sourceCatalog.models?.some(model => model && typeof model === "object" && (model as { slug?: string }).slug === "gpt-5.6-sol")) {
-  throw new Error("Bundled Codex catalog has no gpt-5.6-sol template");
-}
 
 const root = join(tmpdir(), `codex-chatgpt-web-codex-smoke-${process.pid}-${Date.now()}`);
 process.env.CODEX_HOME = join(root, "codex");
 process.env.CODEX_CHATGPT_WEB_HOME = join(root, "app");
 mkdirSync(process.env.CODEX_HOME, { recursive: true });
 const config = defaultConfig("browser-only");
+config.extraHighAvailable = true;
 config.proAvailable = true;
 config.subagentProtocol = "compatibility-v1";
 const catalogPath = join(root, "augmented-models.json");
-writeFileSync(catalogPath, `${JSON.stringify(augmentNativeModelCatalog(sourceCatalog, config))}\n`);
+const augmentedCatalog = augmentNativeModelCatalog(sourceCatalog, config) as {
+  models?: Array<{
+    slug?: string;
+    supported_in_api?: boolean;
+    visibility?: string;
+    priority?: number;
+    multi_agent_version?: string;
+  }>;
+};
+writeFileSync(catalogPath, `${JSON.stringify(augmentedCatalog)}\n`);
 writeFileSync(join(process.env.CODEX_HOME, "config.toml"), [
   `model_catalog_json = ${JSON.stringify(catalogPath)}`,
   "",
@@ -67,11 +74,17 @@ try {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`Codex did not preserve the fixed ChatGPT Web model contract: ${JSON.stringify(actual)}`);
   }
-  const nativeSol = catalog.models?.find(model => model.slug === "gpt-5.6-sol");
+  const expectedSpawnOverrides = (augmentedCatalog.models ?? [])
+    .filter(model => model.supported_in_api === true && model.visibility === "list")
+    .toSorted((left, right) => (left.priority ?? Number.MAX_SAFE_INTEGER) - (right.priority ?? Number.MAX_SAFE_INTEGER))
+    .slice(0, 5)
+    .map(model => model.slug);
+  const nativeParentSlug = expectedSpawnOverrides.find(slug => slug && !slug.startsWith("chatgpt-web/"));
+  const nativeParent = catalog.models?.find(model => model.slug === nativeParentSlug);
   const webPro = catalog.models?.find(model => model.slug === "chatgpt-web/pro");
-  if (nativeSol?.multi_agent_version !== "v1" || webPro?.multi_agent_version !== "v1") {
+  if (!nativeParentSlug || nativeParent?.multi_agent_version !== "v1" || webPro?.multi_agent_version !== "v1") {
     throw new Error(
-      `Codex did not preserve Compatibility V1 catalog metadata: ${JSON.stringify({ nativeSol, webPro })}`,
+      `Codex did not preserve Compatibility V1 catalog metadata: ${JSON.stringify({ nativeParentSlug, nativeParent, webPro })}`,
     );
   }
   const features = runCodex(["features", "list"], isolatedEnv).stdout;
@@ -84,10 +97,6 @@ try {
     .toSorted((left, right) => (left.priority ?? Number.MAX_SAFE_INTEGER) - (right.priority ?? Number.MAX_SAFE_INTEGER))
     .slice(0, 5)
     .map(model => model.slug);
-  const expectedSpawnOverrides = [
-    "gpt-5.6-sol",
-    ...CHATGPT_WEB_MODEL_ROUTES.slice(1).map(route => route.slug),
-  ];
   if (JSON.stringify(spawnOverrides) !== JSON.stringify(expectedSpawnOverrides)) {
     throw new Error(`Codex did not preserve the bounded V1 subagent roster: ${JSON.stringify(spawnOverrides)}`);
   }

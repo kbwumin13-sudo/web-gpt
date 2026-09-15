@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
 import { chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
@@ -10,6 +10,8 @@ import {
 } from "./environment";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
+import { chatGptTurnResultJournal, type TurnResultRecord } from "./turn-result-journal";
+import type { CleanupWarning } from "./compaction-core";
 
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
@@ -268,6 +270,7 @@ export function chatGptCompactionSourceExecutionKey(parsed: CodexParsedRequest):
 }
 
 export class ChatGptTurnSession {
+  readonly sessionId = randomUUID();
   supersededError?: Error;
   readonly createdAt = Date.now();
   private lastTouchedAt = this.createdAt;
@@ -314,6 +317,23 @@ export class ChatGptTurnSession {
       this.settledBrowserOutcome = outcome;
       return outcome;
     });
+  }
+
+  static fromResult(record: TurnResultRecord): ChatGptTurnSession {
+    const text = new ChatGptTextFeed();
+    if (record.events.length === 0) text.push(record.answer);
+    const runtime: ChatGptTurnRuntime = {
+      mode: "read-only",
+      browser: Promise.resolve(record.answer),
+      physicalSettlement: Promise.resolve(),
+      trace: new ChatGptTraceFeed(),
+      text,
+      cancel() {},
+    };
+    const session = new ChatGptTurnSession(runtime);
+    session.setFinalReasoning([...record.reasoning]);
+    session.setFinalEvents([...record.events]);
+    return session;
   }
 
   runExclusive<T>(task: () => Promise<T>): Promise<T> {
@@ -499,6 +519,7 @@ export class ChatGptTurnSessions {
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
   private readonly conversationRetirements = new Map<string, Promise<void>>();
+  private readonly cleanupWarnings: CleanupWarning[] = [];
 
   constructor(
     private readonly ttlMs = 30 * 60_000,
@@ -520,6 +541,12 @@ export class ChatGptTurnSessions {
       if (existing.supersededError) throw existing.supersededError;
       existing.touch();
       return existing;
+    }
+    const replay = chatGptTurnResultJournal.get(key);
+    if (replay) {
+      const session = ChatGptTurnSession.fromResult(replay);
+      this.entries.set(key, session);
+      return session;
     }
     const active = [...this.entries.values()].filter(session => session.isActive()).length;
     if (active >= MAX_CHATGPT_BROWSER_TABS) {
@@ -610,9 +637,9 @@ export class ChatGptTurnSessions {
 
   /**
    * Close the physical retained-chat epoch without discarding a terminal response that won the
-   * compaction race before any compaction instruction reached that response. The detached logical
-   * session remains addressable by its exact Responses execution key, so the post-compaction
-   * native round can consume the already-committed answer instead of opening another browser turn.
+   * compaction race before any compaction instruction reached that response. The terminal result
+   * is recorded independently and a replay-only session can serve the exact Responses execution
+   * key, so the post-compaction native round does not reopen the browser.
    */
   async retireConversationPreservingFinalResponse(
     conversationKey: string,
@@ -623,6 +650,28 @@ export class ChatGptTurnSessions {
     const outcome = preserved.settledOutcome();
     if (!outcome || outcome.type !== "final") {
       throw new Error("Only a settled final ChatGPT response can survive retained-conversation retirement");
+    }
+    const target = this.entries.get(preservedExecutionKey);
+    if (!target || target === preserved) {
+      chatGptTurnResultJournal.record(
+        preservedExecutionKey,
+        outcome.answer,
+        preserved.eventsForFinalReplay(),
+        preserved.reasoningForFinalReplay(),
+      );
+    } else {
+      const targetOutcome = target.settledOutcome();
+      if (targetOutcome?.type === "final" && targetOutcome.answer === outcome.answer) {
+        chatGptTurnResultJournal.record(
+          preservedExecutionKey,
+          targetOutcome.answer,
+          target.eventsForFinalReplay(),
+          target.reasoningForFinalReplay(),
+        );
+      }
+      console.warn(
+        `[chatgpt-web] preserved final replay key conflict; keeping the existing result key=${preservedExecutionKey}`,
+      );
     }
     return this.closeConversationAndWait(conversationKey, {
       session: preserved,
@@ -648,7 +697,17 @@ export class ChatGptTurnSessions {
     }
     const target = preserved ? this.entries.get(preserved.executionKey) : undefined;
     if (target && target !== preserved?.session) {
-      throw new Error("The compacted ChatGPT response execution key is already owned by another session");
+      // The browser epoch can still be retired after a result commit. An occupied replay key is a
+      // cleanup collision, never a reason to turn the committed handoff into a failed response.
+      console.warn(
+        `[chatgpt-web] preserved final replay key is already occupied; retaining existing session key=${preserved!.executionKey}`,
+      );
+      this.cleanupWarnings.push({
+        code: "cleanup_warning",
+        stage: "replay_key",
+        message: "The preserved final replay key was already occupied; the existing result was retained",
+      });
+      return this.closeConversationAndWait(conversationKey);
     }
     this.conversationHeads.delete(conversationKey);
     for (const [key, session] of matches) {
@@ -661,7 +720,13 @@ export class ChatGptTurnSessions {
         throw new Error("ChatGPT retained-conversation ownership changed during retirement");
       }
     }
-    if (preserved) this.entries.set(preserved.executionKey, preserved.session);
+    if (preserved && !chatGptTurnResultJournal.get(preserved.executionKey)) {
+      throw new Error("Preserved ChatGPT final was not recorded in the result journal");
+    }
+    if (preserved && this.entries.get(preserved.executionKey) === undefined) {
+      const replay = chatGptTurnResultJournal.get(preserved.executionKey);
+      if (replay) this.entries.set(preserved.executionKey, ChatGptTurnSession.fromResult(replay));
+    }
     const release = matches.findLast(([, session]) => (
       session.runtime.releaseRetainedConversation !== undefined
     ))?.[1].runtime.releaseRetainedConversation;
@@ -786,6 +851,10 @@ export class ChatGptTurnSessions {
     let active = 0;
     for (const session of this.entries.values()) if (session.isActive()) active += 1;
     return active;
+  }
+
+  takeCleanupWarnings(): CleanupWarning[] {
+    return this.cleanupWarnings.splice(0);
   }
 
   private prune(): void {

@@ -42,6 +42,25 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function sparseV2CompactionContinuation(parsed: CodexParsedRequest): boolean {
+  const body = record(parsed._rawBody);
+  const clientMetadata = record(body?.client_metadata);
+  const rawMetadata = clientMetadata?.["x-codex-turn-metadata"];
+  let metadata: Record<string, unknown> | undefined;
+  if (typeof rawMetadata === "string") {
+    try { metadata = record(JSON.parse(rawMetadata)); }
+    catch { return false; }
+  } else {
+    metadata = record(rawMetadata);
+  }
+  if (typeof metadata?.thread_id !== "string" || typeof metadata.turn_id !== "string") return false;
+  if (metadata.sandbox !== undefined || metadata.sandbox_mode !== undefined || metadata.workspaces !== undefined) {
+    return false;
+  }
+  const input = Array.isArray(body?.input) ? body.input : [];
+  return input.some(value => record(value)?.type === "compaction");
+}
+
 function pathIdentity(value: string): string {
   const normalized = resolve(value);
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -159,7 +178,30 @@ export class ChatGptThreadEnvironmentStore {
       const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
       const historicalMessages = hasCurrentContext && !currentCompaction && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !historicalMessages) throw error;
+      const sameThread = this.get(identity.threadId);
+      if (hasCurrentContext && !currentCompaction && !historicalMessages) {
+        if (sameThread && sparseV2CompactionContinuation(parsed)) {
+          try {
+            const currentClaim = extractChatGptContinuationEnvironmentClaim(parsed);
+            if (sameAuthority(currentClaim, {
+              cwd: sameThread.cwd,
+              roots: sameThread.roots,
+              writableRoots: sameThread.writableRoots,
+              sandboxPolicy: sameThread.sandboxPolicy,
+              tools: parsed.context.tools ?? [],
+            })) {
+              // Post-compaction Codex requests can retain the current environment item while
+              // omitting sandbox/workspace fields from client metadata. The claim may only
+              // refresh authority already proven for this exact thread; it cannot change it.
+              this.set(identity.threadId, currentClaim);
+              return currentClaim;
+            }
+          } catch {
+            // Preserve the original trusted-environment failure below.
+          }
+        }
+        throw error;
+      }
       const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -187,7 +229,6 @@ export class ChatGptThreadEnvironmentStore {
       // Only a current native rollout can supersede an unrecognized historical envelope. Without
       // that proof, do not turn arbitrary history or an invalid update into cached authority.
       if (hasRawChatGptEnvironmentContext(parsed)) throw error;
-      const sameThread = this.get(identity.threadId);
       if (sameThread) return {
         cwd: sameThread.cwd,
         roots: sameThread.roots,

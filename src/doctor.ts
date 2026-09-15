@@ -4,7 +4,7 @@ import { getConfigDir, getConfigPath, loadConfig } from "./config";
 import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
-import { getServiceStatus } from "./service";
+import { getGatewayServiceStatus, getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
@@ -13,6 +13,7 @@ import {
   readLauncherBrowserHostDescriptor,
 } from "./launcher-browser-host";
 import { processRunning } from "./process";
+import { catalogMatchesExpected, expectedWebModelEfforts, expectedWebModels } from "./readiness";
 
 export type CheckStatus = "ok" | "warning" | "error";
 
@@ -65,33 +66,76 @@ async function proxyCheck(config: AppConfig): Promise<DoctorCheck> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2_000);
   try {
-    const response = await fetch(`http://${config.host}:${config.port}/healthz`, { signal: controller.signal });
+    const port = config.browserHost === "launcher" ? config.port : config.nativeGatewayPort;
+    const expectedService = config.browserHost === "launcher" ? "codex-chatgpt-web" : "codex-chatgpt-web-gateway";
+    const response = await fetch(`http://${config.host}:${port}/healthz`, { signal: controller.signal });
     if (!response.ok) return { id: "proxy", status: "error", message: `Responses proxy returned HTTP ${response.status}` };
     const body = await response.json() as Record<string, unknown>;
-    if (body.service !== "codex-chatgpt-web" || body.status !== "ok") {
+    if (body.service !== expectedService || body.status !== "ok") {
       return { id: "proxy", status: "error", message: "The configured port belongs to another service" };
     }
-    if (body.mode !== config.mode) {
+    if (config.browserHost === "launcher" && body.mode !== config.mode) {
       return { id: "proxy", status: "error", message: `Daemon is running in ${String(body.mode)} mode; config requires ${config.mode}` };
     }
     if (body.version !== config.releaseVersion) {
       return { id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` };
     }
-    if (body.accepting_turns !== true) {
+    if (config.browserHost === "launcher" && body.accepting_turns !== true) {
       return {
         id: "proxy",
         status: "error",
         message: "Responses proxy is still drained and is not accepting Codex turns",
       };
     }
-    const ownershipError = launcherOwnershipError(config, body);
+    const ownershipError = config.browserHost === "launcher" ? launcherOwnershipError(config, body) : undefined;
     if (ownershipError) {
       return { id: "proxy", status: "error", message: "Responses proxy ownership could not be verified", detail: ownershipError };
     }
-    return { id: "proxy", status: "ok", message: `Responses proxy is healthy on 127.0.0.1:${config.port}` };
+    return { id: "proxy", status: "ok", message: `Codex route is healthy on 127.0.0.1:${port}` };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return { id: "proxy", status: "error", message: "Responses proxy is not reachable", detail };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function catalogCheck(config: AppConfig): Promise<DoctorCheck> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2_000);
+  try {
+    const port = config.browserHost === "launcher" ? config.port : config.nativeGatewayPort;
+    const expectedService = config.browserHost === "launcher" ? "codex-chatgpt-web" : "codex-chatgpt-web-gateway";
+    const response = await fetch(`http://${config.host}:${port}/healthz`, { signal: controller.signal });
+    if (!response.ok) return { id: "catalog", status: "error", message: "Could not read catalog readiness from the Responses proxy" };
+    const health = await response.json() as Record<string, unknown>;
+    if (health.service !== expectedService) {
+      return { id: "catalog", status: "error", message: "Could not read catalog readiness from the configured Codex route" };
+    }
+    const expected = expectedWebModels(config);
+    const published = Array.isArray(health.published_web_models)
+      ? health.published_web_models.filter((value): value is string => typeof value === "string")
+      : [];
+    const expectedEfforts = expectedWebModelEfforts(config);
+    const publishedEfforts = health.published_web_model_efforts && typeof health.published_web_model_efforts === "object"
+      ? health.published_web_model_efforts as Record<string, string>
+      : {};
+    if (!catalogMatchesExpected({
+      expectedWebModels: expected,
+      publishedWebModels: published,
+      expectedWebModelEfforts: expectedEfforts,
+      publishedWebModelEfforts: publishedEfforts,
+    })) {
+      return {
+        id: "catalog",
+        status: "error",
+        message: "Codex has not completed a real model-catalog request containing the complete Web model contract",
+        detail: `expected=${JSON.stringify(expected)} published=${JSON.stringify(published)}`,
+      };
+    }
+    return { id: "catalog", status: "ok", message: "Codex model catalog contains the complete Web model contract" };
+  } catch (error) {
+    return { id: "catalog", status: "error", message: "Model catalog readiness is unavailable", detail: error instanceof Error ? error.message : String(error) };
   } finally {
     clearTimeout(timeout);
   }
@@ -158,6 +202,7 @@ export async function runDoctor(): Promise<DoctorReport> {
   }
 
   const service = getServiceStatus();
+  const gatewayService = getGatewayServiceStatus();
   if (config.browserHost === "launcher") {
     checks.push(service.installed || service.loaded
       ? {
@@ -168,13 +213,21 @@ export async function runDoctor(): Promise<DoctorReport> {
         }
       : { id: "service", status: "ok", message: "Launcher owns the background runtime" });
   } else if (!service.supported) {
-    checks.push({ id: "service", status: "warning", message: "Managed service is unavailable on this OS; keep `serve` running manually" });
+    checks.push({ id: "service", status: "warning", message: "Managed service is unavailable on this OS; keep `backend` running manually" });
   } else if (!service.installed || !service.loaded) {
     checks.push({ id: "service", status: "error", message: "macOS background service is not installed and loaded" });
   } else {
     checks.push({ id: "service", status: "ok", message: "macOS background service is loaded" });
   }
+  if (config.browserHost === "launcher" || !gatewayService.supported) {
+    checks.push({ id: "gateway-service", status: "warning", message: "Native gateway service is unavailable for this compatibility configuration" });
+  } else if (!gatewayService.installed || !gatewayService.loaded) {
+    checks.push({ id: "gateway-service", status: "error", message: "macOS native gateway service is not installed and loaded" });
+  } else {
+    checks.push({ id: "gateway-service", status: "ok", message: "macOS native gateway service is loaded" });
+  }
   checks.push(await proxyCheck(config));
+  checks.push(await catalogCheck(config));
 
   if (config.mode === "full") {
     const settings = config.tunnel!;
@@ -201,9 +254,14 @@ export async function runDoctor(): Promise<DoctorReport> {
           }
         : { id: "tunnel-service", status: "ok", message: "Launcher owns the tunnel runtime" });
     } else {
-      checks.push(tunnelService.installed && tunnelService.loaded && tunnelService.running
-        ? { id: "tunnel-service", status: "ok", message: "macOS tunnel service is installed, loaded, and running" }
-        : { id: "tunnel-service", status: "error", message: "macOS tunnel service is not fully running", detail: JSON.stringify(tunnelService) });
+      checks.push(tunnelService.installed || tunnelService.loaded
+        ? {
+            id: "tunnel-service",
+            status: "warning",
+            message: "A legacy macOS tunnel service still exists; rerun setup to move ownership to Backend Host",
+            detail: JSON.stringify(tunnelService),
+          }
+        : { id: "tunnel-service", status: "ok", message: "Backend Host owns the tunnel runtime" });
     }
     const runtime = tunnelStatus(config);
     checks.push(runtime.ok

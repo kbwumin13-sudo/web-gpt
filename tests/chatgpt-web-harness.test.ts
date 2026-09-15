@@ -342,7 +342,7 @@ describe("ChatGPT outer-native harness v4", () => {
       browserStarts += 1;
       expect(turn.capabilities.localToolsEnabled).toBe(true);
       const prepared = await turn.prepare();
-      expect(prepared.text).toContain("<codex_context_json>");
+      expect(prepared.text).toContain("<codex_bootstrap_context_json>");
       expect(prepared.text).toMatch(/turn_token turn_[A-Za-z0-9_-]+/);
       const answer = "Canonical metadata accepted";
       turn.onTextDelta(answer);
@@ -447,6 +447,10 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(preparedPrompts[1]).toContain("Continue in the same repository");
       expect(preparedPrompts[1]).not.toContain("First retained answer");
       expect(preparedPrompts[1]).not.toContain(environmentXml);
+      expect(preparedPrompts[0]).toContain("<codex_bootstrap_context_json>");
+      expect(preparedPrompts[1]).toContain("<codex_resume_context_json>");
+      expect(preparedPrompts[1]).not.toContain("<codex_context_json>");
+      expect(preparedPrompts[1].length).toBeLessThan(preparedPrompts[0].length * 0.7);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       chatGptTurnSessions.clear();
@@ -1159,6 +1163,179 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("a raw browser failure after submission becomes a structured terminal event", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-submitted-error-event-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-submitted-error-event-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
+      throw new Error("ChatGPT stopped responding after the task started");
+    };
+
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        rawWireRequest(environmentXml),
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_submitted_turn_failed",
+        status: 502,
+        retryable: false,
+        message: "ChatGPT stopped responding after the task started. Check the ChatGPT tab before continuing.",
+      });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a submitted retained turn can retry by resuming the same conversation", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-retained-retry-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-retained-retry-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "retained-retry-launcher.json"),
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    let firstPrompt = "";
+    let retryPrompt = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      const prepared = browserStarts === 1
+        ? await turn.prepare()
+        : await turn.prepareResume!();
+      if (browserStarts === 1) firstPrompt = prepared.text;
+      else retryPrompt = prepared.text;
+      prepared.release();
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
+      if (browserStarts === 1) throw new Error("ChatGPT response observation temporarily stopped");
+      const answer = "Recovered from the retained ChatGPT conversation";
+      turn.onTextDelta(answer);
+      return answer;
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      expect(firstEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_submitted_turn_failed",
+        retryable: true,
+      });
+
+      const recovered: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => recovered.push(event),
+      );
+      expect(browserStarts).toBe(2);
+      expect(retryPrompt).toContain("<codex_resume_context_json>");
+      expect(retryPrompt).not.toContain(environmentXml);
+      expect(retryPrompt.length).toBeLessThan(firstPrompt.length * 0.7);
+      expect(recovered.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a retained conversation that keeps failing is abandoned for a fresh bootstrap", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-retained-rebuild-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-retained-rebuild-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "retained-rebuild-launcher.json"),
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      const prepared = turn.prepareResume ? await turn.prepareResume() : await turn.prepare();
+      prepared.release();
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
+      // The conversation keeps erroring: resuming it again can never converge.
+      if (browserStarts <= 2) throw new Error("ChatGPT response observation temporarily stopped");
+      const answer = "Recovered from a rebuilt ChatGPT conversation";
+      turn.onTextDelta(answer);
+      return answer;
+    };
+    const rebuildLogs: string[] = [];
+    const originalInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      const line = args.map(String).join(" ");
+      if (line.includes("retained_conversation rebuild")) rebuildLogs.push(line);
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(
+          request,
+          { headers: new Headers() },
+          event => events.push(event),
+        );
+        expect(events.at(-1)).toMatchObject({ code: "chatgpt_submitted_turn_failed", retryable: true });
+        // One transient failure still reconnects, so the first retry must not rebuild.
+        expect(rebuildLogs).toEqual([]);
+      }
+
+      const rebuilt: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => rebuilt.push(event),
+      );
+
+      expect(browserStarts).toBe(3);
+      expect(rebuildLogs).toHaveLength(1);
+      expect(rebuildLogs[0]).toContain("after 2 failed attempts");
+      // An unreachable Launcher costs the rebuild but must not fail the turn.
+      expect(rebuildLogs[0]).toContain("skipped");
+      expect(rebuilt.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      console.info = originalInfo;
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
   test("an unclassified browser failure retires its session before the next native retry", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-error-retry-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
@@ -1508,6 +1685,49 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(serialized).toContain("current contract");
     expect(serialized).toContain("current catalog");
     expect(serialized).toContain("current request");
+  });
+
+  test("drops superseded generated runtime context while preserving task history", () => {
+    const history = [
+      { role: "developer" as const, content: "<app-context>old app</app-context>", timestamp: 1 },
+      { role: "developer" as const, content: "<!-- 以下行为规则来自唯一权威源: old -->", timestamp: 2 },
+      { role: "developer" as const, content: "[Execution environment]\nold", timestamp: 3 },
+      { role: "developer" as const, content: "<openviking-context source=\"session-start\">old</openviking-context>", timestamp: 4 },
+      { role: "developer" as const, content: "<openviking-context source=\"auto-recall\">old</openviking-context>", timestamp: 5 },
+      { role: "developer" as const, content: "<skills_instructions>old skills</skills_instructions>", timestamp: 6 },
+      { role: "developer" as const, content: "<model_switch>old model</model_switch>", timestamp: 7 },
+      { role: "user" as const, content: "historical task", timestamp: 8 },
+      { role: "assistant" as const, content: [{ type: "text" as const, text: "historical result" }], timestamp: 9 },
+      { role: "developer" as const, content: "<app-context>current app</app-context>", timestamp: 10 },
+      { role: "developer" as const, content: "<!-- 以下行为规则来自唯一权威源: current -->", timestamp: 11 },
+      { role: "developer" as const, content: "[Execution environment]\ncurrent", timestamp: 12 },
+      { role: "developer" as const, content: "<openviking-context source=\"session-start\">current</openviking-context>", timestamp: 13 },
+      { role: "developer" as const, content: "<openviking-context source=\"auto-recall\">current</openviking-context>", timestamp: 14 },
+      { role: "developer" as const, content: "<skills_instructions>current skills</skills_instructions>", timestamp: 15 },
+      { role: "developer" as const, content: "<model_switch>current model</model_switch>", timestamp: 16 },
+      { role: "developer" as const, content: "unrelated developer instruction", timestamp: 17 },
+      { role: "user" as const, content: "current task", timestamp: 18 },
+    ];
+
+    const normalized = withoutSupersededModelSwitchContracts(history);
+    const serialized = JSON.stringify(normalized);
+    const developerContents = normalized.flatMap(message =>
+      message.role === "developer" && typeof message.content === "string" ? [message.content] : []
+    );
+    expect(serialized).not.toContain("old app");
+    expect(serialized).not.toContain("old skills");
+    expect(serialized).not.toContain("old model");
+    expect(developerContents).not.toContain("<openviking-context source=\"session-start\">old</openviking-context>");
+    expect(developerContents).not.toContain("<openviking-context source=\"auto-recall\">old</openviking-context>");
+    expect(serialized).toContain("current app");
+    expect(serialized).toContain("current skills");
+    expect(serialized).toContain("current model");
+    expect(developerContents).toContain("<openviking-context source=\"session-start\">current</openviking-context>");
+    expect(developerContents).toContain("<openviking-context source=\"auto-recall\">current</openviking-context>");
+    expect(serialized).toContain("historical task");
+    expect(serialized).toContain("historical result");
+    expect(serialized).toContain("unrelated developer instruction");
+    expect(serialized).toContain("current task");
   });
 
   test("keeps a large context inline and uploads only its referenced images", () => {
@@ -2768,6 +2988,21 @@ describe("ChatGPT outer-native harness v4", () => {
         next_offset: null,
       });
 
+      const openVikingInventory = await inventoryThroughGateway(
+        "openviking",
+        false,
+        ["mcp__openviking_memory__search", "web__run"],
+      );
+      expect(openVikingInventory.structuredContent).toMatchObject({
+        tools: [{
+          wire_name: "mcp__openviking_memory__search",
+          name: "mcp__openviking_memory__search",
+          kind: "gateway",
+        }],
+        total: 1,
+        next_offset: null,
+      });
+
       const rawGatewayInventory = await inventoryThroughGateway(
         "Run nested Codex tools",
         false,
@@ -2960,6 +3195,77 @@ describe("ChatGPT outer-native harness v4", () => {
         }
       }
 
+    } finally {
+      await client.close().catch(() => {});
+      broker.revoke(token);
+      await broker.close();
+    }
+  }, 30_000);
+
+  test("exposes canonical Codex history through Runtime-owned context retrieval", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-context-retrieval-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    environment.tools = [];
+    const token = await broker.register(environment, 60_000, "context-retrieval", {
+      systemPrompt: ["Canonical system instruction"],
+      messages: [
+        { role: "user", content: "Historical task with turn_old_123456789012345678901234", timestamp: 1 },
+        { role: "assistant", content: [{ type: "text", text: "Historical answer" }], timestamp: 2 },
+        { role: "user", content: "Current task", timestamp: 3 },
+      ],
+    });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
+      cwd: process.cwd(),
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "codex-chatgpt-web-context-retrieval-test", version: "1.0.0" });
+    const call = (name: string, arguments_: Record<string, unknown>) => client.callTool({ name, arguments: arguments_ });
+
+    try {
+      await client.connect(transport);
+      const inventory = await call("codex_tool_inventory", {
+        turn_token: token,
+        query: "codex_context",
+        include_schema: false,
+      });
+      expect(inventory.structuredContent).toMatchObject({
+        total: 2,
+        tools: [
+          { wire_name: "codex_context_search", kind: "runtime" },
+          { wire_name: "codex_context_read", kind: "runtime" },
+        ],
+      });
+
+      const search = await call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "codex_context_search",
+        arguments: { query: "historical", limit: 10 },
+      });
+      expect(search.structuredContent).toMatchObject({
+        total: 2,
+        messages: [
+          { message_index: 0, role: "user" },
+          { message_index: 1, role: "assistant" },
+        ],
+      });
+      expect(JSON.stringify(search)).not.toContain("turn_old_123456789012345678901234");
+
+      const read = await call("codex_tool_call", {
+        turn_token: token,
+        wire_name: "codex_context_read",
+        arguments: { message_indices: [0, 1], include_system: true },
+      });
+      expect(read.structuredContent).toMatchObject({
+        system: ["Canonical system instruction"],
+        messages: [
+          { message_index: 0, message: { role: "user" } },
+          { message_index: 1, message: { role: "assistant" } },
+        ],
+      });
+      expect(JSON.stringify(read)).not.toContain("turn_old_123456789012345678901234");
     } finally {
       await client.close().catch(() => {});
       broker.revoke(token);

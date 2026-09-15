@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { namespacedToolName, type CodexTool } from "../../types";
+import { memoryCapabilityIsReachable, memoryWireNameIsReachable } from "./memory-capabilities";
 import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
@@ -12,6 +13,7 @@ interface ClaimedTurn {
   bindingId: string;
   activityId: string;
   environment: ChatGptTurnEnvironment & { expiresAt?: number };
+  contextAvailable?: boolean;
 }
 
 export type ChatGptMcpContract = "native" | "safe";
@@ -33,8 +35,26 @@ const GATEWAY_AGENT_WAIT_TOOL_NAMES = new Set([
   "collaboration__wait_agent",
 ]);
 
+const WEB_AGENT_RUNNER_TOOL_NAMES = new Set([
+  "web_agent_run",
+  "web_agent_runner__web_agent_run",
+  "mcp__web_agent_runner__web_agent_run",
+]);
+
 const turnTokenSchema = z.string().min(20).max(256);
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
+const CODEX_CONTEXT_SEARCH_WIRE_NAME = "codex_context_search";
+const CODEX_CONTEXT_READ_WIRE_NAME = "codex_context_read";
+const contextSearchArgumentsSchema = z.object({
+  query: z.string().max(500).optional(),
+  offset: z.number().int().min(0).max(100_000).default(0),
+  limit: z.number().int().min(1).max(20).default(10),
+});
+const contextReadArgumentsSchema = z.object({
+  message_indices: z.array(z.number().int().min(0).max(50_000)).min(1).max(20),
+  include_system: z.boolean().default(false),
+  max_chars: z.number().int().min(1_000).max(500_000).default(100_000),
+});
 // Match Codex's default wait interval while returning before the MCP invocation deadline.
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 30_000;
 const AGENT_WAIT_TRANSPORT_RULE = `ChatGPT Web transport rule: wait for exactly ${CHATGPT_WEB_AGENT_WAIT_POLL_MS / 1_000} seconds per call, matching the Codex default, then release the MCP channel so spawned Web agents can use their own tools. A wait timeout is not task completion; check agent progress and wait again if needed. Keep the native tool's declared arguments.`;
@@ -114,6 +134,27 @@ function wireName(tool: CodexTool): string {
   return namespacedToolName(tool.namespace, tool.name);
 }
 
+export function isWebAgentRunnerToolName(name: string): boolean {
+  return WEB_AGENT_RUNNER_TOOL_NAMES.has(name)
+    || name.endsWith("__web_agent_run")
+    || name === "web_agent_run";
+}
+
+export function isSpawnAgentToolName(name: string): boolean {
+  return name === "spawn_agent" || name.endsWith("__spawn_agent");
+}
+
+export function assertNativeSpawnAgentArguments(name: string, args: Record<string, unknown>): void {
+  if (!isSpawnAgentToolName(name)) return;
+  const model = args.model;
+  if (typeof model !== "string" || !model.trim()) {
+    throw new Error("ChatGPT Web spawn_agent requires an explicit native model");
+  }
+  if (model.startsWith("chatgpt-web/")) {
+    throw new Error("ChatGPT Web cannot spawn Web subagents; choose an explicit native Codex model");
+  }
+}
+
 function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
 }
@@ -123,11 +164,17 @@ function gatewayToolNameIsValid(name: string): boolean {
 }
 
 function safeVisibleTools(environment: ChatGptTurnEnvironment, contract: ChatGptMcpContract): CodexTool[] {
-  if (contract === "native") return environment.tools;
+  // Memory writes stay with the Runtime under every contract, so this filter precedes the
+  // contract-specific ones rather than being one of them.
+  const environmentTools = environment.tools.filter(tool => (
+    memoryCapabilityIsReachable(tool)
+    && !isWebAgentRunnerToolName(wireName(tool))
+  ));
+  if (contract === "native") return environmentTools;
   const bridgeNamespaces = new Set(environment.tools
     .filter(tool => tool.namespace && BRIDGE_TOOL_NAMES.has(tool.name))
     .map(tool => tool.namespace!));
-  return environment.tools.filter(tool => (
+  return environmentTools.filter(tool => (
     wireName(tool) !== CODEX_COMPACTION_CONTROL_WIRE_NAME
     && !BRIDGE_TOOL_NAMES.has(tool.name)
     // Zero Risk does not expose model-authored JavaScript. Automatic Full mode keeps the native
@@ -154,6 +201,32 @@ function browserToolDescription(tool: CodexTool): string {
 }
 
 function browserToolParameters(tool: CodexTool): Record<string, unknown> {
+  if (isSpawnAgentToolName(tool.name)) {
+    const parameters = structuredClone(tool.parameters);
+    const properties = parameters.properties && typeof parameters.properties === "object" && !Array.isArray(parameters.properties)
+      ? parameters.properties as Record<string, unknown>
+      : {};
+    const model = properties.model && typeof properties.model === "object" && !Array.isArray(properties.model)
+      ? properties.model as Record<string, unknown>
+      : {};
+    const required = Array.isArray(parameters.required)
+      ? parameters.required.filter((value): value is string => typeof value === "string")
+      : [];
+    return {
+      ...parameters,
+      description: `${typeof parameters.description === "string" ? parameters.description : ""} Explicit native Codex model is required; chatgpt-web/* is rejected to prevent Web-to-Web recursion.`,
+      properties: {
+        ...properties,
+        model: {
+          ...model,
+          type: "string",
+          pattern: "^(?!chatgpt-web/).+",
+          description: "Required native Codex model. Web model slugs are unavailable for subagents.",
+        },
+      },
+      required: [...new Set([...required, "model"])],
+    };
+  }
   if (!isAgentWaitTool(tool)) return tool.parameters;
   const parameters = structuredClone(tool.parameters);
   const properties = parameters.properties && typeof parameters.properties === "object" && !Array.isArray(parameters.properties)
@@ -182,6 +255,48 @@ function browserToolParameters(tool: CodexTool): Record<string, unknown> {
     },
     required: [...new Set([...required, "timeout_ms"])],
   };
+}
+
+function runtimeContextToolDescriptors(includeSchema: boolean): Array<Record<string, unknown>> {
+  return [
+    {
+      wire_name: CODEX_CONTEXT_SEARCH_WIRE_NAME,
+      name: CODEX_CONTEXT_SEARCH_WIRE_NAME,
+      namespace: null,
+      description: "Search the canonical Codex message history held by the Runtime. Results return message_index values for codex_context_read.",
+      kind: "runtime",
+      ...(includeSchema ? {
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", maxLength: 500 },
+            offset: { type: "integer", minimum: 0, maximum: 100_000, default: 0 },
+            limit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+          },
+          additionalProperties: false,
+        },
+      } : {}),
+    },
+    {
+      wire_name: CODEX_CONTEXT_READ_WIRE_NAME,
+      name: CODEX_CONTEXT_READ_WIRE_NAME,
+      namespace: null,
+      description: "Read exact canonical Codex messages by message_index from the Runtime, optionally including the canonical system prompt.",
+      kind: "runtime",
+      ...(includeSchema ? {
+        parameters: {
+          type: "object",
+          properties: {
+            message_indices: { type: "array", minItems: 1, maxItems: 20, items: { type: "integer", minimum: 0 } },
+            include_system: { type: "boolean", default: false },
+            max_chars: { type: "integer", minimum: 1_000, maximum: 500_000, default: 100_000 },
+          },
+          required: ["message_indices"],
+          additionalProperties: false,
+        },
+      } : {}),
+    },
+  ];
 }
 
 function assertBrowserToolArguments(tool: CodexTool, args: Record<string, unknown>): void {
@@ -247,6 +362,9 @@ interface GatewayToolCatalogPage {
 }
 
 function gatewayToolDescription(tool: GatewayToolDescriptor): string {
+  if (isSpawnAgentToolName(tool.name)) {
+    return `${tool.description}\n\nChatGPT Web policy: spawn_agent requires an explicit native Codex model; chatgpt-web/* is rejected.`;
+  }
   if (!isGatewayAgentWaitTool(tool.name)) return tool.description;
   return `${tool.description}\n\n${AGENT_WAIT_TRANSPORT_RULE}`;
 }
@@ -339,7 +457,7 @@ function execGatewayResultProgram(invocation: string[]): string {
   ].join("\n");
 }
 
-function execGatewayProgram(
+export function execGatewayProgram(
   nestedToolName: string,
   freeform: boolean,
   payload: { arguments?: Record<string, unknown>; input?: string },
@@ -358,6 +476,7 @@ function execGatewayProgram(
     `const nestedToolName = ${JSON.stringify(gatewayName)};`,
     `const excludedNames = new Set(${JSON.stringify(excludedNames)});`,
     "if (excludedNames.has(nestedToolName)) throw new Error(\"Native nested tool is not callable through the structured gateway\");",
+    `if (${JSON.stringify(isSpawnAgentToolName(nestedToolName))}) { const spawnArguments = ${freeform ? "{}" : JSON.stringify(nestedInput)}; const model = spawnArguments.model; if (typeof model !== "string" || !model.trim()) throw new Error("ChatGPT Web spawn_agent requires an explicit native model"); if (model.startsWith("chatgpt-web/")) throw new Error("ChatGPT Web cannot spawn Web subagents; choose an explicit native Codex model"); }`,
     "if (!ALL_TOOLS.some(tool => tool?.name === nestedToolName)) throw new Error(\"Native nested tool is not listed in this turn\");",
     "const nestedTool = tools[nestedToolName];",
     "if (typeof nestedTool !== \"function\") throw new Error(\"Native nested tool is listed but unavailable\");",
@@ -377,6 +496,7 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     "})((() => {",
     "  const source = tools;",
     `  const waitNames = new Set(${JSON.stringify([...GATEWAY_AGENT_WAIT_TOOL_NAMES])});`,
+    "  const spawnNames = new Set([\"spawn_agent\", \"collaboration__spawn_agent\", \"multi_agent_v1__spawn_agent\", \"multi_agent_v2__spawn_agent\"]);",
     `  const blockedExecName = ${JSON.stringify(blockedExecName)};`,
     `  const pollMs = ${CHATGPT_WEB_AGENT_WAIT_POLL_MS};`,
     "  const registryNames = new Set(Reflect.ownKeys(source));",
@@ -390,6 +510,8 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     "    let exposed = value;",
     "    if (typeof value === \"function\" && name === blockedExecName) {",
     "      exposed = () => { throw new Error(\"Nested raw exec is unavailable inside ChatGPT Web exec\"); };",
+    "    } else if (typeof value === \"function\" && typeof name === \"string\" && spawnNames.has(name)) {",
+    "      exposed = args => { const model = args && typeof args === \"object\" && !Array.isArray(args) ? args.model : undefined; if (typeof model !== \"string\" || !model.trim()) throw new Error(\"ChatGPT Web spawn_agent requires an explicit native model\"); if (model.startsWith(\"chatgpt-web/\")) throw new Error(\"ChatGPT Web cannot spawn Web subagents; choose an explicit native Codex model\"); return Reflect.apply(value, source, [args]); };",
     "    } else if (typeof value === \"function\" && typeof name === \"string\" && waitNames.has(name)) {",
     "      exposed = args => {",
     "        if (!args || typeof args !== \"object\" || Array.isArray(args) || args.timeout_ms !== pollMs) {",
@@ -775,7 +897,14 @@ export async function runChatGptMcpServer(options: {
           tool.namespace ?? "",
           tool.description,
         ].join("\n").toLowerCase().includes(needle));
-        const directPage = directMatches.slice(offset, offset + limit).map(tool => ({
+        const runtimeMatches = claimed.contextAvailable
+          ? runtimeContextToolDescriptors(include_schema).filter(tool => !needle || [
+            tool.wire_name,
+            tool.name,
+            tool.description,
+          ].join("\n").toLowerCase().includes(needle))
+          : [];
+        const directDescriptors = directMatches.map(tool => ({
           wire_name: wireName(tool),
           name: tool.name,
           namespace: tool.namespace ?? null,
@@ -783,12 +912,14 @@ export async function runChatGptMcpServer(options: {
           kind: tool.freeform ? "freeform" : tool.toolSearch ? "tool_search" : "function",
           ...(include_schema ? { parameters: browserToolParameters(tool) } : {}),
         }));
+        const allDirect = [...directDescriptors, ...runtimeMatches];
+        const directPage = allDirect.slice(offset, offset + limit);
         let nestedTotal = 0;
         let nestedPage: Array<Record<string, unknown>> = [];
         const gateway = execGateway(bound);
         if (gateway) {
           const excludedGatewayNames = bound.tools.map(wireName);
-          const nestedOffset = Math.max(0, offset - directMatches.length);
+          const nestedOffset = Math.max(0, offset - allDirect.length);
           const nestedLimit = Math.max(0, limit - directPage.length);
           const response = await invoke(claimed.bindingId, bound, gateway, {
             input: gatewayToolCatalogProgram({
@@ -819,7 +950,7 @@ export async function runChatGptMcpServer(options: {
           }));
         }
         const page = [...directPage, ...nestedPage];
-        const total = directMatches.length + nestedTotal;
+        const total = allDirect.length + nestedTotal;
         return result({
           tools: page,
           total,
@@ -867,12 +998,35 @@ export async function runChatGptMcpServer(options: {
       }
       return withClaimedTurn("codex_tool_call", requestId, extra, async claimed => {
         const bound = claimed.environment;
+        if (wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME || wire_name === CODEX_CONTEXT_READ_WIRE_NAME) {
+          if (input !== undefined) {
+            throw new Error(`${wire_name} accepts structured arguments, not freeform input`);
+          }
+          if (claimed.contextAvailable !== true) {
+            throw new Error("Codex context retrieval is unavailable for this turn");
+          }
+          const contextArguments = wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME
+            ? contextSearchArgumentsSchema.parse(args ?? {})
+            : contextReadArgumentsSchema.parse(args ?? {});
+          const response = await callTurnBroker<Record<string, unknown>>(options.brokerSocketPath, {
+            method: "context_read",
+            token: requestId,
+            contextAction: wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME ? "search" : "read",
+            arguments: contextArguments,
+          }, chatGptMcpInvocationTimeout(bound), extra.signal);
+          return result(response);
+        }
         const tool = safeVisibleTools(bound, contract)
           .find(candidate => wireName(candidate) === wire_name);
         if (!tool) {
           const gateway = execGateway(bound);
           const hiddenOuterTool = bound.tools.some(candidate => wireName(candidate) === wire_name);
-          if (!gateway || hiddenOuterTool || !gatewayToolNameIsValid(wire_name)) {
+          // A memory capability reached through the gateway is governed the same way as a direct
+          // one; otherwise hiding writes from the registry would only move them one call deeper.
+          if (!gateway
+            || hiddenOuterTool
+            || !gatewayToolNameIsValid(wire_name)
+            || !memoryWireNameIsReachable(wire_name)) {
             throw new Error(`Codex tool is not available in this turn: ${wire_name}`);
           }
           if (input !== undefined && args && Object.keys(args).length > 0) {
@@ -883,6 +1037,7 @@ export async function runChatGptMcpServer(options: {
           }
           const invocationArguments = args ?? {};
           assertGatewayToolArguments(wire_name, invocationArguments);
+          assertNativeSpawnAgentArguments(wire_name, invocationArguments);
           return invoke(claimed.bindingId, bound, gateway, {
             input: execGatewayProgram(wire_name, input !== undefined, {
               ...(input !== undefined ? { input } : { arguments: invocationArguments }),
@@ -899,6 +1054,7 @@ export async function runChatGptMcpServer(options: {
         if (input !== undefined) throw new Error(`Function Codex tool ${wire_name} does not accept freeform input`);
         const invocationArguments = args ?? {};
         assertBrowserToolArguments(tool, invocationArguments);
+        assertNativeSpawnAgentArguments(wire_name, invocationArguments);
         return invoke(claimed.bindingId, bound, tool, { arguments: invocationArguments }, extra.signal);
       });
     },

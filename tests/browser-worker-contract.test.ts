@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT, CHATGPT_STOPPED_THINKING_LABELS, CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT, ChatGptCompletionTracker, chatGptCanonicalConversationNavigation, chatGptExternalProgressSuppressesDomHealth, chatGptStoppedTurnContinuationPlan, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -123,6 +123,72 @@ test("assistant tracking rebinds only one proven replacement after React detache
     "conversation-turn-2",
     ["conversation-turn-1", "conversation-turn-3", "conversation-turn-4"],
   )).toThrow("2 new conversation turns");
+});
+
+test("assistant tracking accepts one identity migration after temporary chat canonical navigation", async () => {
+  const oldLocator = { count: async () => 0 };
+  const newLocator = { id: "canonical-assistant" };
+  const page = {
+    locator: (selector: string) => selector.includes("canonical-assistant") ? newLocator : oldLocator,
+  } as unknown as Page;
+  const worker = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web",
+    baseUrl: `browser://canonical-navigation-${Date.now()}-${Math.random()}`,
+    chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+  }) as unknown as {
+    reconcileAssistantTurnBinding(
+      page: Page,
+      baseline: { initialTurnIdentities: string[]; domCache: Record<string, unknown> },
+      binding: { identity: string; locator: unknown; acceptedTurnIdentities: string[] },
+      signal?: AbortSignal,
+      allowCanonicalNavigation?: boolean,
+    ): Promise<{ identity: string; locator: unknown; acceptedTurnIdentities: readonly string[] }>;
+    submissionDomState(): Promise<{
+      turnIdentities: string[];
+      userIdentities: string[];
+      responseIdentities: string[];
+    }>;
+  };
+  worker.submissionDomState = async () => ({
+    turnIdentities: ["canonical-user", "canonical-assistant"],
+    userIdentities: ["canonical-user"],
+    responseIdentities: ["canonical-assistant"],
+  });
+
+  await expect(worker.reconcileAssistantTurnBinding(
+    page,
+    { initialTurnIdentities: [], domCache: {} },
+    {
+      identity: "temporary-assistant",
+      locator: oldLocator,
+      acceptedTurnIdentities: ["temporary-user", "temporary-assistant"],
+    },
+    undefined,
+    true,
+  )).resolves.toEqual({
+    identity: "canonical-assistant",
+    locator: newLocator,
+    acceptedTurnIdentities: ["canonical-user", "canonical-assistant"],
+  });
+});
+
+test("canonical answer recovery is limited to ChatGPT temporary-to-conversation navigation", () => {
+  expect(chatGptCanonicalConversationNavigation(
+    "https://chatgpt.com/?temporary-chat=true",
+    "https://chatgpt.com/c/01234567-abcd-4567-89ab-0123456789ab",
+  )).toBeTrue();
+  expect(chatGptCanonicalConversationNavigation(
+    "https://chatgpt.com/?temporary-chat=true",
+    "https://chatgpt.com/g/g-12345678-another-chat",
+  )).toBeFalse();
+  expect(chatGptCanonicalConversationNavigation(
+    "https://chatgpt.com/c/already-persistent",
+    "https://chatgpt.com/c/different-conversation",
+  )).toBeFalse();
+  expect(chatGptCanonicalConversationNavigation(
+    "https://chatgpt.com/?temporary-chat=true",
+    "https://example.test/c/01234567-abcd-4567-89ab-0123456789ab",
+  )).toBeFalse();
 });
 
 test("a retained MCP conversation reuses its proven connector binding", () => {
@@ -3291,6 +3357,101 @@ test("Stopped thinking is an explicit upstream error, not a user cancellation or
   expect(error.message).not.toContain("5 seconds");
 });
 
+test("Stopped thinking detection covers the launcher's supported ChatGPT locales", () => {
+  expect(CHATGPT_STOPPED_THINKING_LABELS).toContain("Stopped thinking");
+  expect(CHATGPT_STOPPED_THINKING_LABELS).toContain("已停止思考");
+  expect(CHATGPT_STOPPED_THINKING_LABELS).toContain("思考を停止しました");
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  expect(worker).toContain("stoppedThinkingLabels: [...CHATGPT_STOPPED_THINKING_LABELS]");
+  expect(worker).toContain("normalizedLabels.has(label)");
+});
+
+test("Pro gets one final-answer continuation only after all observed tool calls finish", () => {
+  const completedTools = {
+    revision: 4,
+    lastToolBatchRevision: 3,
+    activeToolCalls: 0,
+    lastProgressAt: 1_000,
+  };
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: completedTools,
+    visibleText: "",
+    preToolAlreadyUsed: false,
+    postToolAlreadyUsed: false,
+  })).toEqual({
+    kind: "finish_after_tools",
+    effort: "high",
+    prompt: CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT,
+    useLocalTools: false,
+  });
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: { ...completedTools, activeToolCalls: 1 },
+    visibleText: "",
+    preToolAlreadyUsed: false,
+    postToolAlreadyUsed: false,
+  })).toBeUndefined();
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: completedTools,
+    visibleText: "partial final answer",
+    preToolAlreadyUsed: false,
+    postToolAlreadyUsed: false,
+  })).toBeUndefined();
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: completedTools,
+    visibleText: "",
+    preToolAlreadyUsed: false,
+    postToolAlreadyUsed: true,
+  })).toBeUndefined();
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "high",
+    progress: completedTools,
+    visibleText: "",
+    preToolAlreadyUsed: false,
+    postToolAlreadyUsed: false,
+  })).toBeUndefined();
+  expect(CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT).toContain("tool results above are complete");
+  expect(CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT).toContain("Do not call any tools again");
+});
+
+test("Pro gets one bounded same-conversation recovery when it stops before the first tool call", () => {
+  const noTools = {
+    revision: 0,
+    lastToolBatchRevision: 0,
+    activeToolCalls: 0,
+    lastProgressAt: 1_000,
+  };
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: noTools,
+    visibleText: "",
+    preToolAlreadyUsed: false,
+    postToolAlreadyUsed: false,
+  })).toEqual({
+    kind: "resume_before_tools",
+    effort: "max",
+    prompt: CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT,
+    useLocalTools: true,
+  });
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: noTools,
+    visibleText: "",
+    preToolAlreadyUsed: true,
+    postToolAlreadyUsed: false,
+  })).toBeUndefined();
+  expect(chatGptStoppedTurnContinuationPlan({
+    effort: "max",
+    progress: { ...noTools, lastToolBatchRevision: 1 },
+    visibleText: "",
+    preToolAlreadyUsed: true,
+    postToolAlreadyUsed: false,
+  })?.kind).toBe("finish_after_tools");
+});
+
 test("visible DOM trace keeps a complete action phrase instead of a nested count", () => {
   expect(new ChatGptVisibleTraceTracker(0).observe([
     { kind: "status", text: "Searched\n5\nsites" },
@@ -3441,6 +3602,31 @@ test("visible reasoning keeps the browser turn healthy before final assistant ma
   expect(health.update(reasoning, 10_000)).toBeUndefined();
 });
 
+test("settled tool results cannot leave an empty response healthy forever", () => {
+  const health = new ChatGptTurnDomHealthTracker(1_000, 500, 750, 1_200);
+  const emptyAfterTools = {
+    responsePresent: true,
+    running: false,
+    currentText: "",
+    completionActionVisible: false,
+    postToolAnswerExpected: true,
+  };
+
+  expect(health.update(emptyAfterTools, 1_000)).toBeUndefined();
+  expect(health.update(emptyAfterTools, 2_199)).toBeUndefined();
+  expect(health.update(emptyAfterTools, 2_200)).toContain("tool results settled but no final answer appeared");
+
+  const staleRunningHealth = new ChatGptTurnDomHealthTracker(1_000, 500, 750, 1_200);
+  expect(staleRunningHealth.update({ ...emptyAfterTools, running: true }, 5_000)).toBeUndefined();
+  expect(staleRunningHealth.update({ ...emptyAfterTools, running: true }, 6_199)).toBeUndefined();
+  expect(staleRunningHealth.update({ ...emptyAfterTools, running: true }, 6_200))
+    .toContain("tool results settled but no final answer appeared");
+
+  // Fresh proven tool activity still resets the deadline.
+  expect(staleRunningHealth.update({ ...emptyAfterTools, externalProgressLive: true }, 10_000)).toBeUndefined();
+  expect(staleRunningHealth.update(emptyAfterTools, 20_000)).toBeUndefined();
+});
+
 test("suspending DOM health for proven MCP progress restarts the missing-response window", () => {
   const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
@@ -3497,12 +3683,16 @@ test("both response loops check explicit Stopped thinking before acknowledging f
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
   for (const method of ["private async waitForMultipartAcknowledgement(", "private async runBrowserTurn("]) {
     const loop = worker.slice(worker.indexOf(method));
-    const failure = loop.indexOf("if (snapshot.stoppedThinkingVisible) throw chatGptStoppedThinkingError();");
+    const stopped = loop.indexOf("if (snapshot.stoppedThinkingVisible)");
+    const failure = loop.indexOf("throw chatGptStoppedThinkingError();", stopped);
     const acknowledgement = loop.indexOf(".acknowledgeToolBatch(", failure);
+    expect(stopped).toBeGreaterThan(0);
     expect(failure).toBeGreaterThan(0);
     expect(acknowledgement).toBeGreaterThan(failure);
   }
-  expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(2);
+  // Both response loops suspend missing-DOM health for live MCP work. The main loop has one
+  // additional reset after a bounded canonical-navigation reload.
+  expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(3);
 });
 
 test("proven MCP progress vetoes every terminal DOM conclusion, not just a missing response", () => {

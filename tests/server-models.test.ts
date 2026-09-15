@@ -14,7 +14,8 @@ test("proxies official /models auth and query, then appends the fixed ChatGPT We
   let upstream: Request | undefined;
   const config = defaultConfig("full");
   config.subagentProtocol = "native";
-  config.proAvailable = true;
+  config.extraHighAvailable = true;
+  config.proAvailable = false;
   const response = await modelsRequest(request, config, async input => {
     upstream = input;
     return Response.json({
@@ -57,7 +58,6 @@ test("proxies official /models auth and query, then appends the fixed ChatGPT We
     "chatgpt-web/medium",
     "chatgpt-web/high",
     "chatgpt-web/extra-high",
-    "chatgpt-web/pro",
   ]);
   expect(body.models[0]!.context_window).toBe(300_000);
   expect(body.models[0]!.max_context_window).toBe(371_851);
@@ -104,6 +104,7 @@ test("Zero Risk returns one generic Web row without using scanned capabilities",
   const config = defaultConfig("full");
   config.browserInteractionMode = "manual";
   config.solAvailable = true;
+  config.extraHighAvailable = true;
   config.proAvailable = true;
   const response = await modelsRequest(
     new Request("http://127.0.0.1:17841/v1/models", {

@@ -16,7 +16,11 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
   const sendBudgets: number[] = [];
   let stage = "";
   let released = false;
-  const page = { evaluate: async () => ({}), isClosed: () => false };
+  const page = {
+    evaluate: async () => ({}),
+    isClosed: () => false,
+    url: () => "https://chatgpt.com/?temporary-chat=true",
+  };
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnostics, ...(owned ? { browserHostDescriptorPath: "owned-descriptor" } : {}) },
     runStage: async (_trace: string, name: string, timeout: number, action: (signal: AbortSignal) => Promise<unknown>) => {

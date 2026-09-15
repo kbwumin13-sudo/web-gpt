@@ -11,6 +11,22 @@ Record the release version, operating-system version, install path (`clean` or `
 plan, Codex version, result of each check, and a redacted Activity log for every failure. Never
 capture cookies, tunnel IDs, API keys, bearer tokens, or prompt contents.
 
+### macOS native gateway gate
+
+Before exercising an authenticated Web turn, prove that the stable native gateway and the Web
+backend are separate processes and ports. Query the Codex App Server `model/list` through the
+installed route, stop or drain the Web backend, and complete a small native Luna turn. The Luna
+turn must still reach the official backend while the Web backend is stopped. Then start one Web
+model turn and prove that the gateway activates the Web backend without changing the native route.
+An HTTP `healthz` response or the local model cache alone is not evidence for this gate.
+
+### Direct Web Reader gate
+
+Authorize one test project with `codex-chatgpt-web reader authorize PATH`, then use the separate
+`Codex Reader` connector to list and read it. Attempt a parent path, a second unapproved project,
+and a write or command operation; each must be rejected without changing the worktree. Revoke the
+project and prove subsequent reads fail.
+
 ## Windows 11 gate
 
 Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account:

@@ -167,6 +167,9 @@ class BrowserControlServer {
       if (body.retain !== undefined && typeof body.retain !== "boolean") {
         throw new Error("retain is invalid");
       }
+      if (body.retainForRetry !== undefined && typeof body.retainForRetry !== "boolean") {
+        throw new Error("retainForRetry is invalid");
+      }
       if (body.connectorBound !== undefined && typeof body.connectorBound !== "boolean") {
         throw new Error("connectorBound is invalid");
       }
@@ -306,6 +309,7 @@ class BrowserControlServer {
           body.message,
           body.retain === true,
           body.connectorBound === true,
+          body.retainForRetry === true,
         );
         this.logger.info("browser.turn_ended", { traceId: body.traceId, status: body.status });
         writeJson(response, 200, { ok: true, ...release });

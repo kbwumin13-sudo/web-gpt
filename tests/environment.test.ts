@@ -600,6 +600,48 @@ describe("trusted Codex task environment continuity", () => {
     });
   });
 
+  test("post-compaction current environment re-proves identical cached authority when metadata is sparse", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-post-compact-environment-"));
+    temporaryRoots.push(stateRoot);
+    const store = new ChatGptThreadEnvironmentStore(join(stateRoot, "thread-environments.json"));
+    store.resolve(currentWire());
+
+    const resumed = currentWire();
+    const body = resumed._rawBody as {
+      client_metadata: { "x-codex-turn-metadata": string };
+      input: Array<Record<string, unknown>>;
+    };
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_current",
+      turn_id: "turn_after_compaction",
+    });
+    for (const item of body.input) {
+      item.internal_chat_message_metadata_passthrough = { turn_id: "turn_after_compaction" };
+    }
+    body.input.splice(1, 0, {
+      type: "message",
+      id: "msg_post_compact_developer",
+      role: "developer",
+      content: [{ type: "input_text", text: "Current Codex developer context." }],
+    });
+    body.input.push({ type: "compaction", encrypted_content: "opaque-current-checkpoint" });
+    resumed.context.tools = [{ name: "current_tool", description: "current", parameters: { type: "object" } }];
+
+    expect(store.resolve(resumed)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: resumed.context.tools,
+    });
+
+    const changed = structuredClone(resumed);
+    const changedBody = changed._rawBody as { input: Array<Record<string, unknown>> };
+    const changedContext = changedBody.input[0]!.content as Array<{ type: string; text: string }>;
+    changedContext[1]!.text = environmentXml.replaceAll(root, resolve(root, "different-workspace"));
+    expect(() => store.resolve(changed)).toThrow("missing cwd");
+  });
+
   test("does not borrow authority across threads or hide an invalid trusted update", () => {
     const store = new ChatGptThreadEnvironmentStore();
     store.resolve(currentWire());

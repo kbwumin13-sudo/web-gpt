@@ -2,6 +2,14 @@ import { ChatGptWebAdapterError } from "./adapter-error";
 
 /** Maximum number of automatic browser-turn retries after the initial send. */
 export const MAX_CHATGPT_WEB_TURN_RETRIES = 3;
+
+/**
+ * Retained resumes allowed after a failed turn before the conversation itself is treated as the
+ * problem. One transient failure reconnects and completes. Repeated failures only append another
+ * user message to a conversation whose responses keep erroring, which never converges, so the next
+ * attempt abandons that conversation and rebuilds from canonical Codex state instead.
+ */
+export const MAX_RETAINED_RESUME_RETRIES = 1;
 const RETRY_BUDGET_TTL_MS = 30 * 60_000;
 
 interface RetryBudgetEntry {
@@ -51,6 +59,12 @@ export class ChatGptWebTurnRetryPolicy {
     };
     this.entries.set(key, entry);
     return entry.retries > MAX_CHATGPT_WEB_TURN_RETRIES ? exhaustedError(entry) : error;
+  }
+
+  /** Retryable failures already recorded for this Codex turn. */
+  retryCount(key: string, now = Date.now()): number {
+    this.prune(now);
+    return this.entries.get(key)?.retries ?? 0;
   }
 
   exhaustedError(key: string, now = Date.now()): ChatGptWebAdapterError | undefined {

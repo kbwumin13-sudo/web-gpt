@@ -2,13 +2,16 @@
 
 ## Trust boundaries
 
-The user trusts the local Codex app, this loopback daemon, the launcher's private Electron browser
-profile, the selected ChatGPT workspace, OpenAI's tunnel service, and the exact MCP connector they
-created. Repository contents, tool output, websites, and prompt text are untrusted data.
+The user trusts the local Codex app, this loopback daemon, the backend-owned browser profile or the
+launcher compatibility profile, the selected ChatGPT workspace, OpenAI's tunnel service, and the
+exact MCP connector they created. Repository contents, tool output, websites, and prompt text are
+untrusted data.
 
 ## Full-mode capability flow
 
-1. The daemon accepts a Codex Responses turn on `127.0.0.1`.
+1. The native gateway accepts the Codex route on `127.0.0.1` and forwards native requests directly
+   to the official Codex backend. The Web daemon accepts routed Web requests on its separate
+   loopback port.
 2. It extracts `cwd`, workspace roots, and sandbox policy from the native Codex envelope. When a
    resumed root task or subagent omits that envelope, its canonical local rollout must prove the
    exact thread and current turn (or latest source turn for standalone compaction). Request metadata
@@ -42,6 +45,10 @@ model. Every available effort uses the same MCP contract. An unavailable account
 connector, or missing outer tool fails explicitly instead of becoming an effort-specific exception.
 
 The direct turn-token MCP schema is attached only through the `Codex Native2` connector identity.
+
+The `Codex Reader` contract is independent of the turn broker. It can read only projects explicitly
+authorized in the owner-only Reader state file, and its tool registry contains no command, patch,
+or authorization operation.
 The pre-v4 `Codex Native` connector is treated as legacy and is never selected as a fallback. This
 prevents a cached legacy schema from being mistaken for the current capability contract.
 
@@ -56,10 +63,11 @@ default.
 
 ### Browser session theft
 
-The launcher's persistent Electron partition can authorize ChatGPT access. It remains in the
-current OS user's private application-data directory and is never copied into a daemon prompt or
-runtime descriptor. Never sync, upload, attach, or commit it. On suspected exposure, sign out or
-revoke the ChatGPT session from the launcher.
+The backend-owned managed Chrome profile can authorize ChatGPT access. It remains in the current OS
+user's private application-data directory and is never copied into a daemon prompt or runtime
+descriptor. Never sync, upload, attach, or commit it. Launcher-owned compatibility profiles have
+the same protection and are retained only for Zero Risk/manual interaction until that path moves to
+the backend.
 
 ### Tunnel credential theft
 
@@ -76,11 +84,12 @@ port. Run on a trusted single-user account and treat local code execution as ins
 boundary.
 
 The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
-`/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
-user-only application config. The launcher uses them to reject new work, prove that both the HTTP
-request and long-lived browser/tool loop are idle, flush response state, and stop a process. The
-token does not turn loopback into a hostile-local-process security boundary; it prevents accidental
-or unauthenticated lifecycle control through ordinary requests.
+`/admin/session`, `/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
+user-only application config. Backend Host and the launcher compatibility supervisor use them to
+reject new work, prove that both the HTTP request and long-lived browser/tool loop are idle, flush
+response state, and stop a process. The token does not turn loopback into a hostile-local-process
+security boundary; it prevents accidental or unauthenticated lifecycle control through ordinary
+requests.
 
 ### Browser/UI drift
 
@@ -90,18 +99,18 @@ turn; it never chooses another model, starts another transport, or returns a fab
 
 ### Login-state isolation
 
-The launcher keeps ChatGPT login, identity-provider navigation, and model turns in one private
-Electron partition. Allowed login popups are adopted into an in-launcher `WebContentsView` that
-shares that partition; unrelated external links remain outside it. A visible composer alone is not
-authentication evidence: the launcher also requires a valid server session and an exact Temporary
-Chat URL before setup can continue. No cookies, local storage, or browser profile are copied from an
-external browser.
+The backend keeps ChatGPT login and automatic model turns in one private managed Chrome profile.
+The launcher compatibility path keeps Zero Risk login, identity-provider navigation, and manual
+turns in its private Electron partition. Allowed login popups share that partition; unrelated
+external links remain outside it. A visible composer alone is not authentication evidence: the
+active host also requires a valid server session and an exact Temporary Chat URL before setup can
+continue. No cookies, local storage, or browser profile are copied from an external browser.
 
 ### Cross-turn data leakage
 
 Browser turns use at most five independent task-bound tabs in one private login partition. Every
-outer Codex task owns an exact launcher surface lease and retains its Temporary Chat only across
-sequential messages in the same model/effort/compaction epoch; chats are never reused across tasks.
+outer Codex task owns an exact backend or launcher surface lease and retains its Temporary Chat only
+across sequential messages in the same model/effort/compaction epoch; chats are never reused across tasks.
 Closing a running tab destroys its page and terminates that turn. The five-tab limit bounds parallel
 account traffic. Tool calls remain in the same ChatGPT response. The
 bounded local continuation cache is private, expires, and exists only to implement Codex

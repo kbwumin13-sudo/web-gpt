@@ -410,6 +410,7 @@ test("session inspection delegates navigation and capability detection to the sh
           temporary: true,
           url: "https://chatgpt.com/?temporary-chat=true",
           solAvailable: true,
+          extraHighAvailable: true,
           proAvailable: true,
         },
       };
@@ -423,6 +424,7 @@ test("session inspection delegates navigation and capability detection to the sh
     temporary: true,
     url: "https://chatgpt.com/?temporary-chat=true",
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
   });
   assert.equal(calls.length, 2);
@@ -2432,6 +2434,57 @@ test("a completed keyed turn is retained for thirty minutes and preserves its ac
   const retainedAt = tab.lastHeartbeatAt;
   BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, retainedAt + (30 * 60 * 1000) - 1);
   assert.equal(fixture.turnTabs.has(tab.id), true);
+});
+
+test("a transient failed keyed turn can be retained for an idempotent retry", async () => {
+  const throttling = [];
+  const tab = {
+    id: "tab-retry-retained",
+    surfaceId: "surface-retry-retained",
+    traceId: "trace_retry_retained",
+    conversationKey: "f".repeat(64),
+    connectorIdentity: "Codex Native2",
+    connectorBound: false,
+    helperPid: 778,
+    status: "running",
+    loading: true,
+    view: { webContents: {
+      isDestroyed: () => false,
+      setBackgroundThrottling: (enabled) => throttling.push(enabled),
+    } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(),
+    userCancelledTurnOwners: new Map(),
+    selectedTabId: tab.id,
+    syncPowerSaveBlocker() {},
+    syncViewVisibility() {},
+    writeDescriptor() {},
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    hide() {},
+    logger: { info() {} },
+  });
+
+  const result = await BrowserHost.prototype.endTurn.call(
+    fixture,
+    tab.traceId,
+    tab.helperPid,
+    "failed",
+    false,
+    "ChatGPT response observation temporarily stopped",
+    false,
+    true,
+    true,
+  );
+
+  assert.deepEqual(result, { cancelledByUser: false });
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+  assert.equal(tab.status, "ready");
+  assert.equal(tab.message, "ChatGPT turn retained for retry");
+  assert.equal(tab.connectorBound, true);
+  assert.deepEqual(throttling, [true]);
 });
 
 test("a retained browser tab expires at thirty minutes", () => {

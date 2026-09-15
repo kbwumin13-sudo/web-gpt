@@ -223,10 +223,13 @@ test("detached worker replaces an installed Linux AppImage and removes the old v
     assert.match(fs.readFileSync(wrapper, "utf8"), /versions\/1\.2\.0\/Codex Web GPT\.AppImage/);
     assert.doesNotMatch(fs.readFileSync(wrapper, "utf8"), /APPIMAGE_EXTRACT_AND_RUN/);
     assert.equal(fs.existsSync(path.join(versionsRoot, "run-appimage")), true);
-    const deadline = Date.now() + 3_000;
+    // A detached grandchild performs the relaunch, so it competes for scheduling with the rest of
+    // the suite. Wait generously; the loop still exits as soon as the marker appears.
+    const deadline = Date.now() + 30_000;
     while (!fs.existsSync(marker) && Date.now() < deadline) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
+    assert.equal(fs.existsSync(marker), true, "detached relaunch did not write its marker before the deadline");
     assert.equal(fs.readFileSync(marker, "utf8"), "launched");
     assert.match(fs.readFileSync(logPath, "utf8"), /installed and relaunched/);
   } finally {

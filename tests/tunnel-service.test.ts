@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config";
-import { createTunnelConfig, mcpCommand } from "../src/tunnel";
+import { createTunnelConfig, mcpCommand, readerMcpCommand } from "../src/tunnel";
 import { tunnelServiceDefinition } from "../src/tunnel-service";
 import { existingFullSetupCredentials, tunnelWorkerRuntimeChanged } from "../src/setup";
 
@@ -149,6 +149,13 @@ describe("tunnel launchd ownership", () => {
 
     config.browserInteractionMode = "manual";
     expect(parsePinnedTunnelCommand(mcpCommand(config, "win32"))).toContain("safe");
+  });
+
+  test("can configure the independent read-only Reader MCP contract", () => {
+    const config = defaultConfig("browser-only");
+    config.runtimeCommand = [process.execPath];
+    config.brokerSocketPath = "C:\\reader-broker";
+    expect(readerMcpCommand(config, "win32")).toContain('"--contract" "reader"');
   });
 
 });

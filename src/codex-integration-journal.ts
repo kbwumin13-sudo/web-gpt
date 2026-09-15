@@ -21,6 +21,7 @@ import type {
   LegacyCodexIntegrationJournalV7,
   LegacyCodexIntegrationJournalV8,
 } from "./codex-integration-shared";
+import type { InstalledCodexLifecycleHooks } from "./codex-lifecycle-hook";
 import { verifyManagedJournalState } from "./codex-integration-route";
 
 function isPreviousAssignment(value: unknown): boolean {
@@ -41,6 +42,22 @@ function isInstalledInterruptHook(value: unknown): boolean {
     && typeof hook.fragment === "string" && hook.fragment.length > 0;
 }
 
+function isInstalledCodexLifecycleHooks(value: unknown): value is InstalledCodexLifecycleHooks {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const hooks = value as Record<string, unknown>;
+  return typeof hooks.command === "string" && hooks.command.length > 0
+    && Number.isSafeInteger(hooks.sessionStartGroupIndex) && (hooks.sessionStartGroupIndex as number) >= 0
+    && Number.isSafeInteger(hooks.userPromptSubmitGroupIndex) && (hooks.userPromptSubmitGroupIndex as number) >= 0
+    && Number.isSafeInteger(hooks.sessionEndGroupIndex) && (hooks.sessionEndGroupIndex as number) >= 0
+    && typeof hooks.sessionStartStateKey === "string" && hooks.sessionStartStateKey.length > 0
+    && typeof hooks.userPromptSubmitStateKey === "string" && hooks.userPromptSubmitStateKey.length > 0
+    && typeof hooks.sessionEndStateKey === "string" && hooks.sessionEndStateKey.length > 0
+    && typeof hooks.sessionStartTrustedHash === "string" && /^sha256:[a-f0-9]{64}$/.test(hooks.sessionStartTrustedHash)
+    && typeof hooks.userPromptSubmitTrustedHash === "string" && /^sha256:[a-f0-9]{64}$/.test(hooks.userPromptSubmitTrustedHash)
+    && typeof hooks.sessionEndTrustedHash === "string" && /^sha256:[a-f0-9]{64}$/.test(hooks.sessionEndTrustedHash)
+    && typeof hooks.fragment === "string" && hooks.fragment.length > 0;
+}
+
 function parseJournal(path: string): AnyCodexIntegrationJournal {
   const value = JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))) as Record<string, unknown>;
   const installed = value.installed as Record<string, unknown> | undefined;
@@ -59,6 +76,7 @@ function parseJournal(path: string): AnyCodexIntegrationJournal {
     && value.previous
     && isPreviousAssignment(value.previousRealtimeWebrtcCallBaseUrl)
     && isInstalledInterruptHook(value.interruptHook)
+    && (value.lifecycleHooks === undefined || isInstalledCodexLifecycleHooks(value.lifecycleHooks))
     && typeof value.configPath === "string") {
     return value as unknown as CodexIntegrationJournal;
   }

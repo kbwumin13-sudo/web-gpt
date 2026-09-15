@@ -1,6 +1,6 @@
 {
   "name": "codex-chatgpt-web",
-  "version": "5.0.6",
+  "version": "5.0.7-local.22",
   "private": true,
   "description": "A focused local Responses bridge that runs Codex tasks through a user-authenticated ChatGPT web session.",
   "repository": {
@@ -23,7 +23,7 @@
     "LICENSES"
   ],
   "scripts": {
-    "start": "bun run src/cli.ts serve",
+    "start": "bun run src/cli.ts backend",
     "setup": "bun run src/cli.ts setup",
     "doctor": "bun run src/cli.ts doctor",
     "dev:launcher": "bun run src/cli.ts dev launcher",
@@ -36,6 +36,9 @@
     "clean": "bun run scripts/clean.ts",
     "build": "bun run scripts/build-runtime-bundle.ts",
     "smoke": "bun run scripts/smoke-release.ts dist/runtime",
+    "acceptance:installed": "bun run scripts/smoke-installed.ts",
+    "acceptance:luna": "bun run scripts/smoke-installed.ts --live-luna",
+    "acceptance:web": "bun run scripts/smoke-installed.ts --live-web",
     "smoke:codex": "bun run scripts/smoke-codex-catalog.ts",
     "smoke:cancel": "bun run scripts/smoke-codex-cancel.ts",
     "smoke:interrupt": "bun run scripts/smoke-codex-interrupt.ts",
@@ -75,7 +78,7 @@
   "overrides": {
     "@hono/node-server": "2.0.12",
     "fast-uri": "3.1.6",
-    "hono": "4.12.34",
+    "hono": "4.13.5",
     "qs": "6.16.0",
     "zod-to-json-schema": "3.25.1"
   },

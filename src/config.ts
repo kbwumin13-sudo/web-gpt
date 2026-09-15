@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
@@ -20,6 +20,7 @@ export type SubagentProtocol = "compatibility-v1" | "native";
  * contract therefore has a new identity instead of mutating the retired connector in place.
  */
 export const CHATGPT_CONNECTOR_NAME = "Codex Native2";
+export const CODEX_READER_CONNECTOR_NAME = "Codex Reader";
 export const DEV_CHATGPT_CONNECTOR_NAME = `${CHATGPT_CONNECTOR_NAME} DEV`;
 export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk";
 export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native"] as const;
@@ -69,6 +70,8 @@ export interface AppConfig {
   mode: RuntimeMode;
   subagentProtocol: SubagentProtocol;
   host: "127.0.0.1";
+  /** Port owned by the independent native Codex gateway. */
+  nativeGatewayPort: number;
   port: number;
   contextWindow: number;
   appName: string;
@@ -82,6 +85,7 @@ export interface AppConfig {
   brokerSocketPath: string;
   headed: boolean;
   solAvailable: boolean;
+  extraHighAvailable?: boolean;
   proAvailable: boolean;
   experimentalBiggerContext: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
@@ -198,7 +202,8 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     mode,
     subagentProtocol: "compatibility-v1",
     host: "127.0.0.1",
-    port: 17841,
+    nativeGatewayPort: 17841,
+    port: 17842,
     contextWindow: 256_000,
     appName: CHATGPT_CONNECTOR_NAME,
     automaticAppName: CHATGPT_CONNECTOR_NAME,
@@ -210,6 +215,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     brokerSocketPath: defaultBrokerEndpoint(home),
     headed: true,
     solAvailable: true,
+    extraHighAvailable: false,
     proAvailable: false,
     experimentalBiggerContext: false,
     zeroRiskProEnabled: false,
@@ -230,6 +236,58 @@ export function currentRuntimeCommand(): string[] {
     entry: typeof Bun !== "undefined" ? Bun.main : process.argv[1],
     bunExecutable,
   });
+}
+
+export function stableRuntimeCommand(command: string[]): string[] {
+  const launcherPath = process.env.CODEX_CHATGPT_WEB_LAUNCHER?.trim();
+  const entrypoint = command[1];
+  let runtimeRoot: string | undefined;
+  if (entrypoint && basename(entrypoint) === "cli.js" && basename(dirname(entrypoint)) === "app") {
+    runtimeRoot = dirname(dirname(entrypoint));
+  } else if (launcherPath) {
+    try {
+      const resolvedLauncher = realpathSync(expandUserPath(launcherPath));
+      if (basename(dirname(resolvedLauncher)) === "bin") runtimeRoot = dirname(dirname(resolvedLauncher));
+    } catch {}
+  }
+  if (!runtimeRoot) return command;
+  const launcherName = process.platform === "win32" ? "codex-chatgpt-web.cmd" : "codex-chatgpt-web";
+  const target = join(resolve(runtimeRoot), "bin", launcherName);
+  if (!existsSync(target)) return command;
+  const stable = join(getConfigDir(), "bin", launcherName);
+  mkdirSync(dirname(stable), { recursive: true, mode: 0o700 });
+  if (process.platform === "win32") {
+    const root = resolve(runtimeRoot);
+    const wrapper = `@echo off\r\nsetlocal\r\nset "CODEX_CHATGPT_WEB_LAUNCHER=%~f0"\r\n"${root}\\runtime\\bun.exe" "${root}\\app\\cli.js" %*\r\n`;
+    try {
+      if (readFileSync(stable, "utf8") === wrapper) return [stable];
+      if (lstatSync(stable).isFile()) {
+        throw new Error(`Stable runtime entry is occupied by a different file: ${stable}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    atomicWriteFile(stable, wrapper, { mode: 0o700 });
+    return [stable];
+  }
+  try {
+    if (lstatSync(stable).isSymbolicLink() && realpathSync(stable) === realpathSync(target)) return [stable];
+  } catch {}
+  try {
+    if (lstatSync(stable).isFile() && !lstatSync(stable).isSymbolicLink()) {
+      throw new Error(`Stable runtime entry is occupied by a regular file: ${stable}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const temporary = `${stable}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    symlinkSync(target, temporary);
+    renameSync(temporary, stable);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  return [stable];
 }
 
 export function installedBunExecutable({
@@ -390,7 +448,14 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (browserInteractionMode === "manual" && parsed.browserHost !== "launcher") {
     throw new Error(`Zero Risk requires the launcher browser host in ${path}`);
   }
-  if (!Number.isInteger(parsed.port) || parsed.port! < 1 || parsed.port! > 65_535) throw new Error(`Invalid port in ${path}`);
+  const nativeGatewayPort = parsed.nativeGatewayPort ?? 17841;
+  let backendPort = parsed.port;
+  if (parsed.nativeGatewayPort === undefined && backendPort === 17841) backendPort = 17842;
+  if (!Number.isInteger(nativeGatewayPort) || nativeGatewayPort! < 1 || nativeGatewayPort! > 65_535) {
+    throw new Error(`Invalid nativeGatewayPort in ${path}`);
+  }
+  if (!Number.isInteger(backendPort) || backendPort! < 1 || backendPort! > 65_535) throw new Error(`Invalid port in ${path}`);
+  if (nativeGatewayPort === backendPort) throw new Error(`nativeGatewayPort and port must differ in ${path}`);
   if (!Number.isSafeInteger(parsed.contextWindow) || parsed.contextWindow! <= 0) {
     throw new Error(`Invalid contextWindow in ${path}`);
   }
@@ -486,6 +551,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.solAvailable !== undefined && typeof parsed.solAvailable !== "boolean") {
     throw new Error(`Invalid solAvailable in ${path}`);
   }
+  if (parsed.extraHighAvailable !== undefined && typeof parsed.extraHighAvailable !== "boolean") {
+    throw new Error(`Invalid extraHighAvailable in ${path}`);
+  }
   if (parsed.experimentalBiggerContext !== undefined
     && typeof parsed.experimentalBiggerContext !== "boolean") {
     throw new Error(`Invalid experimentalBiggerContext in ${path}`);
@@ -499,6 +567,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
   }
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
+  const extraHighAvailable = parsed.extraHighAvailable === true
+    || (parsed.extraHighAvailable === undefined && proAvailable);
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
@@ -507,14 +577,20 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (proAvailable && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Pro requires Sol`);
   }
+  if (proAvailable && !extraHighAvailable) {
+    throw new Error(`Invalid ChatGPT account capabilities in ${path}: Pro requires Extra High`);
+  }
   return {
     ...parsed,
+    nativeGatewayPort,
+    port: backendPort,
     appName: expectedAppName,
     automaticAppName,
     manualAppName,
     browserInteractionMode,
     subagentProtocol,
     solAvailable,
+    extraHighAvailable,
     proAvailable,
     experimentalBiggerContext,
     zeroRiskProEnabled,
@@ -541,7 +617,11 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
   const efforts = manual
     ? ["low"]
     : config.solAvailable
-    ? ["low", "medium", "high", "xhigh", ...(config.proAvailable ? ["max"] : [])]
+    ? [
+      "low", "medium", "high",
+      ...(config.extraHighAvailable || config.proAvailable ? ["xhigh"] : []),
+      ...(config.proAvailable ? ["max"] : []),
+    ]
     : ["low", "medium"];
   return {
     adapter: "chatgpt-web",
@@ -569,6 +649,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       headed: config.headed,
       localToolsEnabled: config.mode === "full",
       solAvailable: manual ? false : config.solAvailable,
+      extraHighAvailable: manual ? false : config.extraHighAvailable === true || config.proAvailable,
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),

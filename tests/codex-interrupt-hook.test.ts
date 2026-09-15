@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   MANAGED_INTERRUPT_HOOK_END,
+  MANAGED_INTERRUPT_HOOK_START,
   codexInterruptHookCommand,
   codexInterruptHookHash,
   installCodexInterruptHook,
@@ -46,6 +47,17 @@ test("trusts the canonical Codex config path before a new config file exists", (
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("accepts Codex removing only the managed Interrupt comment", () => {
+  const installed = installCodexInterruptHook(
+    'model = "gpt-5.6-sol"\n',
+    "/Users/test/.codex/config.toml",
+    { runtimeCommand: ["/opt/runtime"] },
+  );
+  const normalized = installed.text.replace(`${MANAGED_INTERRUPT_HOOK_START}\n`, "");
+  verifyCodexInterruptHook(normalized, installed.installed);
+  expect(restoreCodexInterruptHook(normalized, installed.installed)).toBe('model = "gpt-5.6-sol"\n');
 });
 
 test("Interrupt hook command is absolute, quoted, and bound to the exact application home", () => {
@@ -160,4 +172,43 @@ test("restores a hook whose end comment moved before unchanged definitions witho
       expect(() => restoreCodexInterruptHook(markerInsideValue, installed.installed)).toThrow("markers changed after setup");
     }
   }
+});
+
+test("verifies and restores a hook in a carriage-return config the TOML parser rejects", () => {
+  const original = ['model = "gpt-5.6-sol"', 'approval_policy = "never"', ""].join("\r");
+  expect(() => Bun.TOML.parse(original)).toThrow();
+  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", {
+    runtimeCommand: ["/opt/runtime"],
+  });
+
+  verifyCodexInterruptHook(installed.text, installed.installed);
+  expect(restoreCodexInterruptHook(installed.text, installed.installed)).toBe(original);
+  verifyCodexInterruptHookRestored(original);
+  // A config the parser cannot read must still fail closed on any owned-definition edit.
+  for (const changed of [
+    installed.text.replace("timeout = 3", "timeout = 2"),
+    installed.text.replace("trusted_hash", "trusted_hash_changed"),
+    installed.text + '\r[[hooks.Interrupt.hooks]]\rtype = "command"\rcommand = "unexpected-command"\r',
+  ]) {
+    expect(() => restoreCodexInterruptHook(changed, installed.installed)).toThrow("changed after setup");
+  }
+});
+
+test("allows Codex to move the trust-state table after unrelated configuration tables", () => {
+  const original = 'model = "gpt-5.6-sol"\n';
+  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", {
+    runtimeCommand: ["/opt/runtime"],
+  });
+  const fragment = installed.installed.fragment.replace(`${MANAGED_INTERRUPT_HOOK_END}\n`, "");
+  const stateStart = fragment.indexOf("\n[hooks.state.");
+  expect(stateStart).toBeGreaterThan(0);
+  const commandDefinition = fragment.slice(0, stateStart);
+  const trustState = fragment.slice(stateStart) + `${MANAGED_INTERRUPT_HOOK_END}\n`;
+  const mcp = '\n[mcp_servers.node_repl]\ncommand = "my-mcp"\n';
+  const edited = original + commandDefinition + mcp + trustState;
+
+  verifyCodexInterruptHook(edited, installed.installed);
+  expect(restoreCodexInterruptHook(edited, installed.installed)).toBe(original + mcp);
+  expect(() => restoreCodexInterruptHook(edited.replace("trusted_hash", "trusted_hash_changed"), installed.installed))
+    .toThrow("changed after setup");
 });

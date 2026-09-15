@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import type { AppConfig } from "./config";
 import { getConfigPath, loadConfig, saveConfig } from "./config";
 import { installCodexInterruptHook, installCodexInterruptHookCommand } from "./codex-interrupt-hook";
+import { installCodexLifecycleHooks } from "./codex-lifecycle-hook";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
   getCodexConfigPath,
@@ -33,6 +34,8 @@ import { assertJournalTargetsConfig, readJournal } from "./codex-integration-jou
 import {
   findTopLevelAssignment,
   installCompatibilityV1Features,
+  installManagedWebAgentRunner,
+  removeManagedWebAgentRunner,
   splitLines,
   textFormat,
 } from "./codex-integration-document";
@@ -53,10 +56,11 @@ function installConfiguredRoute(
   baseline: string,
   installedUrl: string,
   config: Pick<AppConfig, "subagentProtocol"> & (
-    Pick<AppConfig, "runtimeCommand"> | { interruptHookCommand: string }
+    Partial<Pick<AppConfig, "runtimeCommand">> & { interruptHookCommand?: string }
   ),
   replaceExistingRoute: boolean,
   replaceExistingRealtimeRoute: boolean,
+  installWebAgentRunner = false,
 ): {
   text: string;
   previous: CodexIntegrationJournal["previous"];
@@ -66,6 +70,7 @@ function installConfiguredRoute(
   previousAgentMaxDepth?: CodexIntegrationJournal["previousAgentMaxDepth"];
   installedAgentMaxDepth?: number;
   interruptHook: CodexIntegrationJournal["interruptHook"];
+  lifecycleHooks?: NonNullable<CodexIntegrationJournal["lifecycleHooks"]>;
 } {
   const route = installRoute(
     baseline,
@@ -87,10 +92,21 @@ function installConfiguredRoute(
         };
       })()
     : route;
-  const hook = "interruptHookCommand" in config
+  const hooked = config.interruptHookCommand
     ? installCodexInterruptHookCommand(configured.text, getCodexConfigPath(), config.interruptHookCommand)
-    : installCodexInterruptHook(configured.text, getCodexConfigPath(), config);
-  return { ...configured, text: hook.text, interruptHook: hook.installed };
+    : installCodexInterruptHook(configured.text, getCodexConfigPath(), { runtimeCommand: config.runtimeCommand! });
+  const lifecycle = config.runtimeCommand
+    ? installCodexLifecycleHooks(hooked.text, getCodexConfigPath(), { runtimeCommand: config.runtimeCommand })
+    : undefined;
+  const runnerText = installWebAgentRunner && config.runtimeCommand
+    ? installManagedWebAgentRunner(lifecycle!.text, config.runtimeCommand)
+    : lifecycle?.text ?? hooked.text;
+  return {
+    ...configured,
+    text: runnerText,
+    interruptHook: hooked.installed,
+    ...(lifecycle ? { lifecycleHooks: lifecycle.installed } : {}),
+  };
 }
 
 function journalProtocol(journal: Exclude<AnyCodexIntegrationJournal, { version: 2 }>): AppConfig["subagentProtocol"] {
@@ -262,6 +278,7 @@ export function installCodexIntegration(
       config,
       true,
       !preservePrevious || existing.version === 9 || existing.version === 10 || options.replaceExistingRoute === true,
+      options.installWebAgentRunner === true,
     );
     if (preservePrevious) {
       assertPreservedPreviousAssignments(patched.previous, existing.previous);
@@ -289,6 +306,7 @@ export function installCodexIntegration(
         ? existing.previousRealtimeWebrtcCallBaseUrl
         : patched.previousRealtimeWebrtcCallBaseUrl,
       interruptHook: patched.interruptHook,
+      ...(patched.lifecycleHooks ? { lifecycleHooks: patched.lifecycleHooks } : {}),
       ...(config.subagentProtocol === "compatibility-v1" ? {
         previousMultiAgent: patched.previousMultiAgent,
         previousMultiAgentV2: patched.previousMultiAgentV2,
@@ -313,6 +331,7 @@ export function installCodexIntegration(
     config,
     options.replaceExistingRoute === true,
     options.replaceExistingRoute === true,
+    options.installWebAgentRunner === true,
   );
   const journal: CodexIntegrationJournal = {
     version: 10,
@@ -329,6 +348,7 @@ export function installCodexIntegration(
     previous: patched.previous,
     previousRealtimeWebrtcCallBaseUrl: patched.previousRealtimeWebrtcCallBaseUrl,
     interruptHook: patched.interruptHook,
+    ...(patched.lifecycleHooks ? { lifecycleHooks: patched.lifecycleHooks } : {}),
     ...(config.subagentProtocol === "compatibility-v1" ? {
       previousMultiAgent: patched.previousMultiAgent,
       previousMultiAgentV2: patched.previousMultiAgentV2,
@@ -392,9 +412,13 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
     baseline = restoreManagedRoute(current, existing);
   }
   const protocol = journalProtocol(existing);
+  let runtimeCommand: string[] | undefined;
+  try { runtimeCommand = loadConfig().runtimeCommand; } catch {}
   const hookConfig = existing.version === 10
-    ? { interruptHookCommand: existing.interruptHook.command }
-    : { runtimeCommand: loadConfig().runtimeCommand };
+    ? { interruptHookCommand: existing.interruptHook.command, ...(runtimeCommand ? { runtimeCommand } : {}) }
+    : runtimeCommand
+      ? { runtimeCommand }
+      : (() => { throw new Error("Codex integration activation requires the saved runtime configuration"); })();
   const route = installConfiguredRoute(
     baseline,
     existing.installed.openai_base_url,
@@ -426,6 +450,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
       ? existing.previousRealtimeWebrtcCallBaseUrl
       : route.previousRealtimeWebrtcCallBaseUrl,
     interruptHook: route.interruptHook,
+    ...(route.lifecycleHooks ? { lifecycleHooks: route.lifecycleHooks } : {}),
     ...(protocol === "compatibility-v1" ? {
       previousMultiAgent: route.previousMultiAgent,
       previousMultiAgentV2: route.previousMultiAgentV2,
@@ -454,6 +479,7 @@ export function uninstallCodexIntegration(): UninstallCodexIntegrationResult {
   } else {
     restored = restoreManagedRoute(current, journal);
   }
+  restored = removeManagedWebAgentRunner(restored);
   const configSnapshot = snapshotFile(journal.configPath, { followSymlink: true });
   const catalogSnapshot = journal.version === 2 ? snapshotFile(journal.catalogPath) : undefined;
   const modelsCacheSnapshot = snapshotFile(getCodexModelsCachePath());

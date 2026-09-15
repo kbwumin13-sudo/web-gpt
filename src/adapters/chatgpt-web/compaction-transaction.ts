@@ -19,6 +19,14 @@ interface CompactionTransaction extends CompactionTransactionHandle {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+interface AcceptedCompactionHandoff {
+  summary: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const ACCEPTED_HANDOFF_TOMBSTONE_TTL_MS = 30_000;
+
 function opaqueId(prefix: "control" | "handoff"): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
 }
@@ -26,6 +34,12 @@ function opaqueId(prefix: "control" | "handoff"): string {
 /** One-shot capability store for the summary only; it never owns a Codex tool environment. */
 export class CompactionTransactionStore {
   private readonly transactions = new Map<string, CompactionTransaction>();
+  /**
+   * A submit can cross the browser failure boundary by a few event-loop turns. Keep the
+   * authoritative result briefly after the one-shot transaction is consumed so the caller can
+   * distinguish "accepted then browser failed" from "browser failed before handoff".
+   */
+  private readonly accepted = new Map<string, AcceptedCompactionHandoff>();
 
   begin(traceId: string, ttlMs: number): CompactionTransactionHandle {
     if (!traceId.trim()) throw new Error("compaction transaction trace id is required");
@@ -55,6 +69,7 @@ export class CompactionTransactionStore {
     const normalized = summary.trim();
     if (!normalized) throw new Error("compaction handoff summary is empty");
     transaction.summary = normalized;
+    this.rememberAccepted(transaction.token, normalized);
     console.info(`[chatgpt-web] broker trace=${transaction.traceId} accepted structured compaction handoff`);
     if (transaction.timer) clearTimeout(transaction.timer);
     transaction.timer = undefined;
@@ -84,6 +99,17 @@ export class CompactionTransactionStore {
     });
   }
 
+  acceptedSummary(token: string): string | undefined {
+    const accepted = this.accepted.get(token);
+    if (!accepted) return undefined;
+    if (accepted.expiresAt <= Date.now()) {
+      clearTimeout(accepted.timer);
+      this.accepted.delete(token);
+      return undefined;
+    }
+    return accepted.summary;
+  }
+
   abort(token: string): void {
     const transaction = this.transactions.get(token);
     if (!transaction) return;
@@ -110,6 +136,8 @@ export class CompactionTransactionStore {
     for (const transaction of [...this.transactions.values()]) {
       this.finishError(transaction, new Error("compaction transaction broker closed"));
     }
+    for (const accepted of this.accepted.values()) clearTimeout(accepted.timer);
+    this.accepted.clear();
   }
 
   private consume(transaction: CompactionTransaction): string {
@@ -138,5 +166,17 @@ export class CompactionTransactionStore {
     if (waiter?.signal && waiter.onAbort) {
       waiter.signal.removeEventListener("abort", waiter.onAbort);
     }
+  }
+
+  private rememberAccepted(token: string, summary: string): void {
+    const previous = this.accepted.get(token);
+    if (previous) clearTimeout(previous.timer);
+    const expiresAt = Date.now() + ACCEPTED_HANDOFF_TOMBSTONE_TTL_MS;
+    const timer = setTimeout(() => {
+      const current = this.accepted.get(token);
+      if (current?.timer === timer) this.accepted.delete(token);
+    }, ACCEPTED_HANDOFF_TOMBSTONE_TTL_MS);
+    timer.unref?.();
+    this.accepted.set(token, { summary, expiresAt, timer });
   }
 }

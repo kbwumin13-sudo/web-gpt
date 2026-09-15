@@ -243,6 +243,15 @@ class RuntimeHost {
     ];
   }
 
+  browserHostSetupArgs(mode) {
+    if (mode !== "automatic" && mode !== "manual") {
+      throw new Error("Launcher browser interaction mode is invalid");
+    }
+    return mode === "manual"
+      ? ["--browser-host-descriptor", this.browserDescriptorPath]
+      : ["--managed-browser-host"];
+  }
+
   assertProductionProfile(operation) {
     if (this.launcherProfile !== "production") {
       throw new Error(`${operation} is unavailable in the isolated DEV launcher profile`);
@@ -547,14 +556,6 @@ class RuntimeHost {
           successMessage: "Previous terminal-managed daemon restored",
           timeoutMs: 75_000,
         });
-        if (snapshot.mode === "full") {
-          await this.run(operationName, ["tunnel", "start"], {
-            embedded: true,
-            message: "Restoring the previous terminal-managed tunnel",
-            successMessage: "Previous terminal-managed tunnel restored",
-            timeoutMs: 75_000,
-          });
-        }
       }
       await this.run(operationName, ["doctor", "--json"], {
         message: "Verifying the previous terminal-managed runtime",
@@ -903,6 +904,24 @@ class RuntimeHost {
     }
   }
 
+  async waitForExternalRuntime(config, timeoutMs = 20_000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastDetail = "not reachable";
+    while (Date.now() < deadline) {
+      const health = await this.supervisor.proxyHealthPayload(config);
+      if (health?.service === "codex-chatgpt-web"
+        && health.status === "ok"
+        && health.mode === config.mode
+        && health.version === config.releaseVersion
+        && health.accepting_turns === true) {
+        return health;
+      }
+      lastDetail = health ? `unexpected health payload: ${JSON.stringify(health)}` : "not reachable";
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    throw new Error(`Backend Host did not become ready within ${timeoutMs}ms: ${lastDetail}`);
+  }
+
   mcpConnectorName() {
     const current = this.runtimeConfigSnapshot();
     if (!current.configured || current.mode !== "full") {
@@ -1002,8 +1021,7 @@ class RuntimeHost {
     const args = [
       "setup",
       mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
+      ...this.browserHostSetupArgs(interactionMode),
       ...this.browserInteractionArgs({
         mode: interactionMode,
         refreshCapabilities: interactionMode === "automatic",
@@ -1079,8 +1097,7 @@ class RuntimeHost {
     const args = [
       "setup",
       mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
+      ...this.browserHostSetupArgs("automatic"),
       ...this.browserInteractionArgs(),
       "--replace-codex-route",
       "--acknowledge-unofficial",
@@ -1108,8 +1125,7 @@ class RuntimeHost {
     const args = [
       ...(this.launcherProfile === "development" ? ["dev", "setup"] : ["setup"]),
       "--full",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
+      ...this.browserHostSetupArgs("manual"),
       ...this.browserInteractionArgs({ mode: "manual" }),
       "--acknowledge-unofficial",
       "--standard-context",
@@ -1164,8 +1180,7 @@ class RuntimeHost {
     const args = [
       "setup",
       existing.mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
+      ...this.browserHostSetupArgs(interactionMode),
       // A release may repair capability detection. Reusing the previous result can
       // keep eligible models disabled even after the corrected probe is installed.
       ...this.browserInteractionArgs({ mode: interactionMode, refreshCapabilities: true }),
@@ -1191,6 +1206,46 @@ class RuntimeHost {
     };
   }
 
+  managedBrowserLoginState() {
+    const config = this.runtimeConfigSnapshot().config;
+    const storageStatePath = config?.storageStatePath
+      || path.join(this.coreHome, "browser", "storage-state.json");
+    return fs.existsSync(storageStatePath) && fs.existsSync(`${storageStatePath}.verified.json`);
+  }
+
+  async loginManagedBrowser() {
+    this.assertProductionProfile("Managed Chrome login");
+    if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    const chrome = this.passkeyChromeExecutable();
+    const storageStatePath = path.join(this.coreHome, "browser", "storage-state.json");
+    const result = await this.run("managed-browser-login", [
+      "login",
+      "--chrome",
+      chrome,
+      "--storage-state",
+      storageStatePath,
+    ], {
+      message: "Opening the backend-managed ChatGPT login",
+      successMessage: "Backend-managed ChatGPT login completed",
+      timeoutMs: PASSKEY_LOGIN_TIMEOUT_MS,
+    });
+    return {
+      ...result,
+      authenticated: this.managedBrowserLoginState(),
+      storageStatePath,
+    };
+  }
+
+  async logoutManagedBrowser() {
+    this.assertProductionProfile("Managed Chrome logout");
+    if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    return this.run("managed-browser-logout", ["logout"], {
+      message: "Removing the backend-managed ChatGPT login",
+      successMessage: "Backend-managed ChatGPT login removed",
+      timeoutMs: 15_000,
+    });
+  }
+
   setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
@@ -1205,8 +1260,9 @@ class RuntimeHost {
     const args = [
       "setup",
       "--full",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
+      ...(this.launcherProfile === "development"
+        ? ["--browser-host-descriptor", this.browserDescriptorPath]
+        : this.browserHostSetupArgs(targetMode)),
       ...this.browserInteractionArgs({ mode: targetMode }),
       "--replace-codex-route",
     ];
@@ -1298,8 +1354,9 @@ class RuntimeHost {
     const args = [
       ...(this.launcherProfile === "development" ? ["dev", "setup"] : ["setup"]),
       current.mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
+      ...(this.launcherProfile === "development"
+        ? ["--browser-host-descriptor", this.browserDescriptorPath]
+        : this.browserHostSetupArgs(mode)),
       ...this.browserInteractionArgs({ mode, refreshCapabilities: true }),
       "--acknowledge-unofficial",
       ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
@@ -1356,9 +1413,23 @@ class RuntimeHost {
       else await this.supervisor.stopForSetup();
       setupCommandStarted = true;
       const result = await this.run(name, args, options);
-      const runtime = await this.supervisor.startIfConfigured();
-      if (runtime.status !== "ready") {
-        throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
+      if (this.launcherProfile === "development") {
+        const runtime = await this.supervisor.startIfConfigured();
+        if (runtime.status !== "ready") {
+          throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
+        }
+      } else {
+        const configured = this.runtimeConfigSnapshot();
+        if (configured.owner === "launcher") {
+          const runtime = await this.supervisor.startIfConfigured();
+          if (runtime.status !== "ready") {
+            throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
+          }
+        } else if (configured.owner === "external" && configured.config) {
+          await this.waitForExternalRuntime(configured.config);
+        } else {
+          throw new Error("Setup completed without a configured runtime owner");
+        }
       }
       await options.afterRuntimeReady?.();
       return result;

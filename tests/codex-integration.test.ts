@@ -29,6 +29,11 @@ import {
   snapshotFile,
   writeFilesWithCompensation,
 } from "../src/codex-integration-shared";
+import {
+  installManagedWebAgentRunner,
+  MANAGED_WEB_AGENT_RUNNER_COMMENT,
+  removeManagedWebAgentRunner,
+} from "../src/codex-integration-document";
 
 const roots: string[] = [];
 
@@ -177,6 +182,38 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(configPath, "utf8")).toBe(original);
     expect(existsSync(getCodexJournalRecoveryPath())).toBe(false);
     expect(uninstallCodexIntegration()).toEqual({ changed: false });
+  });
+
+  test("installs the explicit Web Agent Runner while preserving user MCP settings", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = '[mcp_servers.user_tool]\ncommand = "user-tool"\n\nmodel = "gpt-5.6-sol"\n';
+    writeFileSync(configPath, original);
+    const config = nativeConfig("full");
+    config.runtimeCommand = ["/opt/codex/bun", "/opt/codex/app/cli.js"];
+
+    installCodexIntegration(config, { installWebAgentRunner: true });
+    const installed = readFileSync(configPath, "utf8");
+    expect(installed).toContain('[mcp_servers.user_tool]\ncommand = "user-tool"');
+    expect(installed).toContain("[mcp_servers.web_agent_runner]");
+    expect(installed).toContain('args = ["/opt/codex/app/cli.js","runner-mcp"]');
+    uninstallCodexIntegration();
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+  });
+
+  test("adopts the legacy Web Agent Runner from the managed runtime home", () => {
+    const { appHome } = fixture();
+    const legacyRuntime = join(appHome, "versions", "5.0.7-local.22-darwin-arm64");
+    const original = [
+      "[mcp_servers.web_agent_runner]",
+      `command = ${JSON.stringify(join(legacyRuntime, "runtime", "bun"))}`,
+      `args = ${JSON.stringify([join(legacyRuntime, "app", "cli.js"), "runner-mcp"])}`,
+      "",
+    ].join("\n");
+    const installed = installManagedWebAgentRunner(original, ["/opt/codex/bun", "/opt/codex/app/cli.js"]);
+    expect(installed).toContain(MANAGED_WEB_AGENT_RUNNER_COMMENT);
+    expect(installed).toContain('args = ["/opt/codex/app/cli.js","runner-mcp"]');
+    expect(removeManagedWebAgentRunner(installed)).toBe("");
   });
 
   test("routes Codex without changing native compact or multi-agent feature flags", () => {
@@ -796,7 +833,7 @@ describe("reversible native Codex route integration", () => {
     const first = nativeConfig("browser-only");
     installCodexIntegration(first);
     const second = nativeConfig("browser-only");
-    second.port = 17842;
+    second.nativeGatewayPort = 17842;
     installCodexIntegration(second);
     expect(readFileSync(configPath, "utf8")).toContain('openai_base_url = "http://127.0.0.1:17842/v1"');
     uninstallCodexIntegration();
@@ -812,9 +849,13 @@ describe("reversible native Codex route integration", () => {
 
     const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = legacy.interruptHook.fragment as string;
-    const legacyConfig = readFileSync(configPath, "utf8").replace(interruptFragment, "");
+    const lifecycleFragment = legacy.lifecycleHooks.fragment as string;
+    const legacyConfig = readFileSync(configPath, "utf8")
+      .replace(interruptFragment, "")
+      .replace(lifecycleFragment, "");
     legacy.version = 9;
     delete legacy.interruptHook;
+    delete legacy.lifecycleHooks;
     const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
     writeFileSync(configPath, legacyConfig);
     writeFileSync(getCodexJournalPath(), legacyJournal);
@@ -925,12 +966,16 @@ describe("reversible native Codex route integration", () => {
 
     const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = legacy.interruptHook.fragment as string;
+    const lifecycleFragment = legacy.lifecycleHooks.fragment as string;
     legacy.version = 8;
     delete legacy.interruptHook;
+    delete legacy.lifecycleHooks;
     delete legacy.installed.experimental_realtime_webrtc_call_base_url;
     delete legacy.previousRealtimeWebrtcCallBaseUrl;
     const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
-    const legacyConfig = readFileSync(configPath, "utf8").replace(interruptFragment, "")
+    const legacyConfig = readFileSync(configPath, "utf8")
+      .replace(interruptFragment, "")
+      .replace(lifecycleFragment, "")
       .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
       .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*$/m, customVoiceLine);
     writeFileSync(configPath, legacyConfig);
@@ -961,12 +1006,14 @@ describe("reversible native Codex route integration", () => {
 
     const legacy = JSON.parse(currentJournal);
     const interruptFragment = legacy.interruptHook.fragment as string;
+    const lifecycleFragment = legacy.lifecycleHooks.fragment as string;
     legacy.version = 8;
     delete legacy.interruptHook;
+    delete legacy.lifecycleHooks;
     delete legacy.installed.experimental_realtime_webrtc_call_base_url;
     delete legacy.previousRealtimeWebrtcCallBaseUrl;
     const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
-    const legacyConfig = currentConfig.replace(interruptFragment, "")
+    const legacyConfig = currentConfig.replace(interruptFragment, "").replace(lifecycleFragment, "")
       .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
       .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*\n/gm, "");
 
@@ -993,7 +1040,10 @@ describe("reversible native Codex route integration", () => {
     installCodexIntegration(nativeConfig("browser-only"));
     const previous = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = previous.interruptHook.fragment as string;
-    const legacyInstalled = readFileSync(configPath, "utf8").replace(interruptFragment, "")
+    const lifecycleFragment = previous.lifecycleHooks.fragment as string;
+    const legacyInstalled = readFileSync(configPath, "utf8")
+      .replace(interruptFragment, "")
+      .replace(lifecycleFragment, "")
       .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
       .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*\n/gm, "")
       .replace(/^(?:remote_compaction_v2 = false|multi_agent = true|multi_agent_v2 = false).*\n/gm, "");
@@ -1004,6 +1054,7 @@ describe("reversible native Codex route integration", () => {
     delete previous.previousMultiAgentV2;
     delete previous.previousRealtimeWebrtcCallBaseUrl;
     delete previous.interruptHook;
+    delete previous.lifecycleHooks;
     delete previous.installed.remote_compaction_v2;
     delete previous.installed.multi_agent;
     delete previous.installed.multi_agent_v2;
@@ -1028,7 +1079,9 @@ describe("reversible native Codex route integration", () => {
     installCodexIntegration(nativeConfig("browser-only"));
     const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = legacy.interruptHook.fragment as string;
+    const lifecycleFragment = legacy.lifecycleHooks.fragment as string;
     delete legacy.interruptHook;
+    delete legacy.lifecycleHooks;
     delete legacy.previousRemoteCompactionV2;
     delete legacy.previousMultiAgent;
     delete legacy.previousMultiAgentV2;
@@ -1041,7 +1094,7 @@ describe("reversible native Codex route integration", () => {
     writeFileSync(getCodexJournalRecoveryPath(), legacyJournal);
     writeFileSync(
       configPath,
-      readFileSync(configPath, "utf8").replace(interruptFragment, "")
+      readFileSync(configPath, "utf8").replace(interruptFragment, "").replace(lifecycleFragment, "")
         .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
         .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*\n/gm, "")
         .replace(/^(?:remote_compaction_v2 = false|multi_agent = true|multi_agent_v2 = false).*\n/gm, ""),

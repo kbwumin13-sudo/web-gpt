@@ -11,6 +11,7 @@ import {
   loadConfigForSetup,
   resolveInteractionConnectorIdentities,
   saveConfig,
+  stableRuntimeCommand,
   tunnelConfigForInteractionMode,
 } from "./config";
 import {
@@ -32,14 +33,19 @@ import {
 } from "./dev-chat/constants";
 import {
   assertServiceIdle,
+  backendServiceDefinitionMatches,
+  getGatewayServiceStatus,
   getServiceStatus,
+  installGatewayService,
   installService,
   removeLegacyRuntimeArtifacts,
   restartService,
+  stopGatewayService,
   uninstallService,
+  gatewayServiceDefinitionMatches,
 } from "./service";
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
-import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
+import { getTunnelServiceStatus, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 
 export interface SetupOptions {
@@ -48,6 +54,7 @@ export interface SetupOptions {
   subagentProtocol?: SubagentProtocol;
   port?: number;
   chromeExecutablePath?: string;
+  managedBrowserHost?: boolean;
   browserHostDescriptorPath?: string;
   refreshAccountCapabilities?: boolean;
   forceLogin?: boolean;
@@ -100,6 +107,7 @@ export function launcherCapabilityProbeRequired(
     || existing?.browserInteractionMode === "manual"
     || existing?.browserHost !== "launcher"
     || typeof existing.solAvailable !== "boolean"
+    || typeof existing.extraHighAvailable !== "boolean"
     || typeof existing.proAvailable !== "boolean";
 }
 
@@ -127,6 +135,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     subagentProtocol: before.subagentProtocol,
     releaseVersion: before.releaseVersion,
     host: before.host,
+    nativeGatewayPort: before.nativeGatewayPort,
     port: before.port,
     contextWindow: before.contextWindow,
     appName: before.appName,
@@ -140,6 +149,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     brokerSocketPath: before.brokerSocketPath,
     headed: before.headed,
     solAvailable: before.solAvailable,
+    extraHighAvailable: before.extraHighAvailable,
     proAvailable: before.proAvailable,
     experimentalBiggerContext: before.experimentalBiggerContext,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
@@ -154,6 +164,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     subagentProtocol: after.subagentProtocol,
     releaseVersion: after.releaseVersion,
     host: after.host,
+    nativeGatewayPort: after.nativeGatewayPort,
     port: after.port,
     contextWindow: after.contextWindow,
     appName: after.appName,
@@ -167,6 +178,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     brokerSocketPath: after.brokerSocketPath,
     headed: after.headed,
     solAvailable: after.solAvailable,
+    extraHighAvailable: after.extraHighAvailable,
     proAvailable: after.proAvailable,
     experimentalBiggerContext: after.experimentalBiggerContext,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
@@ -249,13 +261,19 @@ function baseConfig(
   ));
   if (options.subagentProtocol) config.subagentProtocol = options.subagentProtocol;
   config.releaseVersion = VERSION;
-  config.runtimeCommand = currentRuntimeCommand();
+  config.runtimeCommand = stableRuntimeCommand(currentRuntimeCommand());
   if (options.port !== undefined) {
     if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65_535) throw new Error("--port must be an integer from 1 to 65535");
     config.port = options.port;
   }
   if (options.chromeExecutablePath) config.chromeExecutablePath = options.chromeExecutablePath;
-  if (options.browserHostDescriptorPath) {
+  if (options.managedBrowserHost && options.browserHostDescriptorPath) {
+    throw new Error("Managed Chrome and Launcher browser hosts cannot be selected together");
+  }
+  if (options.managedBrowserHost) {
+    config.browserHost = "managed-chrome";
+    delete config.browserHostDescriptorPath;
+  } else if (options.browserHostDescriptorPath) {
     config.browserHost = "launcher";
     config.browserHostDescriptorPath = options.browserHostDescriptorPath;
     config.brokerSocketPath = defaultBrokerEndpoint();
@@ -303,7 +321,7 @@ async function inspectLauncherCapabilities(
   existing: AppConfig | undefined,
   refreshAccountCapabilities: boolean,
   expectedProfile: "production" | "development",
-): Promise<{ solAvailable: boolean; proAvailable: boolean }> {
+): Promise<{ solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean }> {
   const detectCapabilities = launcherCapabilityProbeRequired(
     existing,
     refreshAccountCapabilities,
@@ -315,6 +333,9 @@ async function inspectLauncherCapabilities(
   });
   return {
     solAvailable: detectCapabilities ? inspected.solAvailable === true : existing!.solAvailable,
+    extraHighAvailable: detectCapabilities
+      ? inspected.extraHighAvailable === true
+      : existing!.extraHighAvailable === true || existing!.proAvailable,
     proAvailable: detectCapabilities ? inspected.proAvailable === true : existing!.proAvailable,
   };
 }
@@ -472,6 +493,13 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
   const beforeService = getServiceStatus();
+  const previousTunnelService = getTunnelServiceStatus();
+  const backendServiceMigration = !launcherOwned
+    && beforeService.loaded
+    && !backendServiceDefinitionMatches(config);
+  const backendOwnershipMigration = !launcherOwned
+    && (backendServiceMigration || (config.mode === "full"
+      && (previousTunnelService.installed || previousTunnelService.loaded)));
   if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
     if (!existing) {
       throw new Error("A legacy background service exists without a verifiable configuration; refusing automatic migration");
@@ -489,6 +517,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
 
   let loginCreated = false;
   let solAvailable: boolean | undefined = config.solAvailable;
+  let extraHighAvailable: boolean | undefined = config.extraHighAvailable;
   let proAvailable: boolean | undefined = config.proAvailable;
   if (config.browserInteractionMode === "manual") {
     // The generic manual route is independent of account capabilities. The launcher may open the
@@ -502,16 +531,19 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       "production",
     );
     solAvailable = capabilities.solAvailable;
+    extraHighAvailable = capabilities.extraHighAvailable;
     proAvailable = capabilities.proAvailable;
   } else {
     const stored = storedBrowserLoginCapabilities(config);
     solAvailable = stored.solAvailable;
+    extraHighAvailable = stored.extraHighAvailable;
     proAvailable = stored.proAvailable;
     const loginRequired = options.forceLogin || !browserLoginStateExists(config);
     const capabilityProbeRequired = !loginRequired
       && (options.refreshAccountCapabilities === true
         || existing?.browserInteractionMode === "manual"
         || solAvailable === undefined
+        || extraHighAvailable === undefined
         || proAvailable === undefined);
     if (beforeService.loaded && (loginRequired || capabilityProbeRequired) && !options.restartService) {
       throw new Error(
@@ -523,18 +555,26 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     if (loginRequired) {
       const login = await loginToChatGpt(config);
       solAvailable = login.solAvailable;
+      extraHighAvailable = login.extraHighAvailable;
       proAvailable = login.proAvailable;
       loginCreated = true;
     } else if (capabilityProbeRequired) {
       const inspected = await inspectBrowserLoginCapabilities(config);
       solAvailable = inspected.solAvailable;
+      extraHighAvailable = inspected.extraHighAvailable;
       proAvailable = inspected.proAvailable;
     }
   }
   config.solAvailable = solAvailable === true;
+  config.extraHighAvailable = config.solAvailable && (extraHighAvailable === true || proAvailable === true);
   config.proAvailable = config.solAvailable && proAvailable === true;
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
-  const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
+  const preliminaryChange = Boolean(existing && (
+    meaningfulRuntimeChange(existing, config)
+    || explicitTunnelChange
+    || options.forceLogin
+    || backendOwnershipMigration
+  ));
   if (beforeService.loaded && preliminaryChange && !options.restartService) {
     throw new Error(
       "The daemon is currently serving a Codex task and setup would change its runtime. "
@@ -552,20 +592,49 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     );
   }
   if (changedWhileLoaded && !preliminaryChange && existing) await assertServiceIdle(existing);
+  const beforeGatewayService = getGatewayServiceStatus();
+  if (!beforeGatewayService.loaded) await assertPortAvailable(config.host, config.nativeGatewayPort);
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
   if (!launcherOwned) {
+    if (config.mode === "browser-only" && existing?.mode === "full") {
+      if (previousTunnelService.installed || previousTunnelService.loaded) {
+        if (beforeService.loaded) await assertServiceIdle(existing);
+        await uninstallTunnelService();
+      }
+      stopTunnel(existing);
+    }
+    if (config.mode === "full") {
+      if (previousTunnelService.installed || previousTunnelService.loaded) {
+        if (beforeService.loaded) await assertServiceIdle(existing ?? config);
+        await uninstallTunnelService();
+      }
+      const profilePath = join(config.tunnel!.profileDir, `${config.tunnel!.profileName}.yaml`);
+      if (!existsSync(profilePath) || refreshTunnelWorker || explicitTunnelChange) {
+        await bootstrapTunnelProfile(config);
+      }
+    }
     saveConfig(config);
+    if (!gatewayServiceDefinitionMatches(config)) {
+      if (beforeGatewayService.loaded) await stopGatewayService(config);
+      installGatewayService(config);
+    } else if (!beforeGatewayService.loaded) {
+      installGatewayService(config);
+    }
     installService(config);
-    if (changedWhileLoaded && options.restartService && existing) await restartService(existing);
+    if ((changedWhileLoaded || backendOwnershipMigration) && options.restartService && existing) {
+      await restartService(existing);
+    }
     await waitForProxy(config);
   }
 
   let tunnelReady: boolean | null = null;
   if (config.mode === "browser-only" && existing?.mode === "full") {
-    const previousTunnelService = getTunnelServiceStatus();
-    if (previousTunnelService.installed || previousTunnelService.loaded) await uninstallTunnelService();
-    stopTunnel(existing);
+    if (launcherOwned) {
+      const previousTunnelService = getTunnelServiceStatus();
+      if (previousTunnelService.installed || previousTunnelService.loaded) await uninstallTunnelService();
+      stopTunnel(existing);
+    }
   }
   if (config.mode === "full") {
     const profilePath = join(config.tunnel!.profileDir, `${config.tunnel!.profileName}.yaml`);
@@ -577,16 +646,6 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
         await bootstrapTunnelProfile(config);
       }
     } else {
-      const needsOwnershipMigration = !tunnelService.installed || !tunnelService.loaded || !tunnelServiceDefinitionMatches(config);
-      if (needsOwnershipMigration || needsProfile) {
-        await assertServiceIdle(config);
-        if (tunnelService.loaded) await stopTunnelService();
-        await bootstrapTunnelProfile(config);
-        installTunnelService(config);
-      } else if (refreshTunnelWorker) {
-        await assertServiceIdle(config);
-        await restartTunnelService();
-      }
       const status = await waitForTunnelReady(config);
       if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);
       tunnelReady = true;
@@ -604,6 +663,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
   installCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
+    installWebAgentRunner: true,
   });
 
   return {
@@ -643,6 +703,7 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
       DEV_LAUNCHER_PROFILE,
     );
     config.solAvailable = capabilities.solAvailable;
+    config.extraHighAvailable = capabilities.solAvailable && (capabilities.extraHighAvailable || capabilities.proAvailable);
     config.proAvailable = capabilities.solAvailable && capabilities.proAvailable;
   }
 

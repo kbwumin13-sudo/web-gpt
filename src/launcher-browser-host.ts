@@ -297,7 +297,7 @@ export async function inspectLauncherBrowserHost(
     expectedProfile?: LauncherBrowserHostProfile;
     timeoutMs?: number;
   } = {},
-): Promise<{ solAvailable?: boolean; proAvailable?: boolean; url: string }> {
+): Promise<{ solAvailable?: boolean; extraHighAvailable?: boolean; proAvailable?: boolean; url: string }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   if (options.expectedProfile && descriptor.profile !== options.expectedProfile) {
     throw new Error(
@@ -329,16 +329,21 @@ export async function inspectLauncherBrowserHost(
       throw new Error("Launcher returned invalid ChatGPT session evidence");
     }
     if (options.detectCapabilities
-      && (typeof body.solAvailable !== "boolean" || typeof body.proAvailable !== "boolean")) {
+      && (typeof body.solAvailable !== "boolean"
+        || typeof body.extraHighAvailable !== "boolean"
+        || typeof body.proAvailable !== "boolean")) {
       throw new Error("Launcher did not return complete ChatGPT account capability evidence");
     }
-    if (options.detectCapabilities && body.proAvailable === true && body.solAvailable !== true) {
+    if (options.detectCapabilities
+      && (body.extraHighAvailable === true || body.proAvailable === true)
+      && body.solAvailable !== true) {
       throw new Error("Launcher returned contradictory ChatGPT account capability evidence");
     }
     return {
       url: body.url,
       ...(options.detectCapabilities ? {
         solAvailable: body.solAvailable as boolean,
+        extraHighAvailable: body.extraHighAvailable as boolean,
         proAvailable: body.proAvailable as boolean,
       } : {}),
     };
@@ -378,6 +383,8 @@ export type LauncherTurnActivity =
       status: "completed" | "failed" | "aborted";
       message?: string;
       retain?: boolean;
+      /** Keep a failed keyed tab ready for an idempotent retained-session continuation. */
+      retainForRetry?: boolean;
       connectorBound?: boolean;
     };
 

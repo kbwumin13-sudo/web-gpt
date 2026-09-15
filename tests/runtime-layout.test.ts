@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,10 +17,12 @@ import {
   resolveBrokerEndpoint,
   resolveInteractionConnectorIdentities,
   runtimeCommandForProcess,
+  stableRuntimeCommand,
   ZERO_RISK_CHATGPT_CONNECTOR_NAME,
 } from "../src/config";
 import { removeLegacyRuntimeArtifacts } from "../src/service";
 import { processRunning } from "../src/process";
+import { macOsLaunchdProxyEnvironment } from "../src/process";
 import {
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
@@ -36,6 +38,24 @@ test("managed runtime commands reject every ephemeral path component", () => {
   expect(() => assertDurableRuntimeCommand(["/private/tmp/codex-chatgpt-web"])).toThrow("ephemeral path");
   expect(() => assertDurableRuntimeCommand([process.execPath, "/tmp/build/app/cli.js"])).toThrow("ephemeral path");
   expect(() => assertDurableRuntimeCommand([process.execPath])).not.toThrow();
+});
+
+test("stable runtime entry follows the current durable bundle", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-stable-runtime-"));
+  roots.push(root);
+  const runtimeRoot = join(root, "versions", "5.0.7-darwin-arm64");
+  const home = join(root, "profile");
+  const target = join(runtimeRoot, "bin", "codex-chatgpt-web");
+  mkdirSync(join(runtimeRoot, "app"), { recursive: true });
+  mkdirSync(join(runtimeRoot, "bin"), { recursive: true });
+  writeFileSync(join(runtimeRoot, "app", "cli.js"), "\n");
+  writeFileSync(target, "#!/bin/sh\n");
+  process.env.CODEX_CHATGPT_WEB_HOME = home;
+
+  const stable = stableRuntimeCommand([process.execPath, join(runtimeRoot, "app", "cli.js")]);
+  expect(stable).toEqual([join(home, "bin", "codex-chatgpt-web")]);
+  expect(realpathSync(stable[0]!)).toBe(realpathSync(target));
+  expect(stableRuntimeCommand([process.execPath, join(runtimeRoot, "app", "cli.js")])).toEqual(stable);
 });
 
 test("Windows Bun shims resolve to the installed Bun executable before service setup", () => {
@@ -87,12 +107,24 @@ test("permission-denied process probes preserve ownership evidence", () => {
   expect(processRunning(0)).toBe(false);
 });
 
+test("launchd proxy environment drops a dead loopback proxy before deriving system proxy", () => {
+  const environment = macOsLaunchdProxyEnvironment(
+    { HTTPS_PROXY: "http://127.0.0.1:1", HTTP_PROXY: "http://127.0.0.1:1" },
+    "HTTPSEnable : 0\n",
+    "darwin",
+  );
+  expect(environment.HTTPS_PROXY).toBeUndefined();
+  expect(environment.HTTP_PROXY).toBeUndefined();
+});
+
 test("user-home expansion accepts native Unix and Windows separators", () => {
   expect(expandUserPath("~/runtime")).toBe(join(homedir(), "runtime"));
   expect(expandUserPath("~\\runtime")).toBe(join(homedir(), "runtime"));
 });
 
 test("default setup uses the fixed production connector identities", () => {
+  expect(defaultConfig("full").nativeGatewayPort).toBe(17841);
+  expect(defaultConfig("full").port).toBe(17842);
   expect(defaultConfig("full").appName).toBe(CHATGPT_CONNECTOR_NAME);
   expect(defaultConfig("full").automaticAppName).toBe(CHATGPT_CONNECTOR_NAME);
   expect(defaultConfig("full").manualAppName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
@@ -162,6 +194,8 @@ test("setup explicitly migrates v1 pro-only config to v3 managed browser-only", 
   expect(loadConfigForSetup()).toMatchObject({
     version: 3,
     mode: "browser-only",
+    nativeGatewayPort: 17841,
+    port: 17842,
     browserHost: "managed-chrome",
     browserInteractionMode: "automatic",
     subagentProtocol: "compatibility-v1",

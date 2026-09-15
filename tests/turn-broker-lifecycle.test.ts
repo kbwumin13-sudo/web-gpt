@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -212,6 +212,31 @@ test("turn broker creates its private runtime directory on a cold start", async 
     }
   } finally {
     await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("turn broker close does not unlink a replacement socket owner", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-replacement-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  const replacement = createServer();
+  try {
+    await broker.listen();
+    unlinkSync(socketPath);
+    await new Promise<void>((resolveListen, rejectListen) => {
+      replacement.once("error", rejectListen);
+      replacement.listen(socketPath, () => {
+        replacement.off("error", rejectListen);
+        resolveListen();
+      });
+    });
+    await broker.close();
+    expect(existsSync(socketPath)).toBe(true);
+  } finally {
+    if (replacement.listening) await new Promise<void>(resolveClose => replacement.close(() => resolveClose()));
+    if (existsSync(socketPath)) unlinkSync(socketPath);
     rmSync(root, { recursive: true, force: true });
   }
 });

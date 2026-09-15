@@ -1,6 +1,8 @@
 import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
+import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retained-telemetry";
+import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import {
@@ -36,6 +38,7 @@ import {
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
 import { forwardNativeCodexRequest, type NativeFetch, type NativeImageEndpoint } from "./native-passthrough";
+import { catalogMatchesExpected, expectedWebModelEfforts, expectedWebModels, publishedWebCatalogEvidence } from "./readiness";
 import {
   buildCompactV1Output,
   COMPACT_PROMPT,
@@ -48,8 +51,16 @@ import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
+import { processRunning } from "./process";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
+
+export interface BackendServer {
+  port: number | undefined;
+  stop(force?: boolean): void | Promise<void>;
+  shutdown(): Promise<void>;
+  isIdle?(): boolean;
+}
 
 export interface NativeCodexTurnIdentity {
   threadId: string;
@@ -586,11 +597,14 @@ export async function responseRequest(
       headers: { "content-type": "application/json" },
     });
   }
-  const adapter = adapterFactory(provider);
-  const queue = new AsyncEventQueue<AdapterEvent>();
   const abort = new AbortController();
   if (req.signal.aborted) abort.abort();
   else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
+  if (abort.signal.aborted) {
+    return new Response(null, { status: 499, statusText: "Client Closed Request" });
+  }
+  const adapter = adapterFactory(provider);
+  const queue = new AsyncEventQueue<AdapterEvent>();
   const run = async () => {
     try {
       await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: abort.signal }, event => {
@@ -770,7 +784,7 @@ export async function compactRequest(
 export function startServer(
   config: AppConfig,
   dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
-): ReturnType<typeof Bun.serve> {
+): BackendServer {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
   }
@@ -787,10 +801,28 @@ export function startServer(
   let shutdownPromise: Promise<void> | undefined;
   let successfulModelCatalogRequests = 0;
   let lastSuccessfulModelCatalogRequestAt: string | null = null;
+  let publishedWebModels: string[] = [];
+  let publishedWebModelEfforts: Record<string, string> = {};
+  let modelCatalogContractHash: string | null = null;
   const httpTurns = new HttpTurnCounter();
+  const sessionLeases = new Map<string, { refreshedAt: number; ownerPid?: number }>();
+  let lastActivityAt = startedAt;
+  const sessionLeaseTtlMs = 5 * 60_000;
+  const backendIdleTimeoutMs = 120_000;
+  const pruneSessionLeases = (): void => {
+    const staleBefore = Date.now() - sessionLeaseTtlMs;
+    for (const [sessionId, lease] of sessionLeases) {
+      if (lease.ownerPid !== undefined && !processRunning(lease.ownerPid)) {
+        sessionLeases.delete(sessionId);
+      } else if (lease.ownerPid === undefined && lease.refreshedAt < staleBefore) {
+        sessionLeases.delete(sessionId);
+      }
+    }
+  };
   const activity = () => ({
     active_http_turns: httpTurns.count(),
     active_browser_turns: chatGptTurnSessions.activeCount() + (turnBroker?.externalOwnerActiveCount() ?? 0),
+    active_sessions: sessionLeases.size,
   });
   const controlAuthorized = (req: Request): boolean => {
     const header = req.headers.get("authorization") ?? "";
@@ -804,7 +836,9 @@ export function startServer(
     idleTimeout: 0,
     async fetch(req) {
       const url = new URL(req.url);
+      if (url.pathname !== "/healthz") lastActivityAt = Date.now();
       if (req.method === "GET" && url.pathname === "/healthz") {
+        pruneSessionLeases();
         return Response.json({
           status: "ok",
           service: "codex-chatgpt-web",
@@ -816,8 +850,53 @@ export function startServer(
           accepting_turns: !draining,
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
+          expected_web_models: expectedWebModels(config),
+          expected_web_model_efforts: expectedWebModelEfforts(config),
+          published_web_models: publishedWebModels,
+          published_web_model_efforts: publishedWebModelEfforts,
+          model_catalog_contract_hash: modelCatalogContractHash,
+          catalog_ready: catalogMatchesExpected({
+            expectedWebModels: expectedWebModels(config),
+            publishedWebModels,
+            expectedWebModelEfforts: expectedWebModelEfforts(config),
+            publishedWebModelEfforts,
+          }),
+          retained_conversation: chatGptRetainedTelemetrySnapshot(),
+          memory_retrieval: memoryRetrievalSnapshot(),
           ...activity(),
         });
+      }
+      if (req.method === "POST" && url.pathname === "/admin/session") {
+        if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        let action: "acquire" | "refresh" | "release";
+        let sessionId: string;
+        let ownerPid: number | undefined;
+        try {
+          const body = await req.json() as { action?: unknown; session_id?: unknown; owner_pid?: unknown };
+          action = body.action as typeof action;
+          sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+          if (action !== "acquire" && action !== "refresh" && action !== "release") {
+            throw new Error("session action is invalid");
+          }
+          if (!/^[A-Za-z0-9_-]{6,128}$/.test(sessionId)) throw new Error("session_id is invalid");
+          if (body.owner_pid !== undefined
+            && (!Number.isSafeInteger(body.owner_pid) || (body.owner_pid as number) < 1)) {
+            throw new Error("owner_pid is invalid");
+          }
+          ownerPid = body.owner_pid as number | undefined;
+          if (ownerPid !== undefined && !processRunning(ownerPid)) throw new Error("owner_pid is not running");
+        } catch (error) {
+          return Response.json(
+            { status: "error", error: error instanceof Error ? error.message : String(error) },
+            { status: 400 },
+          );
+        }
+        pruneSessionLeases();
+        if (action === "release") sessionLeases.delete(sessionId);
+        else {
+          sessionLeases.set(sessionId, { refreshedAt: Date.now(), ...(ownerPid === undefined ? {} : { ownerPid }) });
+        }
+        return Response.json({ status: "ok", active_sessions: sessionLeases.size });
       }
       if (req.method === "POST" && (url.pathname === "/admin/drain" || url.pathname === "/admin/resume")) {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
@@ -974,6 +1053,16 @@ export function startServer(
           if (response.ok) {
             successfulModelCatalogRequests += 1;
             lastSuccessfulModelCatalogRequestAt = new Date().toISOString();
+            try {
+              const evidence = publishedWebCatalogEvidence(await response.clone().json());
+              publishedWebModels = evidence.publishedWebModels;
+              publishedWebModelEfforts = evidence.publishedWebModelEfforts;
+              modelCatalogContractHash = evidence.contractHash;
+            } catch {
+              publishedWebModels = [];
+              publishedWebModelEfforts = {};
+              modelCatalogContractHash = null;
+            }
           }
           return response;
         }, req.signal, process.platform, "models");
@@ -1062,7 +1151,21 @@ export function startServer(
       console.error(`[codex-chatgpt-web] server shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
+  async function shutdownAndWait(): Promise<void> {
+    shutdown();
+    await shutdownPromise;
+  }
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
-  return server;
+  return Object.assign(server, {
+    shutdown: shutdownAndWait,
+    isIdle: (): boolean => {
+      pruneSessionLeases();
+      const current = activity();
+      return current.active_http_turns === 0
+        && current.active_browser_turns === 0
+        && current.active_sessions === 0
+        && Date.now() - lastActivityAt >= backendIdleTimeoutMs;
+    },
+  });
 }

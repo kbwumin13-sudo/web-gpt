@@ -19,7 +19,15 @@ test("the full verification gate audits launcher dependencies", () => {
   const verify = fs.readFileSync(path.join(repositoryRoot, "scripts", "verify.ts"), "utf8");
   assert.equal(manifest.scripts.audit, "bun audit");
   assert.equal(repositoryManifest.scripts["launcher:audit"], "bun run --cwd launcher audit");
-  assert.match(verify, /await run\(\["run", "launcher:audit"\]\);/);
+  for (const step of [
+    "check-version", "audit", "launcher:audit", "typecheck",
+    "test", "launcher:typecheck", "launcher:test", "launcher:build",
+  ]) {
+    assert.match(verify, new RegExp(`args: \\["run", "${step}"\\]`), `verify.ts must run ${step}`);
+  }
+  // Steps keep running after one fails, so the gate must still fail the run when any did not pass.
+  assert.match(verify, /result !== "passed"/);
+  assert.match(verify, /process\.exit\(1\)/);
 });
 
 test("launcher publishes native packages for all supported desktop operating systems", () => {

@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const { redactText } = require("./logging.cjs");
 const {
@@ -24,6 +24,11 @@ const TUNNEL_MONITOR_INTERVAL_MS = 10_000;
 const TUNNEL_MONITOR_FAILURE_THRESHOLD = 3;
 const TUNNEL_MCP_FAILURE_RECENCY_MS = 2 * 60_000;
 const BOOT_TIME_CLOCK_TOLERANCE_MS = 5_000;
+// A stop waits for in-flight start and recovery work to settle first. That wait is a courtesy, not
+// a requirement: the stop terminates the same children anyway, so it must not outlive the quit.
+const SETTLE_BEFORE_STOP_TIMEOUT_MS = 10_000;
+// Generous enough for a healthy drain, tunnel stop, and daemon stop to finish on their own terms.
+const FORCED_SHUTDOWN_DEADLINE_MS = 45_000;
 const CURRENT_BOOT_STARTED_AT_MS = Date.now() - (os.uptime() * 1_000);
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -64,8 +69,74 @@ function loopbackHealthBaseURL(value) {
   }
 }
 
+function localTunnelHealthBaseURL(output, alias) {
+  try {
+    const parsed = JSON.parse(output);
+    const entry = Array.isArray(parsed?.aliases)
+      ? parsed.aliases.find(candidate => candidate?.alias === alias)
+      : undefined;
+    const healthURLFile = entry?.health_url_file;
+    if (typeof healthURLFile !== "string" || !path.isAbsolute(healthURLFile)) return null;
+    const stat = fs.lstatSync(healthURLFile);
+    if (!stat.isFile() || stat.size > 4_096) return null;
+    return loopbackHealthBaseURL(fs.readFileSync(healthURLFile, "utf8").trim());
+  } catch {
+    return null;
+  }
+}
+
+function macOsSystemProxyEnvironment(inherited = process.env, proxyOutput) {
+  const environment = { ...inherited };
+  const hasExplicitProxy = [
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+  ].some((name) => typeof environment[name] === "string" && environment[name].trim());
+  if (hasExplicitProxy || (process.platform !== "darwin" && proxyOutput === undefined)) return environment;
+
+  let output = proxyOutput;
+  if (output === undefined) {
+    const discovered = spawnSync("/usr/sbin/scutil", ["--proxy"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    });
+    if (discovered.status !== 0 || typeof discovered.stdout !== "string") return environment;
+    output = discovered.stdout;
+  }
+  const field = (name) => {
+    const match = output.match(new RegExp(`^\\s*${name}\\s*:\\s*([^\\r\\n]+?)\\s*$`, "m"));
+    return match?.[1]?.trim();
+  };
+  if (field("HTTPSEnable") !== "1") return environment;
+  const host = field("HTTPSProxy");
+  const port = Number(field("HTTPSPort"));
+  if (!host || /[\\s/@]/.test(host) || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    return environment;
+  }
+  const proxyHost = host.includes(":") ? `[${host}]` : host;
+  const proxyUrl = `http://${proxyHost}:${port}`;
+  environment.HTTPS_PROXY = proxyUrl;
+  environment.HTTP_PROXY = proxyUrl;
+  const noProxy = new Set(String(environment.NO_PROXY || environment.no_proxy || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean));
+  for (const value of ["127.0.0.1", "localhost", "::1"]) noProxy.add(value);
+  environment.NO_PROXY = [...noProxy].join(",");
+  return environment;
+}
+
 function readJson(pathname) {
   return JSON.parse(fs.readFileSync(pathname, "utf8"));
+}
+
+function normalizeLegacyRuntimeConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { config: value, migrated: false };
+  if (value.version !== 3 || Object.prototype.hasOwnProperty.call(value, "extraHighAvailable")) {
+    return { config: value, migrated: false };
+  }
+  // v3 conflated Pro and Extra High. Preserve that one legacy implication, then make the
+  // capability explicit so later reads can distinguish an explicit false from an old config.
+  return { config: { ...value, extraHighAvailable: value.proAvailable === true }, migrated: true };
 }
 
 function errorMessage(error) {
@@ -74,6 +145,24 @@ function errorMessage(error) {
 
 function appendFailure(primary, label, failure) {
   return `${primary}; ${label}: ${errorMessage(failure)}`;
+}
+
+/**
+ * Bound an await that must not be able to hang forever. A hang is not a rejection, so a promise
+ * that never settles silently disables every error path built around it.
+ */
+function withDeadline(promise, timeoutMs, description) {
+  // The loser of the race still needs a handler, or a later rejection is reported as unhandled.
+  promise.catch(() => {});
+  let timer;
+  const expiry = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${description} did not settle within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    if (typeof timer?.unref === "function") timer.unref();
+  });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
 
 function absolutePath(value, platform = process.platform) {
@@ -188,6 +277,7 @@ function managedTunnelConnectArgs(config, invocation) {
 }
 
 function validateConfig(config, descriptorPath, platform = process.platform, launcherProfile = "production") {
+  config = normalizeLegacyRuntimeConfig(config).config;
   if (!config || config.version !== 3) throw new Error("Runtime configuration is missing or unsupported");
   if (launcherProfile === "development") {
     if (config.purpose !== "dev-harness") {
@@ -246,7 +336,7 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
   } else if (!absolutePath(config.brokerSocketPath, platform) || windowsPipeEndpoint(config.brokerSocketPath)) {
     throw new Error("Runtime configuration has an invalid Unix broker socket");
   }
-  for (const key of ["headed", "solAvailable", "proAvailable", "autoApproveToolCalls"]) {
+  for (const key of ["headed", "solAvailable", "extraHighAvailable", "proAvailable", "autoApproveToolCalls"]) {
     if (typeof config[key] !== "boolean") {
       throw new Error(`Runtime configuration has an invalid ${key}`);
     }
@@ -261,6 +351,9 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
   }
   if (config.proAvailable && !config.solAvailable) {
     throw new Error("Runtime configuration cannot enable Pro without Sol");
+  }
+  if (config.proAvailable && !config.extraHighAvailable) {
+    throw new Error("Runtime configuration cannot enable Pro without Extra High");
   }
   if (!Array.isArray(config.runtimeCommand)
     || config.runtimeCommand.length === 0
@@ -361,8 +454,11 @@ class RuntimeSupervisor {
 
   readConfig() {
     if (!fs.existsSync(this.configPath)) return null;
+    const raw = readJson(this.configPath);
+    const normalized = normalizeLegacyRuntimeConfig(raw);
+    if (normalized.migrated) writePrivateFileAtomic(this.configPath, `${JSON.stringify(normalized.config, null, 2)}\n`);
     return validateConfig(
-      readJson(this.configPath),
+      normalized.config,
       this.browserDescriptorPath,
       this.platform,
       this.launcherProfile,
@@ -371,7 +467,9 @@ class RuntimeSupervisor {
 
   readSetupConfig() {
     if (!fs.existsSync(this.configPath)) return null;
-    const config = readJson(this.configPath);
+    const normalized = normalizeLegacyRuntimeConfig(readJson(this.configPath));
+    const config = normalized.config;
+    if (normalized.migrated) writePrivateFileAtomic(this.configPath, `${JSON.stringify(config, null, 2)}\n`);
     if (!config || typeof config !== "object" || Array.isArray(config)) {
       throw new Error("Runtime configuration is not an object");
     }
@@ -482,7 +580,7 @@ class RuntimeSupervisor {
       cwd: invocation.cwd,
       detached: DETACH_OWNED_CHILD,
       env: {
-        ...process.env,
+        ...macOsSystemProxyEnvironment(process.env),
         CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -779,6 +877,19 @@ class RuntimeSupervisor {
   async discoverTunnelHealthBaseUrl(config) {
     const tunnel = config.tunnel;
     if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
+    const local = await this.runTunnelCommand(
+      config,
+      ["runtimes", "list", "--json"],
+      5_000,
+      "Local tunnel diagnostics discovery",
+    );
+    if (local.code === 0) {
+      const baseUrl = localTunnelHealthBaseURL(local.output, tunnel.alias);
+      if (baseUrl) {
+        this.tunnelHealthBaseUrl = baseUrl;
+        return baseUrl;
+      }
+    }
     const result = await this.runTunnelCommand(
       config,
       ["runtimes", "status", tunnel.alias, "--json"],
@@ -1590,6 +1701,7 @@ class RuntimeSupervisor {
       const child = spawn(tunnel.binaryPath, args, {
         cwd: tunnel.profileDir,
         detached: DETACH_OWNED_CHILD,
+        env: macOsSystemProxyEnvironment(process.env),
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
@@ -1922,7 +2034,9 @@ class RuntimeSupervisor {
   async performStopForSetup() {
     if (this.startPromise) {
       try {
-        await this.startPromise;
+        // A start that is stuck must not hold the stop open. Tunnel start alone budgets two
+        // minutes, and a start that never settles would block the quit indefinitely.
+        await withDeadline(this.startPromise, SETTLE_BEFORE_STOP_TIMEOUT_MS, "runtime start");
       } catch (error) {
         this.logger.warn("runtime.start_failed_before_stop", { message: errorMessage(error) });
       }
@@ -1937,7 +2051,15 @@ class RuntimeSupervisor {
       }
     }
     if (this.recoveryTasks.size > 0) {
-      await Promise.allSettled([...this.recoveryTasks]);
+      try {
+        await withDeadline(
+          Promise.allSettled([...this.recoveryTasks]),
+          SETTLE_BEFORE_STOP_TIMEOUT_MS,
+          "runtime recovery tasks",
+        );
+      } catch (error) {
+        this.logger.warn("runtime.recovery_unsettled_before_stop", { message: errorMessage(error) });
+      }
     }
     let drained = false;
     let tunnelStopped = false;
@@ -2041,7 +2163,17 @@ class RuntimeSupervisor {
       }
     }
     try {
-      if (this.recoveryTasks.size > 0) await Promise.allSettled([...this.recoveryTasks]);
+      if (this.recoveryTasks.size > 0) {
+        try {
+          await withDeadline(
+            Promise.allSettled([...this.recoveryTasks]),
+            SETTLE_BEFORE_STOP_TIMEOUT_MS,
+            "runtime recovery tasks",
+          );
+        } catch (error) {
+          this.logger.warn("runtime.recovery_unsettled_before_stop", { message: errorMessage(error) });
+        }
+      }
       const failures = [];
       if (this.tunnel) {
         try {
@@ -2076,10 +2208,20 @@ class RuntimeSupervisor {
     }
   }
 
-  async shutdown({ cancelActiveTurns = false, force = false } = {}) {
+  async shutdown({
+    cancelActiveTurns = false,
+    force = false,
+    deadlineMs = FORCED_SHUTDOWN_DEADLINE_MS,
+  } = {}) {
     try {
-      if (cancelActiveTurns) await this.cancelActiveTurns();
-      return await this.stopForSetup();
+      const stop = (async () => {
+        if (cancelActiveTurns) await this.cancelActiveTurns();
+        return await this.stopForSetup();
+      })();
+      // `force` promises that the caller's quit completes, so it needs a deadline and not only a
+      // catch. A hung stop never rejects, which would leave the fallback below unreachable and the
+      // launcher impossible to quit. A stop that is merely slow still finishes on its own terms.
+      return await (force ? withDeadline(stop, deadlineMs, "runtime shutdown") : stop);
     } catch (error) {
       if (!force) throw error;
       return this.forceStopOwnedRuntime(error);
@@ -2088,13 +2230,18 @@ class RuntimeSupervisor {
 }
 
 module.exports = {
+  FORCED_SHUTDOWN_DEADLINE_MS,
   MAX_RESTARTS_PER_WINDOW,
   RESTART_WINDOW_MS,
+  SETTLE_BEFORE_STOP_TIMEOUT_MS,
   TUNNEL_HEALTH_POLL_INTERVAL_MS,
   TUNNEL_MONITOR_FAILURE_THRESHOLD,
   TUNNEL_MONITOR_INTERVAL_MS,
   TUNNEL_START_TIMEOUT_MS,
   RuntimeSupervisor,
+  macOsSystemProxyEnvironment,
   managedTunnelConnectArgs,
   validateConfig,
+  normalizeLegacyRuntimeConfig,
+  withDeadline,
 };

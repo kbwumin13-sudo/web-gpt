@@ -1,0 +1,13 @@
+{
+  "name": "handoff accepted then target key occupied during cleanup",
+  "events": [
+    "handoff_accepted",
+    "target_execution_key_occupied",
+    "cleanup_collision"
+  ],
+  "expected": {
+    "outcome": "committed",
+    "cleanup_warning": true,
+    "error_code": null
+  }
+}

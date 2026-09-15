@@ -2301,6 +2301,7 @@ class BrowserHost {
     message,
     retain = false,
     connectorBound = false,
+    retainForRetry = false,
   ) {
     const tab = [...this.turnTabs.values()].find((candidate) => candidate.traceId === traceId);
     if (!tab) {
@@ -2326,14 +2327,17 @@ class BrowserHost {
     if (status === "completed") {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
     }
-    if (status === "completed"
-      && retain
+    const retainFailedForRetry = status !== "completed" && retainForRetry;
+    if ((status === "completed" && retain || retainFailedForRetry)
       && tab.conversationKey
       && (!tab.connectorIdentity || connectorBound)) {
       tab.connectorBound = connectorBound === true;
       tab.lastHeartbeatAt = Date.now();
+      tab.status = "ready";
+      tab.loading = false;
+      tab.message = status === "completed" ? "Task completed" : "ChatGPT turn retained for retry";
       if (hideAfterTurn && !this.activeTraceId) this.hide();
-      this.logger.info("browser.tab_retained", { tabId: tab.id, traceId });
+      this.logger.info("browser.tab_retained", { tabId: tab.id, traceId, status });
       this.publishState?.(this.snapshot());
       this.writeDescriptor();
       return { cancelledByUser };
@@ -2807,10 +2811,14 @@ class BrowserHost {
       throw new Error("Browser helper returned invalid ChatGPT session evidence");
     }
     if (detectCapabilities
-      && (typeof inspected.solAvailable !== "boolean" || typeof inspected.proAvailable !== "boolean")) {
+      && (typeof inspected.solAvailable !== "boolean"
+        || typeof inspected.extraHighAvailable !== "boolean"
+        || typeof inspected.proAvailable !== "boolean")) {
       throw new Error("Browser helper returned incomplete ChatGPT capability evidence");
     }
-    if (detectCapabilities && inspected.proAvailable && !inspected.solAvailable) {
+    if (detectCapabilities
+      && (inspected.extraHighAvailable || inspected.proAvailable)
+      && !inspected.solAvailable) {
       throw new Error("Browser helper returned contradictory ChatGPT capability evidence");
     }
     if (startedIdle) await this.returnToIdle();

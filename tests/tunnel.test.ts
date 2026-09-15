@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError, tunnelHealthFileFromInventory, tunnelStopReachedTerminalState } from "../src/tunnel";
+import { macOsSystemProxyEnvironment } from "../src/process";
 
 test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
   expect(TUNNEL_VERSION).toBe("0.0.12");
@@ -7,6 +8,57 @@ test("pins the fixed tunnel-client and migrates only the previously shipped vers
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
+
+test("CLI tunnel startup derives the active macOS HTTPS proxy without overriding explicit settings", () => {
+  const detected = macOsSystemProxyEnvironment({ NO_PROXY: "example.test" }, `
+<dictionary> {
+  HTTPSEnable : 1
+  HTTPSPort : 7890
+  HTTPSProxy : 127.0.0.1
+}
+`, "darwin");
+  expect(detected.HTTPS_PROXY).toBe("http://127.0.0.1:7890");
+  expect(detected.HTTP_PROXY).toBe("http://127.0.0.1:7890");
+  expect(detected.NO_PROXY).toContain("example.test");
+  expect(detected.NO_PROXY).toContain("127.0.0.1");
+
+  const explicit = macOsSystemProxyEnvironment({
+    HTTPS_PROXY: "http://explicit:8443",
+  }, "", "darwin");
+  expect(explicit.HTTPS_PROXY).toBe("http://explicit:8443");
+});
+
+test("local tunnel readiness discovery accepts only the exact alias and an absolute health file", () => {
+  const absolute = process.platform === "win32"
+    ? "C:\\Users\\Example\\tunnel-health.url"
+    : "/Users/example/tunnel-health.url";
+  const inventory = JSON.stringify({
+    aliases: [
+      { alias: "other", health_url_file: "/tmp/unrelated.url" },
+      { alias: "codex-chatgpt-web", health_url_file: absolute },
+    ],
+  });
+  expect(tunnelHealthFileFromInventory(inventory, "codex-chatgpt-web")).toBe(absolute);
+  expect(tunnelHealthFileFromInventory(inventory, "missing")).toBeUndefined();
+  expect(tunnelHealthFileFromInventory(JSON.stringify({
+    aliases: [{ alias: "codex-chatgpt-web", health_url_file: "relative.url" }],
+  }), "codex-chatgpt-web")).toBeUndefined();
+});
+
+test("tunnel stop accepts a nonzero native result only when its structured state is terminal", () => {
+  expect(tunnelStopReachedTerminalState(JSON.stringify({
+    process_running: false,
+    runtime_state: "stopped",
+    stopped: false,
+    error: "process 123 did not exit after SIGTERM",
+  }))).toBeTrue();
+  expect(tunnelStopReachedTerminalState(JSON.stringify({
+    process_running: true,
+    runtime_state: "stopping",
+    stopped: false,
+  }))).toBeFalse();
+  expect(tunnelStopReachedTerminalState("not json")).toBeFalse();
 });
 
 describe("tunnel status boundary", () => {

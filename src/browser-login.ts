@@ -1,13 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { chromium, type BrowserContext, type BrowserContextOptions } from "playwright-core";
+import { chromium, type BrowserContext, type BrowserContextOptions, type Page } from "playwright-core";
 import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
   CHATGPT_TEMPORARY_CHAT_URL,
+  CHATGPT_COMPOSER_SELECTOR,
   detectChatGptAccountCapabilities,
 } from "./chatgpt-session";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
@@ -16,6 +17,7 @@ export interface BrowserLoginResult {
   storageStatePath: string;
   accountSurfaceUrl: string;
   solAvailable: boolean;
+  extraHighAvailable: boolean;
   proAvailable: boolean;
 }
 
@@ -43,6 +45,7 @@ interface LoginVerificationMarker {
   authenticated: true;
   verifiedAt: string;
   solAvailable?: boolean;
+  extraHighAvailable?: boolean;
   proAvailable?: boolean;
 }
 
@@ -137,6 +140,24 @@ export function loginVerificationMarkerPath(storageStatePath: string): string {
   return `${storageStatePath}.verified.json`;
 }
 
+export function chromeProxyArguments(environment: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = [environment.HTTPS_PROXY, environment.https_proxy, environment.HTTP_PROXY, environment.http_proxy]
+    .find(value => typeof value === "string" && value.trim())?.trim();
+  if (!raw) return [];
+  try {
+    const proxy = new URL(raw);
+    if (!["http:", "https:", "socks4:", "socks5:"].includes(proxy.protocol)
+      || proxy.username || proxy.password || proxy.pathname !== "/" || proxy.search || proxy.hash) return [];
+    return [`--proxy-server=${proxy.protocol}//${proxy.host}`];
+  } catch {
+    return [];
+  }
+}
+
+function chatGptComposer(page: Page) {
+  return page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).last();
+}
+
 function writeVerificationMarker(
   storageStatePath: string,
   capabilities: ChatGptWebAccountCapabilities,
@@ -154,18 +175,19 @@ async function inspectStoredState(
   config: AppConfig,
   storageState: NonNullable<BrowserContextOptions["storageState"]>,
 ): Promise<ChatGptWebAccountCapabilities & { url: string }> {
+  const proxyArgs = chromeProxyArguments();
   const verifierBrowser = await chromium.launch({
     executablePath: config.chromeExecutablePath,
     headless: false,
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-    args: ["--no-first-run", "--no-default-browser-check"],
+    args: ["--no-first-run", "--no-default-browser-check", ...proxyArgs],
   });
   try {
     const verifierContext = await verifierBrowser.newContext({ storageState });
     try {
       const verifierPage = await verifierContext.newPage();
       await verifierPage.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await verifierPage.getByRole("textbox", { name: "Chat with ChatGPT" }).waitFor({ state: "visible", timeout: 60_000 });
+      await chatGptComposer(verifierPage).waitFor({ state: "visible", timeout: 60_000 });
       await assertAuthenticatedChatGptPage(verifierPage);
       await assertTemporaryChatPage(verifierPage);
       return { ...await detectChatGptAccountCapabilities(verifierPage), url: verifierPage.url() };
@@ -181,7 +203,11 @@ export async function inspectBrowserLoginCapabilities(config: AppConfig): Promis
   if (!browserLoginStateExists(config)) throw new Error("ChatGPT login state is missing or unverified");
   const inspected = await inspectStoredState(config, config.storageStatePath);
   writeVerificationMarker(config.storageStatePath, inspected);
-  return { solAvailable: inspected.solAvailable, proAvailable: inspected.proAvailable };
+  return {
+    solAvailable: inspected.solAvailable,
+    extraHighAvailable: inspected.extraHighAvailable === true || inspected.proAvailable === true,
+    proAvailable: inspected.proAvailable,
+  };
 }
 
 export function storedBrowserLoginCapabilities(
@@ -192,6 +218,7 @@ export function storedBrowserLoginCapabilities(
     const marker = JSON.parse(readFileSync(loginVerificationMarkerPath(config.storageStatePath), "utf8")) as Partial<LoginVerificationMarker>;
     return {
       ...(typeof marker.solAvailable === "boolean" ? { solAvailable: marker.solAvailable } : {}),
+      ...(typeof marker.extraHighAvailable === "boolean" ? { extraHighAvailable: marker.extraHighAvailable } : {}),
       ...(typeof marker.proAvailable === "boolean" ? { proAvailable: marker.proAvailable } : {}),
     };
   } catch {
@@ -233,12 +260,14 @@ export async function captureSystemBrowserLogin(
   let context: BrowserContext | undefined;
   let primaryError: unknown;
   try {
+    const proxyArgs = chromeProxyArguments();
     const loginBrowser = spawn(config.chromeExecutablePath, [
       `--user-data-dir=${profileDir}`,
       "--new-window",
       "--disable-background-mode",
       "--no-first-run",
       "--no-default-browser-check",
+      ...proxyArgs,
       CHATGPT_TEMPORARY_CHAT_URL,
     ], { env: process.env, stdio: "ignore" });
     let continuationRequested = false;
@@ -296,6 +325,7 @@ export async function captureSystemBrowserLogin(
         "--no-first-run",
         "--no-default-browser-check",
         "--restore-last-session",
+        ...proxyArgs,
       ],
       timeout: Math.min(30_000, remainingTime()),
     });
@@ -378,12 +408,14 @@ export async function loginToChatGpt(
   process.stdout.write(
     "A normal Chrome window is open. Sign in to ChatGPT, confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n",
   );
+  const proxyArgs = chromeProxyArguments();
   const loginBrowser = spawn(config.chromeExecutablePath, [
     `--user-data-dir=${profileDir}`,
     "--new-window",
     "--disable-background-mode",
     "--no-first-run",
     "--no-default-browser-check",
+    ...proxyArgs,
     CHATGPT_TEMPORARY_CHAT_URL,
   ], { env: process.env, stdio: "ignore" });
   const loginExit = await new Promise<number>((resolveExit, rejectExit) => {
@@ -399,7 +431,7 @@ export async function loginToChatGpt(
     executablePath: config.chromeExecutablePath,
     headless: false,
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-    args: ["--no-first-run", "--no-default-browser-check"],
+    args: ["--no-first-run", "--no-default-browser-check", ...proxyArgs],
   });
   try {
     const page = context.pages()[0] ?? await context.newPage();
@@ -407,9 +439,7 @@ export async function loginToChatGpt(
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
-      page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
-    ).first();
+    const composer = chatGptComposer(page);
     try {
       await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
     } catch {
@@ -426,6 +456,7 @@ export async function loginToChatGpt(
       storageStatePath: config.storageStatePath,
       accountSurfaceUrl: page.url(),
       solAvailable: inspected.solAvailable,
+      extraHighAvailable: inspected.extraHighAvailable === true || inspected.proAvailable === true,
       proAvailable: inspected.proAvailable,
     };
   } finally {

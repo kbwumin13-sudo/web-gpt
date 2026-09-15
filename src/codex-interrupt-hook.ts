@@ -136,14 +136,32 @@ function hookTextPattern(text: string): string {
     .join("(?:\\r\\n|\\n|\\r)");
 }
 
+// TOML rejects a bare carriage return, so a CR-only config cannot be handed to the parser as-is.
+// Valid TOML never contains one, including inside strings, so replacing it cannot change a
+// document's values. Parsing only compares owned definitions and never produces output, which
+// keeps CR configs restorable byte for byte.
+function parseConfigToml(text: string): unknown {
+  return Bun.TOML.parse(text.replace(/\r(?!\n)/g, "\n"));
+}
+
 function locateCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): Array<{
   start: number; end: number;
 }> {
   const marker = installed.fragment.indexOf(MANAGED_INTERRUPT_HOOK_END);
   if (marker < 0) throw new Error("Codex interrupt lifecycle hook journal fragment is invalid");
-  const ownedPrefix = installed.fragment.slice(0, marker);
-  // Native config writes normalize CRLF to LF; commands and owned fields must still match exactly.
-  const pattern = new RegExp(hookTextPattern(ownedPrefix), "g");
+  // Codex's TOML editor may move the hooks.state table away from the command hook while it
+  // inserts unrelated tables. Match the command definition textually, then validate both owned
+  // definitions semantically below instead of requiring the two tables to remain contiguous.
+  const stateTable = installed.fragment.search(/(?:\r\n|\n|\r)\[hooks\.state\./);
+  const ownedPrefix = stateTable < 0 ? installed.fragment.slice(0, marker) : installed.fragment.slice(0, stateTable);
+  // Native config writes normalize CRLF to LF; the command and owned fields must still match exactly.
+  const markerlessPrefix = ownedPrefix
+    .replace(MANAGED_INTERRUPT_HOOK_START, "")
+    .replace(/^(\r\n|\n|\r){2}/, "$1");
+  const prefixes = text.includes(MANAGED_INTERRUPT_HOOK_START)
+    ? [ownedPrefix]
+    : [markerlessPrefix];
+  const pattern = new RegExp(hookTextPattern(prefixes[0]!), "g");
   const match = pattern.exec(text);
   if (!match || pattern.exec(text)) {
     throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
@@ -154,7 +172,9 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
     throw new Error("Codex interrupt lifecycle hook order changed after setup; refusing to overwrite it");
   }
   const endMarker = text.indexOf(MANAGED_INTERRUPT_HOOK_END);
-  if (managedMarkerCount(text) !== 1 || endMarker < 0
+  const markerMissingAfterCodexNormalization = managedMarkerCount(text) === 0
+    && !text.includes(MANAGED_INTERRUPT_HOOK_START);
+  if ((!markerMissingAfterCodexNormalization && managedMarkerCount(text) !== 1) || endMarker < 0
     || (endMarker >= first && endMarker < ownedEnd)
     || text.split(MANAGED_INTERRUPT_HOOK_END).length !== 2) {
     throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
@@ -166,8 +186,8 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
     const withoutMarker = precedingConfig.slice(0, endMarker)
       + precedingConfig.slice(endMarker + MANAGED_INTERRUPT_HOOK_END.length);
     try {
-      if (JSON.stringify(canonicalJson(Bun.TOML.parse(precedingConfig)))
-        !== JSON.stringify(canonicalJson(Bun.TOML.parse(withoutMarker)))) {
+      if (JSON.stringify(canonicalJson(parseConfigToml(precedingConfig)))
+        !== JSON.stringify(canonicalJson(parseConfigToml(withoutMarker)))) {
         throw new Error("Marker removal changes TOML values");
       }
     } catch {
@@ -177,35 +197,51 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
   if (codexInterruptHookHash(installed.command) !== installed.trustedHash) {
     throw new Error("Codex interrupt lifecycle hook journal hash is invalid");
   }
-  // Codex's TOML editor inserts new tables before trailing comments. The end marker can therefore
-  // move past unrelated config even though the owned hook fields remain unchanged.
-  const appendedConfig = text.slice(ownedEnd, endMarker < first ? undefined : endMarker);
-  const firstAssignment = appendedConfig.split(/\r\n|\n|\r/)
-    .map(line => line.trim()).find(line => line && !line.startsWith("#"));
-  if (firstAssignment && !/^\[\[?.+\]\]?(?:\s*#.*)?$/.test(firstAssignment)) {
+  // Compare the managed Interrupt entry and trust state by parsed TOML values. This tolerates
+  // unrelated tables being inserted between them, but rejects added fields, changed commands,
+  // changed hashes, duplicate entries, or malformed config.
+  try {
+    const expected = parseConfigToml(installed.fragment) as {
+      hooks?: { Interrupt?: unknown[]; state?: Record<string, unknown> };
+    };
+    const actual = parseConfigToml(text) as {
+      hooks?: { Interrupt?: unknown[]; state?: Record<string, unknown> };
+    };
+    const expectedInterrupt = expected.hooks?.Interrupt?.[0];
+    const actualInterrupt = actual.hooks?.Interrupt?.[installed.groupIndex];
+    const expectedState = expected.hooks?.state?.[installed.stateKey];
+    const actualState = actual.hooks?.state?.[installed.stateKey];
+    if (JSON.stringify(canonicalJson(actualInterrupt)) !== JSON.stringify(canonicalJson(expectedInterrupt))
+      || JSON.stringify(canonicalJson(actualState)) !== JSON.stringify(canonicalJson(expectedState))) {
+      throw new Error("Modified owned definitions");
+    }
+  } catch {
     throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
   }
-  if (firstAssignment) {
-    // A later table can also extend the owned hook or trust state. Compare those exact
-    // definitions with Bun's TOML parser before treating the inserted tables as unrelated.
-    const ownedDefinitions = (fragment: string): string => {
-      const { hooks } = Bun.TOML.parse(fragment) as {
-        hooks: { Interrupt: unknown[]; state: Record<string, unknown> };
-      };
-      return JSON.stringify(canonicalJson([hooks.Interrupt[0], hooks.state[installed.stateKey]]));
-    };
-    try {
-      if (ownedDefinitions(ownedPrefix) !== ownedDefinitions(ownedPrefix + appendedConfig)) {
-        throw new Error("Modified owned definitions");
-      }
-    } catch {
-      throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
-    }
+  const stateHeader = `[hooks.state.${JSON.stringify(installed.stateKey)}]`;
+  const escapedStateHeader = stateHeader.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+  const escapedHash = JSON.stringify(installed.trustedHash).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+  const statePattern = new RegExp(
+    `(^|\\r\\n|\\n|\\r)${escapedStateHeader}(?:\\r\\n|\\n|\\r)trusted_hash\\s*=\\s*${escapedHash}(?:\\r\\n|\\n|\\r)?`,
+    "g",
+  );
+  const stateMatches = [...text.matchAll(statePattern)];
+  if (stateMatches.length !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
   }
+  const stateMatch = stateMatches[0];
+  // Consume the separator immediately before the state table as well. It is part of the managed
+  // fragment's spacing and prevents a blank line from being left behind after restoration.
+  const stateStart = stateMatch.index!;
+  const stateEnd = stateStart + stateMatch[0].length;
   const end = endMarker + MANAGED_INTERRUPT_HOOK_END.length;
   const trailing = installed.fragment.slice(marker + MANAGED_INTERRUPT_HOOK_END.length);
   const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(end))?.[0].length ?? 0;
-  return [{ start: first, end: ownedEnd }, { start: endMarker, end: end + trailingLength }];
+  return [
+    { start: first, end: ownedEnd },
+    { start: stateStart, end: stateEnd },
+    { start: endMarker, end: end + trailingLength },
+  ];
 }
 
 export function verifyCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): void {
@@ -220,7 +256,7 @@ export function restoreCodexInterruptHook(
   // Explicit Setup can reinstall a fully removed hook. A stale journal alone does not mean
   // there is still a definition to remove; partial edits must retain the strict checks below.
   if (options.allowAbsent && managedMarkerCount(text) === 0 && !text.includes(MANAGED_INTERRUPT_HOOK_END)) {
-    const { hooks } = Bun.TOML.parse(text) as { hooks?: unknown };
+    const { hooks } = parseConfigToml(text) as { hooks?: unknown };
     if (hooks === undefined) return text;
     if (hooks && typeof hooks === "object" && !Array.isArray(hooks) && !Object.hasOwn(hooks, "Interrupt")) {
       const state = (hooks as Record<string, unknown>).state;

@@ -3,9 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chatGptWebTraceId } from "../src/adapters/chatgpt-web";
+import { chatGptWebTraceId, structuredCompactionMode } from "../src/adapters/chatgpt-web";
 import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import {
+  recordChatGptRetainedOutcome,
+  resetChatGptRetainedTelemetry,
+} from "../src/adapters/chatgpt-web/retained-telemetry";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
@@ -14,6 +18,57 @@ import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebReques
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
   expect(() => startServer(config)).toThrow("cannot start a Responses listener");
+});
+
+test("managed browser compaction uses a fresh checkpoint without a launcher surface", () => {
+  expect(structuredCompactionMode({
+    manualRequest: false,
+    hasRetainedLauncher: false,
+    hasStructuredBroker: true,
+  })).toBe("fresh");
+  expect(structuredCompactionMode({
+    manualRequest: false,
+    hasRetainedLauncher: true,
+    hasStructuredBroker: true,
+  })).toBe("retained");
+  expect(structuredCompactionMode({
+    manualRequest: true,
+    hasRetainedLauncher: false,
+    hasStructuredBroker: true,
+  })).toBe("unavailable");
+});
+
+test("backend session leases keep the headless server alive until SessionEnd", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const server = startServer(config);
+  const port = server.port;
+  if (port === undefined) throw new Error("test server did not bind a TCP port");
+  const endpoint = `http://127.0.0.1:${port}`;
+  const headers = {
+    authorization: `Bearer ${config.controlToken}`,
+    "content-type": "application/json",
+  };
+  try {
+    const sessionId = "session_backend_lease";
+    const acquired = await fetch(`${endpoint}/admin/session`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "acquire", session_id: sessionId }),
+    });
+    expect(acquired.status).toBe(200);
+    expect(await acquired.json()).toMatchObject({ status: "ok", active_sessions: 1 });
+    expect(server.isIdle?.()).toBe(false);
+
+    const released = await fetch(`${endpoint}/admin/session`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "release", session_id: sessionId }),
+    });
+    expect(released.status).toBe(200);
+    expect(await released.json()).toMatchObject({ status: "ok", active_sessions: 0 });
+  } finally {
+    await server.stop(true);
+  }
 });
 
 async function waitForTurnCount(turns: HttpTurnCounter, expected: number): Promise<void> {
@@ -1301,6 +1356,40 @@ test("authenticated shutdown requires a verified idle drain", async () => {
     }
     expect(stopped).toBe(true);
   } finally {
+    await server.stop(true);
+  }
+});
+
+test("health reports the retained-conversation rate so it can be queried, not grepped", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const server = startServer(config);
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  try {
+    resetChatGptRetainedTelemetry();
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      retained_conversation: { hits: 0, misses: 0, hit_rate: null },
+    });
+
+    const components = {
+      threadId: "thread_health",
+      model: "m",
+      reasoning: "r",
+      systemPrompt: "s",
+      compaction: "c",
+    };
+    recordChatGptRetainedOutcome(components, false);
+    recordChatGptRetainedOutcome(components, true);
+    recordChatGptRetainedOutcome({ ...components, model: "m2" }, false);
+
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      retained_conversation: {
+        hits: 1,
+        misses: 2,
+        miss_causes: { first_turn: 1, model_changed: 1 },
+      },
+    });
+  } finally {
+    resetChatGptRetainedTelemetry();
     await server.stop(true);
   }
 });

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { AppConfig, SubagentProtocol } from "./config";
 import { atomicWriteFile, expandUserPath, getConfigDir } from "./config";
+import type { InstalledCodexLifecycleHooks } from "./codex-lifecycle-hook";
 
 export const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
 export const MANAGED_ROUTE_COMMENT =
@@ -63,6 +64,7 @@ export interface CodexIntegrationJournal {
   previous: Record<ManagedAssignmentKey, PreviousAssignment>;
   previousRealtimeWebrtcCallBaseUrl: PreviousAssignment;
   interruptHook: InstalledCodexInterruptHook;
+  lifecycleHooks?: InstalledCodexLifecycleHooks;
   previousMultiAgent?: PreviousFeatureAssignment;
   previousMultiAgentV2?: PreviousFeatureAssignment;
   previousAgentMaxDepth?: PreviousAgentAssignment;
@@ -227,6 +229,7 @@ export interface FileSnapshot {
 
 export interface InstallCodexIntegrationOptions {
   replaceExistingRoute?: boolean;
+  installWebAgentRunner?: boolean;
 }
 
 export interface UninstallCodexIntegrationResult {
@@ -264,7 +267,8 @@ export function getCodexJournalRecoveryPath(): string {
 }
 
 export function routeUrl(config: AppConfig): string {
-  return `http://${config.host}:${config.port}/v1`;
+  const port = config.browserHost === "launcher" ? config.port : config.nativeGatewayPort;
+  return `http://${config.host}:${port}/v1`;
 }
 
 export function sha256(value: string | Uint8Array): string {

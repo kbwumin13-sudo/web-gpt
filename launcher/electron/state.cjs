@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
+const { normalizeReadiness, readinessFromState } = require("./readiness.cjs");
 const SIDEBAR_MIN_WIDTH = 240;
 const SIDEBAR_MAX_WIDTH = 420;
 const SESSION_REFRESH_REMINDER_INTERVAL_MS = 48 * 60 * 60 * 1000;
@@ -22,6 +23,17 @@ const DEFAULT_STATE = Object.freeze({
   sidebarWidth: 252,
   mcpGuideStep: 0,
   sessionRefreshReminderAt: null,
+  readiness: {
+    route: "unknown",
+    proxy: "unknown",
+    catalog: "unknown",
+    tunnel: "unknown",
+    connector: "unknown",
+    runner: "unknown",
+    restartRequired: false,
+    expectedWebModels: [],
+    publishedWebModels: [],
+  },
 });
 
 function nextSessionRefreshReminderAt(now = Date.now()) {
@@ -85,6 +97,7 @@ function readState(filePath) {
     ]) {
       if (state[key] !== undefined && typeof state[key] !== "boolean") delete state[key];
     }
+    state.readiness = normalizeReadiness(state);
     return state;
   } catch {
     return { ...DEFAULT_STATE };
@@ -113,6 +126,13 @@ function createStateStore(filePath) {
     },
     update(patch) {
       const next = { ...state, ...patch, version: 1 };
+      if (Object.prototype.hasOwnProperty.call(patch, "readiness")) {
+        next.readiness = normalizeReadiness(next);
+      } else {
+        const derived = readinessFromState(next, state.readiness?.publishedWebModels || []);
+        derived.expectedWebModels = state.readiness?.expectedWebModels || [];
+        next.readiness = derived;
+      }
       writeState(filePath, next);
       state = next;
       return structuredClone(next);

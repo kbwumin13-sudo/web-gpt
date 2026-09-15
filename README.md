@@ -33,14 +33,16 @@ back into the same Codex task.
 </p>
 
 ```text
-Codex task ──Responses + SSE──▶ codex-chatgpt-web ──embedded browser──▶ ChatGPT
-     ▲                                │                                      │
-     └──────── native UI, context, images, tracing, and tool lifecycle ──────┘
+Codex task ──Responses + SSE──▶ Native Gateway ──native requests──▶ OpenAI Codex
+     │                              │
+     │                              └── Web requests ──▶ headless Backend ──managed Chrome──▶ ChatGPT
+     └──────── native UI, context, images, tracing, and tool lifecycle
 ```
 
-Codex keeps the native task, context lifecycle, UI, and tool harness. The local Responses bridge
-routes only the selected model task through a task-bound ChatGPT Temporary Chat; in full mode, MCP
-connects ChatGPT back to the tools of that same Codex task until its next compaction boundary.
+Codex keeps the native task, context lifecycle, UI, and tool harness. The Native Gateway stays in a
+separate service and forwards native requests without waiting for the Web backend. Only a selected
+Web model task enters the task-bound ChatGPT Temporary Chat; in full mode, MCP connects ChatGPT back
+to the tools of that same Codex task until its next compaction boundary.
 
 > [!TIP]
 > I also built **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)**, a local
@@ -57,8 +59,9 @@ connects ChatGPT back to the tools of that same Codex task until its next compac
 - **Continuous task sessions and native compaction.** Sequential messages reuse one task-bound
   Temporary Chat. At the context boundary, the retained agent writes the checkpoint before Codex
   starts a clean chat; if that chat was closed, canonical Codex history supplies the fallback.
-- **One cross-platform launcher.** The macOS, Windows, and Linux app owns sign-in, model setup, MCP
-  guidance, health checks, safe diagnostics, and up to five visible task-bound browser tabs.
+- **Settings-only desktop app.** The app manages sign-in, model setup, MCP guidance, health checks,
+  safe diagnostics, updates, and repair. Automatic production turns run in the headless backend;
+  the embedded browser remains only for Zero Risk/manual compatibility.
 - **Fail-closed behavior.** Missing models, tools, or changed ChatGPT UI produce explicit errors
   instead of silently switching route or capability. End-to-end coverage is documented in
   [release validation](docs/release-validation.md).
@@ -87,20 +90,25 @@ curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/
 irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
-Then complete the three checks in the app:
+Then complete the checks in the app:
 
-1. Sign in directly in the launcher's embedded ChatGPT browser. Login pages and identity-provider
-   windows stay inside the same launcher-owned private browser profile; no session is copied between
-   browsers.
-2. Run the browser smoke test.
+1. Sign in from Settings. Automatic mode opens the configured managed Chrome profile; the app is not
+   needed for ordinary model turns.
+2. If using Zero Risk, run the browser smoke test.
 3. Press **Install models**, restart Codex once, and select a **ChatGPT Web — …** model.
 
 The launcher detects the current account's ChatGPT controls during setup: Free/Go accounts expose
 only Luna, while Pro appears only when the signed-in account exposes it. The separate **MCP** page
 is optional and guides the full-harness setup without terminal commands.
 
-The packaged launcher keeps sign-in and ChatGPT model turns in its embedded browser. It needs no
-model API key, installed Chrome/Chromium, system Node/Bun, or project-managed browser download.
+The packaged Settings app does not own automatic model turns. Automatic mode uses the configured
+Chrome executable from the headless backend; the app only starts a temporary login operation when
+you request it. It still needs no model API key, system Node/Bun, or project-managed browser download.
+
+After setup, the native gateway remains available in its own macOS service. Codex starts the Web
+backend through its lifecycle hooks or on the first Web request. The Web service uses the stable
+`~/.codex-chatgpt-web/bin/codex-chatgpt-web` entry and exits after its session lease and active turns
+have been idle for the configured grace period.
 
 **Run from source**
 
@@ -118,7 +126,7 @@ This source path requires Bun 1.4.0. The command installs locked dependencies an
 | --- | --- | --- | --- |
 | **Browser-only** | Free/Go: Luna; Plus: Instant–High; Pro: adds Extra High and Pro | No; Codex shows a warning | None |
 | **Full harness (With Automation)** | Free/Go: Luna; Plus: Instant–High; Pro: adds Extra High and Pro | Yes for every listed effort, including Pro | OpenAI tunnel + ChatGPT connector |
-| **Zero Risk** | Choose the ChatGPT model and effort manually; optional Pro-sized context | Yes; the full turn-bound Codex harness remains available | Separate OpenAI tunnel + `Codex Zero Risk` connector; paste and send manually |
+| **Zero Risk (legacy)** | Choose the ChatGPT model and effort manually; optional Pro-sized context | Yes; the full turn-bound Codex harness remains available | Separate OpenAI tunnel + `Codex Zero Risk` connector; paste and send manually |
 
 Each automatic picker entry has one fixed ChatGPT mode. Codex still displays its built-in Effort and
 Speed rows, but changing them cannot silently change the selected browser model. In automatic Full
@@ -129,6 +137,12 @@ Zero Risk keeps the local Responses bridge and full Codex harness, but never rea
 ChatGPT page and never sends a prompt for you. The launcher prepares and copies the prompt; you
 choose the model, effort, and `Codex Zero Risk` connector, then paste and send it yourself. This
 removes the account risk specifically associated with ChatGPT web automation.
+
+Direct ChatGPT Web conversations can use the `Codex Reader` contract. Authorize a project locally
+with `codex-chatgpt-web reader authorize PATH`, print the separate MCP command with
+`codex-chatgpt-web reader mcp-command`, and bind that command to a `Codex Reader` connector on its
+own Tunnel. Reader can list/read/search that project and inspect Git status, but cannot run
+commands, write files, or authorize another project.
 
 ## Full harness
 
@@ -173,6 +187,19 @@ after changing the protocol:
 codex-chatgpt-web subagents status
 codex-chatgpt-web subagents compatibility-v1
 codex-chatgpt-web subagents native
+```
+
+The setup also installs a local `web_agent_runner` MCP server. From a native Codex task, call its
+single `web_agent_run` tool and choose `chatgpt-web/light`, `chatgpt-web/medium`,
+`chatgpt-web/high`, `chatgpt-web/extra-high`, or `chatgpt-web/pro` explicitly. `design` runs a
+read-only ephemeral App Server task; `execute` uses workspace write access and returns each command
+or file approval to the current Codex client. The server never falls back to another model and is
+disabled inside its own child task.
+
+The installed entry point is:
+
+```bash
+codex-chatgpt-web runner-mcp
 ```
 
 ## Limitations and security

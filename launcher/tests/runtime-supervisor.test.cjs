@@ -11,9 +11,22 @@ const { linuxDesktopEntry, requireAutostartState } = require("../electron/autost
 const {
   MAX_RESTARTS_PER_WINDOW,
   RuntimeSupervisor,
+  macOsSystemProxyEnvironment,
   managedTunnelConnectArgs,
+  normalizeLegacyRuntimeConfig,
   validateConfig,
+  withDeadline,
 } = require("../electron/runtime-supervisor.cjs");
+
+test("legacy v3 configuration migrates the old Pro capability implication exactly once", () => {
+  const legacy = { version: 3, proAvailable: true };
+  const migrated = normalizeLegacyRuntimeConfig(legacy);
+  assert.equal(migrated.migrated, true);
+  assert.equal(migrated.config.extraHighAvailable, true);
+  assert.equal(normalizeLegacyRuntimeConfig(migrated.config).migrated, false);
+  const explicitFalse = normalizeLegacyRuntimeConfig({ version: 3, proAvailable: true, extraHighAvailable: false });
+  assert.equal(explicitFalse.migrated, false);
+});
 
 async function freePort() {
   return await new Promise((resolve, reject) => {
@@ -60,6 +73,8 @@ function launcherConfig(descriptorPath, overrides = {}) {
       ? "\\\\.\\pipe\\codex-chatgpt-web-runtime-supervisor-test"
       : path.join(root, "turn-broker.sock"),
     headed: true,
+    solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
@@ -250,6 +265,7 @@ test("launcher runtime validation accepts native Windows paths and a named pipe"
     brokerSocketPath: "\\\\.\\pipe\\codex-chatgpt-web-runtime-supervisor-test",
     headed: true,
     solAvailable: true,
+    extraHighAvailable: true,
     proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
@@ -377,6 +393,39 @@ test("tunnel control failures preserve stderr even when stdout is also present",
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("launcher derives tunnel proxy variables from the active macOS HTTPS proxy", () => {
+  const inherited = { PATH: "/usr/bin", NO_PROXY: "example.test" };
+  const environment = macOsSystemProxyEnvironment(inherited, `
+<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7890
+  HTTPSProxy : 127.0.0.1
+}
+`);
+  assert.equal(environment.HTTPS_PROXY, "http://127.0.0.1:7890");
+  assert.equal(environment.HTTP_PROXY, "http://127.0.0.1:7890");
+  assert.match(environment.NO_PROXY, /(?:^|,)127\.0\.0\.1(?:,|$)/);
+  assert.match(environment.NO_PROXY, /(?:^|,)localhost(?:,|$)/);
+  assert.match(environment.NO_PROXY, /(?:^|,)example\.test(?:,|$)/);
+  assert.equal(environment.PATH, "/usr/bin");
+
+  const explicit = macOsSystemProxyEnvironment({
+    HTTPS_PROXY: "http://explicit-proxy:8443",
+    HTTP_PROXY: "http://explicit-proxy:8080",
+  }, `
+<dictionary> {
+  HTTPSEnable : 1
+  HTTPSPort : 7890
+  HTTPSProxy : 127.0.0.1
+}
+`);
+  assert.equal(explicit.HTTPS_PROXY, "http://explicit-proxy:8443");
+  assert.equal(explicit.HTTP_PROXY, "http://explicit-proxy:8080");
 });
 
 test("tunnel health diagnostics preserve the machine-readable readiness state", async () => {
@@ -915,6 +964,8 @@ test("tunnel recovery replaces a false-green managed runtime and proves the fres
 
 test("fresh tunnel recovery discovers its official loopback diagnostics before probing MCP", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-health-discovery-"));
+  const healthURLFile = path.join(root, "codex-chatgpt-web.url");
+  fs.writeFileSync(healthURLFile, "http://127.0.0.1:43127\n");
   const supervisor = new RuntimeSupervisor({
     app: { getVersion: () => "0.2.0", isPackaged: false },
     logger: { info() {}, warn() {}, error() {} },
@@ -932,6 +983,14 @@ test("fresh tunnel recovery discovers its official loopback diagnostics before p
   const commands = [];
   supervisor.runTunnelCommand = async (_config, args) => {
     commands.push(args);
+    if (args[1] === "list") {
+      return {
+        code: 0,
+        output: JSON.stringify({
+          aliases: [{ alias: "codex-chatgpt-web", health_url_file: healthURLFile }],
+        }),
+      };
+    }
     return {
       code: 0,
       output: JSON.stringify({
@@ -948,7 +1007,7 @@ test("fresh tunnel recovery discovers its official loopback diagnostics before p
   try {
     await supervisor.waitForTunnelMcpTransport(config, 25);
     assert.equal(supervisor.tunnelHealthBaseUrl, "http://127.0.0.1:43127");
-    assert.deepEqual(commands, [["runtimes", "status", "codex-chatgpt-web", "--json"]]);
+    assert.deepEqual(commands, [["runtimes", "list", "--json"]]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1394,6 +1453,89 @@ test("explicit launcher shutdown force-stops only its owned runtime when gracefu
     "graceful-stop",
     "forced-stop:daemon still reports one HTTP turn",
   ]);
+});
+
+function shutdownSupervisor() {
+  return new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: os.tmpdir(),
+    coreHome: os.tmpdir(),
+    browserDescriptorPath: path.join(os.tmpdir(), "launcher.json"),
+  });
+}
+
+test("a forced shutdown that hangs still force-stops instead of blocking the quit forever", async () => {
+  const actions = [];
+  const supervisor = shutdownSupervisor();
+  supervisor.cancelActiveTurns = async () => { actions.push("cancel-turns"); };
+  // A hang, not a rejection: this is what made the launcher impossible to quit, because the
+  // force fallback only ever ran from a catch.
+  supervisor.stopForSetup = () => new Promise(() => { actions.push("graceful-stop-hangs"); });
+  supervisor.forceStopOwnedRuntime = async error => {
+    actions.push("forced-stop");
+    return { status: "forced", detail: error.message };
+  };
+
+  const result = await supervisor.shutdown({ cancelActiveTurns: true, force: true, deadlineMs: 50 });
+  assert.equal(result.status, "forced");
+  assert.match(result.detail, /runtime shutdown did not settle within 50ms/);
+  assert.deepEqual(actions, ["cancel-turns", "graceful-stop-hangs", "forced-stop"]);
+});
+
+test("a slow but settling shutdown finishes gracefully and is never force-stopped", async () => {
+  const actions = [];
+  const supervisor = shutdownSupervisor();
+  supervisor.stopForSetup = async () => {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    actions.push("graceful-stop");
+    return { status: "stopped" };
+  };
+  supervisor.forceStopOwnedRuntime = async () => {
+    actions.push("forced-stop");
+    return { status: "forced" };
+  };
+
+  assert.deepEqual(
+    await supervisor.shutdown({ force: true, deadlineMs: 2_000 }),
+    { status: "stopped" },
+  );
+  assert.deepEqual(actions, ["graceful-stop"]);
+});
+
+test("an unforced shutdown keeps failing closed rather than force-stopping", async () => {
+  const actions = [];
+  const supervisor = shutdownSupervisor();
+  supervisor.stopForSetup = async () => { throw new Error("daemon still reports one HTTP turn"); };
+  supervisor.forceStopOwnedRuntime = async () => { actions.push("forced-stop"); return { status: "forced" }; };
+
+  await assert.rejects(
+    supervisor.shutdown({ deadlineMs: 50 }),
+    /daemon still reports one HTTP turn/,
+  );
+  assert.deepEqual(actions, []);
+});
+
+test("a bounded wait reports expiry without leaving the abandoned promise unhandled", async () => {
+  const unhandled = [];
+  const record = reason => unhandled.push(reason);
+  process.on("unhandledRejection", record);
+  try {
+    assert.equal(await withDeadline(Promise.resolve("settled"), 1_000, "work"), "settled");
+    await assert.rejects(
+      withDeadline(new Promise(() => {}), 20, "work"),
+      /work did not settle within 20ms/,
+    );
+    // A loser that rejects after the race must not surface as an unhandled rejection.
+    let rejectLate;
+    const late = new Promise((_, reject) => { rejectLate = reject; });
+    await assert.rejects(withDeadline(late, 20, "work"), /did not settle/);
+    rejectLate(new Error("too late"));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", record);
+  }
 });
 
 test("launcher resumes an owned drained daemon before reporting it ready", async () => {

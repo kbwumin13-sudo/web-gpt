@@ -21,15 +21,18 @@ import {
   uninstallCodexIntegration,
 } from "./codex-integration";
 import { formatDoctorReport, runDoctor } from "./doctor";
-import { runChatGptMcpMain } from "./adapters/chatgpt-web/mcp-main";
+import { runChatGptMcpMain, runWebAgentRunnerMcpMain } from "./adapters/chatgpt-web/mcp-main";
 import { runCommand } from "./process";
+import { BackendHost } from "./backend-host";
+import { startGateway } from "./gateway";
 import { startServer } from "./server";
-import { assertServiceIdle, cancelActiveTurns, getServiceStatus, installService, interruptActiveTurn, restartService, startService, stopService, uninstallService } from "./service";
+import { assertServiceIdle, cancelActiveTurns, getGatewayServiceStatus, getServiceStatus, installGatewayService, installService, interruptActiveTurn, restartService, startGatewayService, startService, stopGatewayService, stopService, uninstallGatewayService, uninstallService, waitForBackendReady, waitForGatewayReady } from "./service";
 import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions } from "./setup";
-import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
+import { installRuntimeKeyBytes, managedRuntimeKeyPath, readerMcpCommand, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
+import { authorizeReaderProject, listReaderProjects, revokeReaderProject } from "./reader";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -39,6 +42,7 @@ Usage:
   codex-chatgpt-web setup --browser-only [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
+  codex-chatgpt-web logout
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web subagents <status|compatibility-v1|native>
@@ -49,8 +53,12 @@ Usage:
   codex-chatgpt-web dev chat NAME [--model MODEL] [MESSAGE]
   codex-chatgpt-web dev list
   codex-chatgpt-web serve
+  codex-chatgpt-web backend
+  codex-chatgpt-web gateway
   codex-chatgpt-web mcp [--broker-socket PATH]
-  codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns>
+  codex-chatgpt-web reader <list|authorize PATH|revoke PROJECT_ID|mcp-command>
+  codex-chatgpt-web runner-mcp
+  codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns|gateway-status|gateway-install|gateway-start|gateway-stop>
   codex-chatgpt-web tunnel <status|start|restart|stop|key-import>
   codex-chatgpt-web open <tunnels|runtime-keys|connectors>
   codex-chatgpt-web uninstall --yes
@@ -64,8 +72,9 @@ Setup options:
                                Full mode: select, paste, and send in the launcher yourself
   --zero-risk-pro              Zero Risk: also install the explicit Pro-sized model row
   --zero-risk-default          Zero Risk: install only the default model row
-  --port NUMBER                Loopback Responses port (default: 17841)
+  --port NUMBER                Headless Web backend port (default: 17842)
   --chrome PATH                Google Chrome/Chromium executable used for account login
+  --managed-browser-host       Keep browser login and turns in the headless backend
   --browser-host-descriptor PATH
                                Use the embedded launcher browser described by this owner-only file
   --refresh-account-capabilities
@@ -224,8 +233,19 @@ function launcherLoginContinuation(): { promise: Promise<void>; close: () => voi
 async function loginCommand(args: string[]): Promise<void> {
   const launcherControl = takeFlag(args, "--launcher-control");
   if (!launcherControl) {
+    const chromeExecutablePath = takeOption(args, "--chrome");
+    const storageStatePath = takeOption(args, "--storage-state");
     assertNoArgs(args);
-    const config = loadConfig();
+    if (Boolean(chromeExecutablePath) !== Boolean(storageStatePath)) {
+      throw new Error("`--chrome` and `--storage-state` must be provided together");
+    }
+    const config = chromeExecutablePath && storageStatePath
+      ? {
+          ...defaultConfig("browser-only"),
+          chromeExecutablePath,
+          storageStatePath,
+        }
+      : loadConfig();
     if (config.browserHost === "launcher") {
       throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
     }
@@ -256,6 +276,23 @@ async function loginCommand(args: string[]): Promise<void> {
     continuation.close();
   }
   stdout.write("Passkey session captured for Launcher verification.\n");
+}
+
+async function logoutCommand(args: string[]): Promise<void> {
+  assertNoArgs(args);
+  const config = loadConfig();
+  if (config.browserHost === "launcher") {
+    throw new Error("ChatGPT logout is owned by the launcher; use its Settings page");
+  }
+  const restartBackend = process.platform === "darwin" && getServiceStatus().loaded;
+  if (restartBackend) await stopService(config);
+  try {
+    rmSync(config.storageStatePath, { force: true });
+    rmSync(`${config.storageStatePath}.verified.json`, { force: true });
+  } finally {
+    if (restartBackend) startService();
+  }
+  stdout.write("Backend-managed ChatGPT login state removed.\n");
 }
 
 async function setupCommand(args: string[]): Promise<void> {
@@ -289,8 +326,10 @@ async function setupCommand(args: string[]): Promise<void> {
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
+  const managedBrowserHost = takeFlag(args, "--managed-browser-host");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
   if (chrome) options.chromeExecutablePath = chrome;
+  if (managedBrowserHost) options.managedBrowserHost = true;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
   if (tunnelId) options.tunnelId = tunnelId;
@@ -417,7 +456,23 @@ async function subagentsCommand(args: string[]): Promise<void> {
 async function serviceCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
-  const config = action === "status" ? undefined : loadConfig();
+  const config = action === "status" || action === "gateway-status" ? undefined : loadConfig();
+  if (action === "gateway-status") {
+    stdout.write(`${JSON.stringify(getGatewayServiceStatus(), null, 2)}\n`);
+    return;
+  }
+  if (action === "gateway-install") {
+    stdout.write(`${JSON.stringify(installGatewayService(config!), null, 2)}\n`);
+    return;
+  }
+  if (action === "gateway-start") {
+    stdout.write(`${JSON.stringify(startGatewayService(), null, 2)}\n`);
+    return;
+  }
+  if (action === "gateway-stop") {
+    stdout.write(`${JSON.stringify(await stopGatewayService(config!), null, 2)}\n`);
+    return;
+  }
   if (action === "cancel-turns") {
     stdout.write(`${JSON.stringify(await cancelActiveTurns(config!), null, 2)}\n`);
     return;
@@ -430,6 +485,59 @@ async function serviceCommand(args: string[]): Promise<void> {
             : undefined;
   if (!status) throw new Error(`Unknown service action: ${action}`);
   stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+}
+
+async function backendCommand(args: string[]): Promise<void> {
+  assertNoArgs(args);
+  const host = new BackendHost(loadConfig());
+  const status = await host.start();
+  stdout.write(`codex-chatgpt-web backend listening on http://127.0.0.1:${status.port}/v1\n`);
+  let shutdownPromise: Promise<void> | undefined;
+  const stop = async () => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = host.stop().catch(error => {
+      process.exitCode = 1;
+      process.stderr.write(`codex-chatgpt-web backend shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+    return shutdownPromise;
+  };
+  process.once("SIGINT", () => { void stop(); });
+  process.once("SIGTERM", () => { void stop(); });
+  await new Promise<void>(resolve => {
+    const check = setInterval(() => {
+      if (host.currentStatus().state === "stopped" || host.currentStatus().state === "failed") {
+        clearInterval(check);
+        resolve();
+      }
+    }, 50);
+    check.unref?.();
+  });
+}
+
+async function gatewayCommand(args: string[]): Promise<void> {
+  assertNoArgs(args);
+  const gateway = startGateway(loadConfig());
+  stdout.write(`codex-chatgpt-web native gateway listening on http://127.0.0.1:${gateway.port}/v1\n`);
+  let shutdownPromise: Promise<void> | undefined;
+  const stop = async () => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = gateway.shutdown().catch(error => {
+      process.exitCode = 1;
+      process.stderr.write(`codex-chatgpt-web gateway shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+    return shutdownPromise;
+  };
+  process.once("SIGINT", () => { void stop(); });
+  process.once("SIGTERM", () => { void stop(); });
+  await new Promise<void>(resolve => {
+    const check = setInterval(() => {
+      if (!gateway.port) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 50);
+    check.unref?.();
+  });
 }
 
 async function interruptHookCommand(args: string[]): Promise<void> {
@@ -456,6 +564,68 @@ async function interruptHookCommand(args: string[]): Promise<void> {
     throw new Error("Codex Interrupt hook payload has no valid session_id or turn_id");
   }
   await interruptActiveTurn(loadConfig(), { threadId, turnId });
+}
+
+async function backendLifecycleHookCommand(args: string[]): Promise<void> {
+  assertNoArgs(args);
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > 8 * 1024 * 1024) throw new Error("Codex backend lifecycle hook payload is too large");
+    chunks.push(buffer);
+  }
+  let payload: { hook_event_name?: unknown; session_id?: unknown };
+  try {
+    payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { hook_event_name?: unknown };
+  } catch {
+    throw new Error("Codex backend lifecycle hook payload is not valid JSON");
+  }
+  if (payload.hook_event_name !== "SessionStart"
+    && payload.hook_event_name !== "UserPromptSubmit"
+    && payload.hook_event_name !== "SessionEnd") {
+    throw new Error("Codex backend lifecycle hook received an unsupported event");
+  }
+  const sessionId = typeof payload.session_id === "string" ? payload.session_id.trim() : "";
+  if (!/^[A-Za-z0-9_-]{6,128}$/.test(sessionId)) {
+    throw new Error("Codex backend lifecycle hook payload has no valid session_id");
+  }
+  const config = loadConfig();
+  if (config.browserHost === "launcher" || process.platform !== "darwin") return;
+  const service = getServiceStatus();
+  if (!service.supported || !service.installed) return;
+  if (payload.hook_event_name === "SessionEnd") {
+    if (!service.loaded || !service.running) return;
+  } else {
+    const gateway = getGatewayServiceStatus();
+    if (!gateway.installed) return;
+    if (!gateway.loaded || !gateway.running) startGatewayService();
+    await waitForGatewayReady(config);
+    if (!service.loaded || !service.running) startService();
+    await waitForBackendReady(config);
+  }
+  const action = payload.hook_event_name === "SessionEnd" ? "release" : "acquire";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2_000);
+  try {
+    const response = await fetch(`http://${config.host}:${config.port}/admin/session`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        action,
+        session_id: sessionId,
+        ...(process.ppid > 1 ? { owner_pid: process.ppid } : {}),
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function tunnelCommand(args: string[]): Promise<void> {
@@ -506,6 +676,37 @@ async function openCommand(args: string[]): Promise<void> {
   }
 }
 
+async function readerCommand(args: string[]): Promise<void> {
+  const action = args.shift() ?? "list";
+  if (action === "list") {
+    assertNoArgs(args);
+    stdout.write(`${JSON.stringify({ connector: "Codex Reader", projects: listReaderProjects() }, null, 2)}\n`);
+    return;
+  }
+  if (action === "mcp-command") {
+    assertNoArgs(args);
+    stdout.write(`${readerMcpCommand(loadConfig())}\n`);
+    return;
+  }
+  if (action === "authorize") {
+    const name = takeOption(args, "--name");
+    const root = args.shift();
+    assertNoArgs(args);
+    if (!root) throw new Error("reader authorize requires a project path");
+    stdout.write(`${JSON.stringify(authorizeReaderProject(root, name), null, 2)}\n`);
+    return;
+  }
+  if (action === "revoke") {
+    const projectId = args.shift();
+    assertNoArgs(args);
+    if (!projectId) throw new Error("reader revoke requires a project_id");
+    revokeReaderProject(projectId);
+    stdout.write(`${JSON.stringify({ revoked: projectId }, null, 2)}\n`);
+    return;
+  }
+  throw new Error(`Unknown reader action: ${action}`);
+}
+
 async function uninstallCommand(args: string[]): Promise<void> {
   const yes = takeFlag(args, "--yes");
   const keepData = takeFlag(args, "--keep-data");
@@ -524,6 +725,9 @@ async function uninstallCommand(args: string[]): Promise<void> {
   if (!config && process.platform === "darwin" && getServiceStatus().installed) {
     throw new Error("Service exists but configuration is missing; refusing an unverifiable uninstall");
   }
+  if (!config && process.platform === "darwin" && getGatewayServiceStatus().installed) {
+    throw new Error("Gateway service exists but configuration is missing; refusing an unverifiable uninstall");
+  }
   const launcherRuntimeStopped = config?.browserHost === "launcher" && launcherControl;
   if (config && process.platform === "darwin" && !launcherRuntimeStopped) await assertServiceIdle(config);
   if (config?.mode === "full" && !launcherRuntimeStopped) {
@@ -531,6 +735,7 @@ async function uninstallCommand(args: string[]): Promise<void> {
     stopTunnel(config);
   }
   if (config && process.platform === "darwin" && !launcherRuntimeStopped) await uninstallService(config);
+  if (config && process.platform === "darwin" && !launcherRuntimeStopped) await uninstallGatewayService(config);
   uninstallCodexIntegration();
   if (!keepData) rmSync(getConfigDir(), { recursive: true, force: true });
   stdout.write(keepData ? "Uninstalled; private application data was preserved.\n" : "Uninstalled and removed private application data.\n");
@@ -555,6 +760,7 @@ async function main(): Promise<void> {
   if (command === "help") stdout.write(HELP);
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") await loginCommand(args);
+  else if (command === "logout") await logoutCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "route") await routeCommand(args);
   else if (command === "subagents") await subagentsCommand(args);
@@ -581,13 +787,18 @@ async function main(): Promise<void> {
     const server = startServer(config);
     stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);
     await new Promise<void>(() => {});
-  } else if (command === "dev") await runDevCommand(args);
+  } else if (command === "backend") await backendCommand(args);
+  else if (command === "gateway") await gatewayCommand(args);
+  else if (command === "dev") await runDevCommand(args);
   else if (command === "mcp") await runChatGptMcpMain(args);
+  else if (command === "reader") await readerCommand(args);
+  else if (command === "runner-mcp") await runWebAgentRunnerMcpMain(args);
   else if (command === "service") await serviceCommand(args);
   else if (command === "hook") {
     const action = args.shift();
-    if (action !== "interrupt") throw new Error("Hook command must be: hook interrupt");
-    await interruptHookCommand(args);
+    if (action === "interrupt") await interruptHookCommand(args);
+    else if (action === "backend") await backendLifecycleHookCommand(args);
+    else throw new Error("Hook command must be: hook interrupt or hook backend");
   }
   else if (command === "tunnel") await tunnelCommand(args);
   else if (command === "open") await openCommand(args);

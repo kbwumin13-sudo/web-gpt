@@ -1,5 +1,7 @@
 import { defaultBrokerEndpoint, resolveBrokerEndpoint } from "../../config";
 import { runChatGptMcpServer, type ChatGptMcpContract } from "./mcp-server";
+import { runWebAgentRunnerMcpServer } from "./web-agent-runner-mcp";
+import { runReaderMcpServer } from "../../reader-mcp";
 
 function option(args: string[], name: string, fallback: string): string {
   const index = args.indexOf(name);
@@ -14,6 +16,11 @@ export async function runChatGptMcpMain(args: string[]): Promise<void> {
   const remaining = [...args];
   const brokerSocketPath = resolveBrokerEndpoint(option(remaining, "--broker-socket", defaultBrokerEndpoint()));
   const requestedContract = option(remaining, "--contract", "native");
+  if (requestedContract === "reader") {
+    if (remaining.length > 0) throw new Error(`Unknown MCP arguments: ${remaining.join(" ")}`);
+    await runReaderMcpServer();
+    return;
+  }
   if (requestedContract !== "native" && requestedContract !== "safe") {
     throw new Error(`--contract must be native or safe, received ${requestedContract}`);
   }
@@ -22,4 +29,9 @@ export async function runChatGptMcpMain(args: string[]): Promise<void> {
     brokerSocketPath,
     contract: requestedContract as ChatGptMcpContract,
   });
+}
+
+export async function runWebAgentRunnerMcpMain(args: string[]): Promise<void> {
+  if (args.length > 0) throw new Error(`Unknown Web Agent Runner MCP arguments: ${args.join(" ")}`);
+  await runWebAgentRunnerMcpServer();
 }

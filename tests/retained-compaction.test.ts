@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 import { mock } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptCompactionHandoffAccepted, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
+  compactionGenerationTimeoutMs,
+  MAX_COMPACTION_GENERATION_TIMEOUT_MS,
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   cancelAllStructuredCompactions,
   cancelStructuredCompactionNativeTurn,
@@ -47,6 +49,7 @@ import {
   structuredCompactionHandoffInstruction,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
+import { TurnResultJournal } from "../src/adapters/chatgpt-web/turn-result-journal";
 
 /**
  * These fixtures hand the turn broker a Unix socket under their temp root. macOS puts TMPDIR at
@@ -112,19 +115,28 @@ test("one browser conversation spans native turns and rotates only at compaction
   };
   const afterCompact = structuredClone(before);
   (afterCompact._rawBody as { input: unknown[] }).input.unshift({
-    type: "compaction",
+    type: "compaction", id: "cmp_first",
+    encrypted_content: "ocx1:checkpoint",
+  });
+  const replayedCompact = structuredClone(before);
+  (replayedCompact._rawBody as { input: unknown[] }).input.unshift({
+    type: "compaction", id: "cmp_rebuilt_with_a_different_transport_id",
     encrypted_content: "ocx1:checkpoint",
   });
 
   expect(chatGptConversationKey(sameTurn, "provider")).toBe(chatGptConversationKey(before, "provider"));
   expect(chatGptConversationKey(nextTurn, "provider")).toBe(chatGptConversationKey(before, "provider"));
   expect(chatGptConversationKey(afterCompact, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
+  expect(chatGptConversationKey(replayedCompact, "provider")).toBe(chatGptConversationKey(afterCompact, "provider"));
   const otherModel = structuredClone(before);
   otherModel.modelId = "chatgpt-web/pro";
   expect(chatGptConversationKey(otherModel, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
   const otherEffort = structuredClone(before);
   otherEffort.options.reasoning = "medium";
   expect(chatGptConversationKey(otherEffort, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
+  const changedSystemPrompt = structuredClone(before);
+  changedSystemPrompt.context.systemPrompt = ["updated canonical system prompt"];
+  expect(chatGptConversationKey(changedSystemPrompt, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
   const otherThread = structuredClone(before);
   (otherThread._rawBody as { client_metadata: Record<string, unknown> }).client_metadata = {
     "x-codex-turn-metadata": JSON.stringify({
@@ -150,7 +162,10 @@ test("compaction capability is one-shot and structurally bound to its handoff id
   const transaction = store.begin("trace_compaction", 1_000);
   expect(() => store.submit(transaction.token, "handoff_wrong", "checkpoint")).toThrow("does not match");
   store.submit(transaction.token, transaction.handoffId, "  exact checkpoint  ");
+  expect(store.acceptedSummary(transaction.token)).toBe("exact checkpoint");
   await expect(store.wait(transaction.token)).resolves.toBe("exact checkpoint");
+  // The status read is internal race arbitration; external submission remains one-shot.
+  expect(store.acceptedSummary(transaction.token)).toBe("exact checkpoint");
   expect(() => store.submit(transaction.token, transaction.handoffId, "again")).toThrow("invalid, expired, or consumed");
   store.close();
 });
@@ -290,6 +305,9 @@ test("active compaction drains an MCP call already queued without an outer Codex
 
 test("a completed retained agent returns an exact checkpoint and its browser is physically retired", async () => {
   expect(MAX_COMPACTION_HANDOFF_TIMEOUT_MS).toBe(5 * 60_000);
+  expect(MAX_COMPACTION_GENERATION_TIMEOUT_MS).toBe(15 * 60_000);
+  expect(compactionGenerationTimeoutMs(MAX_COMPACTION_HANDOFF_TIMEOUT_MS))
+    .toBe(MAX_COMPACTION_GENERATION_TIMEOUT_MS);
   const sourceRequest = request(false);
   const conversationKey = chatGptConversationKey(sourceRequest, "provider")!;
   const source = new ChatGptTurnSession({
@@ -306,6 +324,7 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
   let browserRetired = false;
   let transactionAborted = false;
   let transactionTtl = 0;
+  let generationStarts = 0;
   const broker = {
     beginCompactionTransaction: async (_traceId: string, ttlMs: number) => {
       transactionTtl = ttlMs;
@@ -323,6 +342,7 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
       const prepared = await turn.prepareResume!();
       expect(prepared.text).toContain("wire_name codex.control.compaction_handoff");
       prepared.release();
+      turn.onSubmitted?.();
       return await new Promise<string>((_resolve, reject) => {
         const onAbort = () => {
           browserRetired = true;
@@ -343,6 +363,10 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
     "trace_handoff",
     undefined,
     60 * 60_000,
+    undefined,
+    {
+      onStarted: () => { generationStarts += 1; },
+    },
   )).resolves.toBe("Retained agent checkpoint");
   expect(captured?.conversationKey).toBe(conversationKey);
   expect(captured?.requireRetainedConversation).toBeTrue();
@@ -351,7 +375,66 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
   expect(browserRetired).toBeTrue();
   expect(captured?.abortSignal?.reason).toBeInstanceOf(ChatGptCompactionHandoffAccepted);
   expect(transactionAborted).toBeTrue();
-  expect(transactionTtl).toBe(MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
+  expect(generationStarts).toBe(1);
+  expect(transactionTtl).toBe(
+    MAX_COMPACTION_HANDOFF_TIMEOUT_MS + MAX_COMPACTION_GENERATION_TIMEOUT_MS,
+  );
+});
+
+test("a structured compaction handoff accepted just after a Web terminal error wins the race", async () => {
+  const sourceRequest = request(false);
+  const source = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    usageInput: sourceRequest,
+    conversationKey: chatGptConversationKey(sourceRequest, "provider")!,
+    cancel() {},
+  });
+  let browserRetired = false;
+  const broker = {
+    beginCompactionTransaction: async () => ({
+      token: "control_11111111111111111111111111111111",
+      handoffId: "handoff_22222222222222222222222222222222",
+    }),
+    waitForCompactionHandoff: async () => {
+      await Bun.sleep(10);
+      return "Checkpoint accepted by Codex Native";
+    },
+    acceptedCompactionHandoff: () => undefined,
+    abortCompactionTransaction() {},
+  } as unknown as TurnBroker;
+  const worker = {
+    run: async (turn: BrowserTurn): Promise<string> => {
+      const prepared = await turn.prepareResume!();
+      prepared.release();
+      turn.onSubmitted?.();
+      turn.abortSignal?.addEventListener("abort", () => {
+        browserRetired = true;
+      }, { once: true });
+      await Bun.sleep(0);
+      const error = new ChatGptWebAdapterError(
+        "ChatGPT ended the turn with 'Something went wrong'. Retry the turn.",
+        { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: true },
+      );
+      if (turn.abortSignal?.aborted) browserRetired = true;
+      throw error;
+    },
+  };
+
+  await expect(requestRetainedCompactionHandoff(
+    worker as never,
+    request(true),
+    source,
+    broker,
+    { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    "trace_handoff_race",
+    undefined,
+    60 * 60_000,
+  )).resolves.toBe("Checkpoint accepted by Codex Native");
+  expect(browserRetired).toBeTrue();
 });
 
 test("completed retained compaction never treats ordinary assistant text as a handoff", async () => {
@@ -643,10 +726,18 @@ test("active compaction settles canonical tool results before the separate retai
     { role: "toolResult", toolCallId: "call_two", toolName: "exec_command", content: "two", isError: false, timestamp: 5 },
   );
 
-  await expect(settleActiveCompactionSource(parsed, source, broker)).resolves.toEqual({
+  let generationStarts = 0;
+  await expect(settleActiveCompactionSource(
+    parsed,
+    source,
+    broker,
+    undefined,
+    () => { generationStarts += 1; },
+  )).resolves.toEqual({
     answer: "Ordinary final after canonical results.",
     compactionInstructionDelivered: false,
   });
+  expect(generationStarts).toBe(1);
   expect(compactionTokens).toEqual(["turn_active"]);
   expect(completed.map(entry => entry.callId)).toEqual(["call_one", "call_two"]);
   expect(JSON.stringify(completed[0])).not.toContain(CODEX_ACTIVE_COMPACTION_REQUEST_MARKER);
@@ -1005,13 +1096,78 @@ test("retained compaction can close its browser epoch while preserving an ordina
   expect(source.conversationKey()).toBeUndefined();
   expect(sessions.findConversationHead(conversationKey)).toBeUndefined();
   expect(sessions.find("ordinary-final")).toBeUndefined();
-  expect(sessions.find("compacted-ordinary-final")).toBe(source);
+  const replay = sessions.find("compacted-ordinary-final");
+  expect(replay).toBeDefined();
+  expect(replay).not.toBe(source);
   expect(sessions.getOrCreate("compacted-ordinary-final", () => {
     replacementStarts += 1;
     throw new Error("the committed final response must be replayed, not replaced");
-  })).toBe(source);
+  })).toBe(replay!);
   expect(replacementStarts).toBe(0);
   sessions.clear();
+});
+
+test("a preserved final does not fail when its replay key is already occupied", async () => {
+  const sessions = new ChatGptTurnSessions();
+  const conversationKey = "d".repeat(64);
+  const sourceText = new ChatGptTextFeed();
+  sourceText.push("committed final");
+  const source = sessions.getOrCreate("source-final", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("committed final"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: sourceText,
+    conversationKey,
+    cancel() {},
+  }));
+  const occupied = sessions.getOrCreate("target-final", () => ({
+    mode: "read-only",
+    browser: Promise.resolve("other result"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel() {},
+  }));
+  await source.browserOutcome;
+  await source.physicalSettlement;
+
+  await expect(sessions.retireConversationPreservingFinalResponse(
+    conversationKey,
+    source,
+    "target-final",
+  )).resolves.toBe(1);
+  expect(sessions.find("source-final")).toBeUndefined();
+  expect(sessions.find("target-final")).toBe(occupied);
+  expect(source.conversationKey()).toBeUndefined();
+});
+
+test("the sanitized accepted-handoff collision trace remains a committed result with a warning", async () => {
+  const trace = JSON.parse(readFileSync(new URL("./fixtures/compaction/handoff-accepted-target-occupied-cleanup-collision.json", import.meta.url), "utf8")) as {
+    expected: { outcome: string; cleanup_warning: boolean; error_code: null };
+  };
+  const core = new (await import("../src/adapters/chatgpt-web/compaction-core")).InProcessStructuredCompactionCore();
+  const outcome = await core.compact({
+    selector: { namespace: "chatgpt-web", executionKey: "trace-collision" },
+    execute: async () => "accepted summary",
+    cleanup: async () => { throw new Error("target execution key already occupied"); },
+  });
+  expect(outcome).toMatchObject({
+    kind: trace.expected.outcome,
+    cleanupWarnings: trace.expected.cleanup_warning ? [{ code: "cleanup_warning" }] : [],
+  });
+  expect(trace.expected.error_code).toBeNull();
+});
+
+test("turn result journal treats identical results as idempotent and preserves conflicts", () => {
+  const journal = new TurnResultJournal();
+  const first = journal.record("k", "summary", [{ type: "text_delta", text: "summary" }]);
+  const duplicate = journal.record("k", "summary", [{ type: "text_delta", text: "summary" }]);
+  const conflict = journal.record("k", "different");
+  expect(first.kind).toBe("recorded");
+  expect(duplicate.kind).toBe("duplicate");
+  expect(conflict.kind).toBe("conflict");
+  expect(journal.get("k")?.answer).toBe("summary");
 });
 
 test("adapter compact returns one same-agent handoff and preserves a pre-existing ordinary final", async () => {
@@ -1264,6 +1420,65 @@ test.each([false, true])("structured compact rebuilds canonical context when its
   }
 });
 
+test("structured compact rebuilds canonical context when retained ChatGPT stops during handoff", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stopped-retained-compact-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://stopped-retained-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: true,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const sourceRequest = request(false);
+  const namespace = chatGptWebExecutionNamespace(provider);
+  const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
+  chatGptTurnSessions.getOrCreate(sourceKey, () => ({
+    mode: "read-only",
+    browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    usageInput: sourceRequest,
+    conversationKey: chatGptConversationKey(sourceRequest, namespace)!,
+    cancel() {},
+  }));
+  await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
+
+  let browserStarts = 0;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    browserStarts += 1;
+    if (turn.requireRetainedConversation) throw chatGptStoppedThinkingError();
+    const prepared = await turn.prepare();
+    expect(prepared.text).toContain("Original task");
+    prepared.release();
+    return "Fallback checkpoint after retained ChatGPT stopped";
+  };
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(provider).runTurn!(
+      request(true),
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+    expect(browserStarts).toBe(2);
+    expect(events.some(event => event.type === "text_delta"
+      && event.text.includes("Fallback checkpoint after retained ChatGPT stopped"))).toBeTrue();
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fresh multipart compaction gives each acknowledged phase its own handoff budget", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-phased-fallback-compact-"));
   const provider: CodexProviderConfig = {
@@ -1304,6 +1519,52 @@ test("fresh multipart compaction gives each acknowledged phase its own handoff b
     );
     expect(events.some(event => event.type === "text_delta"
       && event.text.includes("Fallback checkpoint after separately bounded phases"))).toBeTrue();
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    mock.timers.reset();
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh Pro compaction uses High for reliable checkpoint generation and keeps the longer budget", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-pro-generation-compact-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://pro-generation-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: true,
+      solAvailable: true,
+      proAvailable: true,
+      turnTimeoutMs: 40,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    expect(turn.reasoning).toBe("high");
+    expect(turn.onSubmitted).toBeDefined();
+    turn.onSubmitted!();
+    mock.timers.tick(80);
+    expect(turn.abortSignal?.aborted).toBeFalse();
+    return "Fallback checkpoint after a slow Pro generation phase";
+  };
+  const events: AdapterEvent[] = [];
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const compact = request(true);
+    compact.options.reasoning = "max";
+    await createChatGptWebAdapter(provider).runTurn!(
+      compact,
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+    expect(events.some(event => event.type === "text_delta"
+      && event.text.includes("Fallback checkpoint after a slow Pro generation phase"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
     mock.timers.reset();

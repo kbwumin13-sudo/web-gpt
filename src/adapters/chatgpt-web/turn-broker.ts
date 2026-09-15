@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { isWindowsPipeEndpoint } from "../../config";
@@ -8,6 +8,13 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import type { CodexMessage } from "../../types";
+
+/** Canonical Codex state kept behind the Runtime-owned retrieval boundary. */
+export interface ChatGptTurnContextSnapshot {
+  systemPrompt?: string[];
+  messages: CodexMessage[];
+}
 
 interface PendingTurn extends ChatGptTurnEnvironment {
   expiresAt?: number;
@@ -65,6 +72,7 @@ interface TurnChannel {
   traceId: string;
   externalOwner: boolean;
   environment: PendingTurn;
+  context?: ChatGptTurnContextSnapshot;
   bindingId?: string;
   queuedCallIds: string[];
   deliveredCallIds: Set<string>;
@@ -97,6 +105,7 @@ interface BrokerRequest {
     | "owner_register"
     | "owner_register_safe"
     | "owner_update"
+    | "owner_context_update"
     | "owner_safe_sent"
     | "owner_next"
     | "owner_complete"
@@ -111,6 +120,7 @@ interface BrokerRequest {
     | "safe_start"
     | "safe_complete"
     | "activity_complete"
+    | "context_read"
     | "submit_compaction_handoff";
   token?: string;
   bindingId?: string;
@@ -119,6 +129,7 @@ interface BrokerRequest {
   arguments?: Record<string, unknown>;
   input?: string;
   environment?: ChatGptTurnEnvironment;
+  context?: ChatGptTurnContextSnapshot;
   ttlMs?: number;
   traceId?: string;
   callId?: string;
@@ -130,6 +141,7 @@ interface BrokerRequest {
   surfaceNonce?: string;
   finalAnswer?: string;
   contract?: "native" | "safe";
+  contextAction?: "search" | "read";
 }
 
 interface BrokerResponse {
@@ -200,6 +212,97 @@ function ownerEnvironment(value: unknown): ChatGptTurnEnvironment {
   return structuredClone(environment as ChatGptTurnEnvironment);
 }
 
+function cloneContextSnapshot(value: ChatGptTurnContextSnapshot | undefined): ChatGptTurnContextSnapshot | undefined {
+  if (!value) return undefined;
+  if (!Array.isArray(value.messages) || value.messages.length > 50_000) {
+    throw new Error("turn context snapshot is invalid");
+  }
+  if (value.systemPrompt !== undefined
+    && (!Array.isArray(value.systemPrompt) || value.systemPrompt.some(item => typeof item !== "string"))) {
+    throw new Error("turn context system prompt is invalid");
+  }
+  return structuredClone({
+    ...(value.systemPrompt !== undefined ? { systemPrompt: value.systemPrompt } : {}),
+    messages: value.messages,
+  });
+}
+
+function contextMessageText(message: CodexMessage): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content.map(part => {
+    if (part.type === "text") return part.text;
+    if (part.type === "image") return `[image: ${part.imageUrl.slice(0, 120)}]`;
+    if (part.type === "thinking") return part.thinking;
+    return JSON.stringify(part);
+  }).join("\n");
+}
+
+const RETIRED_CONTEXT_HANDLE = /\b(?:turn|request|binding)_[A-Za-z0-9_-]{24,}/g;
+
+function redactContextText(value: string): string {
+  return value.replace(RETIRED_CONTEXT_HANDLE, handle => `[retired ${handle.split("_", 1)[0]} handle]`);
+}
+
+function contextSearch(
+  snapshot: ChatGptTurnContextSnapshot,
+  arguments_: Record<string, unknown>,
+): Record<string, unknown> {
+  const query = typeof arguments_.query === "string" ? arguments_.query.trim().toLowerCase() : "";
+  const offset = Number.isSafeInteger(arguments_.offset) && (arguments_.offset as number) >= 0
+    ? arguments_.offset as number
+    : 0;
+  const limit = Number.isSafeInteger(arguments_.limit) && (arguments_.limit as number) > 0
+    ? Math.min(arguments_.limit as number, 20)
+    : 10;
+  const matches = snapshot.messages.flatMap((message, index) => {
+    const text = redactContextText(contextMessageText(message));
+    const haystack = `${message.role}\n${text}`.toLowerCase();
+    if (query && !haystack.includes(query)) return [];
+    return [{
+      message_index: index,
+      role: message.role,
+      timestamp: message.timestamp,
+      preview: text.slice(0, 1_000),
+    }];
+  });
+  const page = matches.slice(offset, offset + limit);
+  return {
+    messages: page,
+    total: matches.length,
+    next_offset: offset + page.length < matches.length ? offset + page.length : null,
+  };
+}
+
+function contextRead(
+  snapshot: ChatGptTurnContextSnapshot,
+  arguments_: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!Array.isArray(arguments_.message_indices) || arguments_.message_indices.length === 0) {
+    throw new Error("codex_context_read requires one or more message_indices");
+  }
+  const indices = [...new Set(arguments_.message_indices)]
+    .filter((value): value is number => Number.isSafeInteger(value) && value >= 0 && value < snapshot.messages.length)
+    .slice(0, 20);
+  if (indices.length === 0) throw new Error("codex_context_read message_indices are invalid");
+  const includeSystem = arguments_.include_system === true;
+  const maxChars = Number.isSafeInteger(arguments_.max_chars) && (arguments_.max_chars as number) > 0
+    ? Math.min(arguments_.max_chars as number, 500_000)
+    : 100_000;
+  const selected = indices.map(index => ({
+    message_index: index,
+    message: snapshot.messages[index],
+  }));
+  const response: Record<string, unknown> = {
+    ...(includeSystem ? { system: snapshot.systemPrompt ?? [] } : {}),
+    messages: selected,
+  };
+  const encoded = redactContextText(JSON.stringify(response));
+  if (encoded.length > maxChars) {
+    throw new Error(`codex_context_read result exceeds max_chars=${maxChars}; request fewer records`);
+  }
+  return JSON.parse(encoded) as Record<string, unknown>;
+}
+
 function assertSurfaceNonce(value: unknown): asserts value is string {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{20,256}$/.test(value)) {
     throw new Error("Zero Risk local browser binding is invalid");
@@ -207,14 +310,21 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
-  register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId?: string): Promise<string>;
+  register(
+    environment: ChatGptTurnEnvironment,
+    ttlMs?: number,
+    traceId?: string,
+    context?: ChatGptTurnContextSnapshot,
+  ): Promise<string>;
   registerSafe(
     environment: ChatGptTurnEnvironment,
     surfaceNonce: string,
     ttlMs?: number,
     traceId?: string,
+    context?: ChatGptTurnContextSnapshot,
   ): Promise<string>;
   updateEnvironment(token: string, environment: ChatGptTurnEnvironment): void | Promise<void>;
+  updateContext(token: string, context: ChatGptTurnContextSnapshot): void | Promise<void>;
   confirmSafeTurnSent(
     token: string,
     surfaceNonce: string,
@@ -277,6 +387,7 @@ export class TurnBroker implements TurnBrokerOwner {
     environment: ChatGptTurnEnvironment,
     ttlMs?: number,
     traceId = "unknown",
+    context?: ChatGptTurnContextSnapshot,
     externalOwner = false,
     handlePrefix = "turn",
   ): Promise<string> {
@@ -292,6 +403,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel: TurnChannel = {
       traceId,
       externalOwner,
+      ...(context ? { context: cloneContextSnapshot(context) } : {}),
       environment: {
         ...environment,
         ...(ttlMs !== undefined ? { expiresAt: Date.now() + ttlMs } : {}),
@@ -319,10 +431,11 @@ export class TurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
+    context?: ChatGptTurnContextSnapshot,
     externalOwner = false,
   ): Promise<string> {
     assertSurfaceNonce(surfaceNonce);
-    const token = await this.register(environment, ttlMs, traceId, externalOwner, "request");
+    const token = await this.register(environment, ttlMs, traceId, context, externalOwner, "request");
     const channel = this.channels.get(token);
     if (!channel) throw new Error("Zero Risk turn registration was revoked before initialization");
     channel.safe = {
@@ -347,6 +460,11 @@ export class TurnBroker implements TurnBrokerOwner {
 
   waitForCompactionHandoff(token: string, signal?: AbortSignal): Promise<string> {
     return this.compactionTransactions.wait(token, signal);
+  }
+
+  /** Read the broker's authoritative accepted result after its one-shot waiter was consumed. */
+  acceptedCompactionHandoff(token: string): string | undefined {
+    return this.compactionTransactions.acceptedSummary(token);
   }
 
   abortCompactionTransaction(token: string): void {
@@ -374,6 +492,14 @@ export class TurnBroker implements TurnBrokerOwner {
         ? { expiresAt: channel.environment.expiresAt }
         : {}),
     };
+  }
+
+  updateContext(token: string, context: ChatGptTurnContextSnapshot): void {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw new Error("turn token is invalid or expired");
+    if (channel.safe?.state === "revoked") throw new Error("Zero Risk turn is already terminal");
+    channel.context = cloneContextSnapshot(context);
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -725,15 +851,24 @@ export class TurnBroker implements TurnBrokerOwner {
     this.server = undefined;
     this.startPromise = undefined;
     brokers.delete(this.socketPath);
-    if (server?.listening) {
-      await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
-        if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
-        else rejectClose(error);
-      }));
+    let displacedSocketPath: string | undefined;
+    if (server?.listening && !isWindowsPipeEndpoint(this.socketPath)
+      && existsSync(this.socketPath) && lstatSync(this.socketPath).isSocket()) {
+      displacedSocketPath = `${this.socketPath}.closing-${process.pid}-${randomBytes(8).toString("hex")}`;
+      renameSync(this.socketPath, displacedSocketPath);
     }
-    if (!isWindowsPipeEndpoint(this.socketPath)
-      && existsSync(this.socketPath)
-      && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath);
+    try {
+      if (server?.listening) {
+        await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
+          if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
+          else rejectClose(error);
+        }));
+      }
+    } finally {
+      if (displacedSocketPath && existsSync(displacedSocketPath) && !existsSync(this.socketPath)) {
+        renameSync(displacedSocketPath, this.socketPath);
+      }
+    }
   }
 
   private start(): Promise<void> {
@@ -877,7 +1012,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff"].includes(request.method)) {
+    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_context_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "context_read", "submit_compaction_handoff"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -912,15 +1047,38 @@ export class TurnBroker implements TurnBrokerOwner {
       this.compactionTransactions.submit(request.token, request.handoffId, request.summary);
       return { submitted: true };
     }
+    if (request.method === "context_read") {
+      if (!request.token) throw new Error("turn token is required");
+      const channel = this.channels.get(request.token);
+      if (!channel) throw new Error("turn token is invalid or expired");
+      this.assertSafeHarnessRunning(channel);
+      if (!channel.context) throw new Error("Codex context retrieval is unavailable for this turn");
+      const arguments_ = request.arguments ?? {};
+      // The compact bootstrap is a bet that the Web model retrieves what it was not sent. Without
+      // this line the bet is unobservable: a model that never retrieves looks the same as one that
+      // had everything it needed.
+      console.info(
+        `[chatgpt-web] broker trace=${channel.traceId} context_${request.contextAction ?? "invalid"}`,
+      );
+      if (request.contextAction === "search") return contextSearch(channel.context, arguments_);
+      if (request.contextAction === "read") return contextRead(channel.context, arguments_);
+      throw new Error("Codex context retrieval action is invalid");
+    }
     if (request.method === "owner_status") {
-      return { protocolVersion: 5, acceptingExternalOwners: this.acceptingExternalOwners };
+      return { protocolVersion: 6, acceptingExternalOwners: this.acceptingExternalOwners };
     }
     if (request.method === "owner_register") {
       const environment = ownerEnvironment(request.environment);
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
       }
-      return this.register(environment, request.ttlMs, request.traceId, true).then(token => ({ token }));
+      return this.register(
+        environment,
+        request.ttlMs,
+        request.traceId,
+        cloneContextSnapshot(request.context),
+        true,
+      ).then(token => ({ token }));
     }
     if (request.method === "owner_register_safe") {
       const environment = ownerEnvironment(request.environment);
@@ -933,12 +1091,20 @@ export class TurnBroker implements TurnBrokerOwner {
         request.surfaceNonce,
         request.ttlMs,
         request.traceId,
+        cloneContextSnapshot(request.context),
         true,
       ).then(token => ({ token }));
     }
     if (request.method === "owner_update") {
       if (!request.token) throw new Error("turn owner token is required");
       this.updateEnvironment(request.token, ownerEnvironment(request.environment));
+      return { updated: true };
+    }
+    if (request.method === "owner_context_update") {
+      if (!request.token) throw new Error("turn owner token is required");
+      const context = cloneContextSnapshot(request.context);
+      if (!context) throw new Error("turn owner context snapshot is required");
+      this.updateContext(request.token, context);
       return { updated: true };
     }
     if (request.method === "owner_safe_sent") {
@@ -1050,13 +1216,23 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
-        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment };
+        return {
+          bindingId: activeChannel.bindingId,
+          activityId,
+          environment: activeChannel.environment,
+          contextAvailable: activeChannel.context !== undefined,
+        };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
-      return { bindingId, activityId, environment: activeChannel.environment };
+      return {
+        bindingId,
+        activityId,
+        environment: activeChannel.environment,
+        contextAvailable: activeChannel.context !== undefined,
+      };
     }
 
     const bindingId = request.bindingId;
@@ -1307,7 +1483,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
         + ` (${error instanceof Error ? error.message : String(error)})`,
       );
     }
-    if (status.protocolVersion !== 5) {
+    if (status.protocolVersion !== 6) {
       throw new Error(`Unsupported DEV turn-owner protocol version: ${String(status.protocolVersion)}`);
     }
     if (status.acceptingExternalOwners !== true) {
@@ -1315,12 +1491,18 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     }
   }
 
-  async register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId = "unknown"): Promise<string> {
+  async register(
+    environment: ChatGptTurnEnvironment,
+    ttlMs?: number,
+    traceId = "unknown",
+    context?: ChatGptTurnContextSnapshot,
+  ): Promise<string> {
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
       method: "owner_register",
       environment,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
+      ...(context ? { context } : {}),
     });
     if (typeof response.token !== "string" || !response.token.startsWith("turn_")) {
       throw new Error("DEV turn owner received an invalid broker token");
@@ -1333,6 +1515,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
+    context?: ChatGptTurnContextSnapshot,
   ): Promise<string> {
     assertSurfaceNonce(surfaceNonce);
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
@@ -1341,6 +1524,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
       surfaceNonce,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
+      ...(context ? { context } : {}),
     });
     if (typeof response.token !== "string" || !response.token.startsWith("request_")) {
       throw new Error("DEV Zero Risk turn owner received an invalid broker request id");
@@ -1350,6 +1534,10 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
 
   async updateEnvironment(token: string, environment: ChatGptTurnEnvironment): Promise<void> {
     await callTurnBroker(this.socketPath, { method: "owner_update", token, environment });
+  }
+
+  async updateContext(token: string, context: ChatGptTurnContextSnapshot): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_update", token, context });
   }
 
   async confirmSafeTurnSent(

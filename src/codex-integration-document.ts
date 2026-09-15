@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { stripUtf8Bom } from "./config";
+import { getConfigDir, stripUtf8Bom } from "./config";
 import {
   MANAGED_COMMENT,
   MANAGED_ROUTE_COMMENT,
@@ -25,6 +25,66 @@ import type {
 export function firstTableIndex(lines: string[]): number {
   const index = lines.findIndex(line => /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line));
   return index < 0 ? lines.length : index;
+}
+
+export const MANAGED_WEB_AGENT_RUNNER_COMMENT = "# Managed by codex-chatgpt-web: explicit Web model delegation through an ephemeral App Server thread.";
+
+function legacyManagedWebAgentRunner(lines: string[]): boolean {
+  const command = lines.find(line => /^\s*command\s*=\s*/.test(line))?.replace(/^\s*command\s*=\s*/, "").trim();
+  const args = lines.find(line => /^\s*args\s*=\s*/.test(line))?.replace(/^\s*args\s*=\s*/, "").trim();
+  if (!command || !args) return false;
+  try {
+    const commandValue = JSON.parse(command);
+    const argsValue = JSON.parse(args);
+    return typeof commandValue === "string"
+      && commandValue.startsWith(`${getConfigDir()}/versions/`)
+      && Array.isArray(argsValue)
+      && argsValue.at(-1) === "runner-mcp"
+      && argsValue.some(value => typeof value === "string" && value.endsWith("/app/cli.js"));
+  } catch {
+    return false;
+  }
+}
+
+function managedWebAgentRunner(lines: string[]): boolean {
+  return lines.includes(MANAGED_WEB_AGENT_RUNNER_COMMENT) || legacyManagedWebAgentRunner(lines);
+}
+
+export function installManagedWebAgentRunner(text: string, runtimeCommand: readonly string[]): string {
+  if (runtimeCommand.length === 0 || runtimeCommand.some(part => !part.trim())) {
+    throw new Error("Web Agent Runner requires a non-empty runtime command");
+  }
+  const document = parseDocument(text);
+  const table = findTomlTable(document.lines, "mcp_servers.web_agent_runner");
+  if (table) {
+    const existing = document.lines.slice(table.headerIndex, table.endIndex);
+    if (!managedWebAgentRunner(existing)) {
+      throw new Error("Codex already defines [mcp_servers.web_agent_runner]; refusing to replace the user's MCP server");
+    }
+    for (let index = table.endIndex - 1; index >= table.headerIndex; index -= 1) removeDocumentLine(document, index);
+  }
+  if (document.lines.length > 0 && document.lines.at(-1)?.trim()) insertDocumentLine(document, document.lines.length, "");
+  const lines = [
+    "[mcp_servers.web_agent_runner]",
+    MANAGED_WEB_AGENT_RUNNER_COMMENT,
+    `command = ${JSON.stringify(runtimeCommand[0])}`,
+    `args = ${JSON.stringify([...runtimeCommand.slice(1), "runner-mcp"])}`,
+  ];
+  for (const line of lines) insertDocumentLine(document, document.lines.length, line);
+  return renderDocument(document);
+}
+
+export function removeManagedWebAgentRunner(text: string): string {
+  const document = parseDocument(text);
+  const table = findTomlTable(document.lines, "mcp_servers.web_agent_runner");
+  if (!table) return text;
+  if (!managedWebAgentRunner(document.lines.slice(table.headerIndex, table.endIndex))) return text;
+  for (let index = table.endIndex - 1; index >= table.headerIndex; index -= 1) removeDocumentLine(document, index);
+  while (table.headerIndex > 0 && document.lines[table.headerIndex - 1]?.trim() === "") {
+    removeDocumentLine(document, table.headerIndex - 1);
+    table.headerIndex -= 1;
+  }
+  return renderDocument(document);
 }
 function assignmentRegex(key: string): RegExp {
   return new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.+?)\\s*$`);

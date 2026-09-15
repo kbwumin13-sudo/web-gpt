@@ -67,8 +67,7 @@ test("core setup preserves an existing full-harness installation", async () => {
   assert.deepEqual(fixture.invocation().args, [
     "setup",
     "--full",
-    "--browser-host-descriptor",
-    "/runtime/launcher-browser.json",
+    "--managed-browser-host",
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
     "--replace-codex-route",
@@ -181,8 +180,7 @@ test("Bigger Context uses the setup transaction and refreshes the production Cod
     args: [
       "setup",
       "--full",
-      "--browser-host-descriptor",
-      "/runtime/launcher-browser.json",
+      "--managed-browser-host",
       "--automatic-browser-interaction",
       "--replace-codex-route",
       "--acknowledge-unofficial",
@@ -379,8 +377,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
   assert.deepEqual(fixture.invocation().args, [
     "setup",
     "--full",
-    "--browser-host-descriptor",
-    "/runtime/launcher-browser.json",
+    "--managed-browser-host",
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
     "--acknowledge-unofficial",
@@ -410,8 +407,7 @@ test("launcher migrates the legacy connector identity even when the release vers
   assert.deepEqual(fixture.invocation().args, [
     "setup",
     "--full",
-    "--browser-host-descriptor",
-    "/runtime/launcher-browser.json",
+    "--managed-browser-host",
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
     "--acknowledge-unofficial",
@@ -488,8 +484,7 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
     assert.deepEqual(fixture.invocation().args, [
       "setup",
       "--full",
-      "--browser-host-descriptor",
-      "/runtime/launcher-browser.json",
+      "--managed-browser-host",
       "--automatic-browser-interaction",
       "--replace-codex-route",
       "--acknowledge-unofficial",
@@ -510,11 +505,10 @@ test("new MCP setup uses the fixed connector without a CLI name override", async
     runtimeKey: "new-private-runtime-key",
   });
 
-  assert.deepEqual(fixture.invocation().args.slice(0, 5), [
+  assert.deepEqual(fixture.invocation().args.slice(0, 4), [
     "setup",
     "--full",
-    "--browser-host-descriptor",
-    "/runtime/launcher-browser.json",
+    "--managed-browser-host",
     "--automatic-browser-interaction",
   ]);
   assert.equal(fixture.invocation().args.includes("--app-name"), false);
@@ -1169,11 +1163,10 @@ test("failed terminal migration restores removed launchd ownership before verify
     assert.equal(fs.readFileSync(daemonPlist, "utf8"), "old daemon plist\n");
     assert.equal(fs.readFileSync(tunnelPlist, "utf8"), "old tunnel plist\n");
     assert.deepEqual(calls, [
-      "setup --full --preflight-only",
-      "setup --full",
-      "service install",
-      "tunnel start",
-      "doctor --json",
+    "setup --full --preflight-only",
+    "setup --full",
+    "service install",
+    "doctor --json",
     ]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

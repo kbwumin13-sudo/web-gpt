@@ -29,6 +29,11 @@ import {
   verifyCodexInterruptHookRestored,
 } from "./codex-interrupt-hook";
 import {
+  restoreCodexLifecycleHooks,
+  verifyCodexLifecycleHooks,
+  verifyCodexLifecycleHooksRestored,
+} from "./codex-lifecycle-hook";
+import {
   assignments,
   findFeatureAssignment,
   findAgentMaxDepthAssignment,
@@ -179,9 +184,12 @@ export function replacementBaseline(
   if (!managedJournalIsActive(journal)) return currentText;
 
   if (journal.version === 9 || journal.version === 10) {
-    const withoutHook = journal.version === 10
-      ? restoreCodexInterruptHook(currentText, journal.interruptHook, { allowAbsent: true })
+    const withoutHooks = journal.version === 10 && journal.lifecycleHooks
+      ? restoreCodexLifecycleHooks(currentText, journal.lifecycleHooks, { allowAbsent: true })
       : currentText;
+    const withoutHook = journal.version === 10
+      ? restoreCodexInterruptHook(withoutHooks, journal.interruptHook, { allowAbsent: true })
+      : withoutHooks;
     const baseline = restoreOwnedManagedFeatures(withoutHook, journal);
     const document = parseDocument(baseline);
     removeManagedComment(document);
@@ -300,7 +308,10 @@ export function verifyInstalledRoute(text: string, journal: ManagedRouteJournal)
       throw new Error("Codex realtime WebRTC call route changed after setup; refusing to overwrite the user's newer value");
     }
   }
-  if (journal.version === 10) verifyCodexInterruptHook(text, journal.interruptHook);
+  if (journal.version === 10) {
+    verifyCodexInterruptHook(text, journal.interruptHook);
+    if (journal.lifecycleHooks) verifyCodexLifecycleHooks(text, journal.lifecycleHooks);
+  }
   if (journal.version === 8 || journal.version === 9 || journal.version === 10) {
     const evidence = compatibilityV1Evidence(journal);
     if (evidence) {
@@ -354,7 +365,10 @@ export function verifyRestoredRoute(
       );
     }
   }
-  if (journal.version === 10) verifyCodexInterruptHookRestored(text);
+  if (journal.version === 10) {
+    verifyCodexInterruptHookRestored(text);
+    if (journal.lifecycleHooks) verifyCodexLifecycleHooksRestored(text);
+  }
   if (journal.version === 5 || journal.version === 6) {
     const previousFeatures: Array<readonly [string, PreviousFeatureAssignment]> = [
       ["remote_compaction_v2", journal.previousRemoteCompactionV2],
@@ -431,9 +445,12 @@ export function assertPreservedPreviousRealtimeAssignment(
 
 export function restoreManagedRoute(text: string, journal: ManagedRouteJournal): string {
   verifyInstalledRoute(text, journal);
-  const withoutHook = journal.version === 10
-    ? restoreCodexInterruptHook(text, journal.interruptHook)
+  const withoutLifecycleHooks = journal.version === 10 && journal.lifecycleHooks
+    ? restoreCodexLifecycleHooks(text, journal.lifecycleHooks)
     : text;
+  const withoutHook = journal.version === 10
+    ? restoreCodexInterruptHook(withoutLifecycleHooks, journal.interruptHook)
+    : withoutLifecycleHooks;
   const document = parseDocument(withoutHook);
   removeManagedComment(document);
   const currentBaseUrl = findTopLevelAssignment(document.lines, "openai_base_url");

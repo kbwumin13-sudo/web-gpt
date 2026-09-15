@@ -32,7 +32,7 @@ Free 和 Go 账户会在 Codex 原生模型选择器中看到 **ChatGPT Web — 
 </p>
 
 ```text
-Codex task ──Responses + SSE──▶ codex-chatgpt-web ──embedded browser──▶ ChatGPT
+Codex task ──Responses + SSE──▶ 无头 Backend ──托管 Chrome──▶ ChatGPT
      ▲                                │                                      │
      └──────── native UI, context, images, tracing, and tool lifecycle ──────┘
 ```
@@ -55,8 +55,8 @@ Codex 会保留原生任务、上下文生命周期、界面和工具 harness。
 - **连续任务会话与原生上下文压缩。** 连续消息会复用同一个与任务绑定的临时聊天。到达上下文
   边界时，保留的 agent 会先写出检查点，再由 Codex 从干净聊天继续；若该私有聊天已被关闭，
   则使用 Codex 的规范任务历史作为回退来源。
-- **统一的跨平台启动器。** macOS、Windows 和 Linux 应用统一管理登录、模型设置、MCP 指南、
-  健康检查、安全诊断以及最多五个可见的任务绑定浏览器标签页。
+- **仅设置功能的桌面应用。** 应用负责登录、模型设置、MCP 指南、健康检查、安全诊断、更新和
+  修复。正式自动轮次运行在无头后端；内置浏览器仅保留给零风险/手动兼容路径。
 - **故障时明确失败。** 模型、工具缺失或 ChatGPT UI 发生变化时会返回明确错误，而不会静默切换
   路由或能力。端到端覆盖范围记录在[发布验证](docs/release-validation.md)中。
 
@@ -83,17 +83,21 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 
 然后在应用中完成三项检查：
 
-1. 直接在启动器内置的 ChatGPT 浏览器中登录。登录页和身份提供商窗口都保留在同一个由启动器
-   管理的私有浏览器配置中；会话不会在不同浏览器之间复制。
-2. 运行浏览器冒烟测试。
+1. 在设置页发起登录。自动模式会打开后端使用的托管 Chrome 配置；零风险模式仍保留内置启动器
+   浏览器作为明确的手动兼容路径。
+2. 如果使用零风险模式，运行浏览器冒烟测试。
 3. 点击 **安装模型**，重启一次 Codex，然后选择一个 **ChatGPT Web — …** 模型。
 
 启动器会在设置期间检测当前账户的 ChatGPT 控件：Free/Go 账户只会显示 Luna；只有已登录账户
 支持 Pro 时，Pro 才会显示。独立的 **MCP** 页面是可选项，它会在不需要终端命令的情况下引导你
 完成完整 harness 设置。
 
-打包后的启动器在其内置浏览器中完成登录并运行 ChatGPT 模型轮次，不需要模型 API 密钥、已安装的
-Chrome/Chromium、系统级 Node/Bun，也不会由本项目另行下载浏览器。
+打包后的设置应用不再托管自动模型轮次。自动模式由无头后端使用配置好的 Chrome 可执行文件；应用
+只在你主动请求时启动临时登录操作。它仍不需要模型 API 密钥、系统级 Node/Bun，也不会由本项目另行
+下载浏览器。
+
+完成设置后，Codex 会通过生命周期 Hook 启动后端。macOS 服务按需加载，使用稳定的
+`~/.codex-chatgpt-web/bin/codex-chatgpt-web` 入口；当会话租约和活动轮次都经过空闲宽限期后，后端会自动退出。
 
 **从源码运行**
 
@@ -158,6 +162,18 @@ bun run app
 codex-chatgpt-web subagents status
 codex-chatgpt-web subagents compatibility-v1
 codex-chatgpt-web subagents native
+```
+
+安装过程还会写入本地 `web_agent_runner` MCP server。原生 Codex 任务可以调用它唯一的
+`web_agent_run` 工具，并主动选择 `chatgpt-web/light`、`chatgpt-web/medium`、
+`chatgpt-web/high`、`chatgpt-web/extra-high` 或 `chatgpt-web/pro`。`design` 会创建只读的
+临时 App Server 任务；`execute` 使用 workspace-write，并把每一次命令或文件审批回传给当前
+Codex。Runner 不会回退到其他模型，子任务内部也会关闭自身。
+
+安装的入口命令是：
+
+```bash
+codex-chatgpt-web runner-mcp
 ```
 
 ## 限制和安全性

@@ -16,8 +16,26 @@ import {
 } from "./native-compaction-control";
 import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broker";
 import type { ChatGptTurnSession } from "./turn-execution";
+import { isChatGptCompactionHandoffRaceCandidate } from "./recovery-policy";
+import { InProcessStructuredCompactionCore, type CompactionSelector } from "./compaction-core";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
+
+export const structuredCompactionCore = new InProcessStructuredCompactionCore();
+
+export function structuredCompactionSelector(key: string): CompactionSelector {
+  const separator = key.indexOf(":");
+  if (separator < 0) {
+    if (!key.trim()) throw new Error("Structured compaction key must contain an exact execution key");
+    // Keep the helper compatible with the existing internal callers while production keys use
+    // the explicit namespace:execution-key form.
+    return { namespace: "chatgpt-web", executionKey: key };
+  }
+  if (separator <= 0 || separator === key.length - 1) {
+    throw new Error("Structured compaction key must contain a namespace and exact execution key");
+  }
+  return { namespace: key.slice(0, separator), executionKey: key.slice(separator + 1) };
+}
 
 function brokerContent(content: string | CodexContentPart[]): unknown[] {
   if (typeof content === "string") return [{ type: "text", text: content }];
@@ -129,9 +147,20 @@ function currentToolResults(
 }
 
 export const MAX_COMPACTION_HANDOFF_TIMEOUT_MS = 5 * 60_000;
+export const MAX_COMPACTION_GENERATION_TIMEOUT_MS = 15 * 60_000;
+/**
+ * The browser can surface a terminal banner while the MCP request that carries the checkpoint is
+ * still crossing the helper/broker boundary. Give the authoritative control plane a short window
+ * to publish its result before converting the browser banner into a failed compaction.
+ */
+export const COMPACTION_HANDOFF_ACCEPTANCE_GRACE_MS = 1_500;
 
 function boundedCompactionTimeout(timeoutMs: number): number {
   return Math.min(timeoutMs, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
+}
+
+export function compactionGenerationTimeoutMs(transportTimeoutMs: number): number {
+  return Math.min(MAX_COMPACTION_GENERATION_TIMEOUT_MS, transportTimeoutMs * 3);
 }
 
 function abortReason(signal: AbortSignal): Error {
@@ -164,6 +193,7 @@ export async function settleActiveCompactionSource(
   source: ChatGptTurnSession,
   broker: TurnBroker,
   signal?: AbortSignal,
+  onGenerationStarted?: () => void,
 ): Promise<{ answer: string; compactionInstructionDelivered: boolean }> {
   return source.runExclusive(async () => {
     if (signal?.aborted) {
@@ -194,6 +224,7 @@ export async function settleActiveCompactionSource(
         source.runtime.externalProgress.recordToolResult();
         source.markResultDelivered(request.callId);
       }
+      onGenerationStarted?.();
       const browserOutcome = await withCompactionAbort(source.browserOutcome, signal);
       if (browserOutcome.type === "error") throw browserOutcome.error;
       const compactionInstructionDelivered = broker.compactionDeliveryCount(token) > 0;
@@ -283,16 +314,37 @@ export async function requestRetainedCompactionHandoff(
   traceId: string,
   signal?: AbortSignal,
   timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
+  generationTimeoutMs?: number,
+  generationLifecycle: {
+    onStarted?: () => void;
+  } = {},
 ): Promise<string> {
   const conversationKey = source.conversationKey();
   if (!conversationKey) throw new Error("The completed ChatGPT source has no retained conversation identity");
   const operationTimeoutMs = boundedCompactionTimeout(timeoutMs);
-  const deadline = new AbortController();
-  const deadlineTimer = setTimeout(
-    () => deadline.abort(new Error(`ChatGPT compaction handoff timed out after ${operationTimeoutMs}ms`)),
-    operationTimeoutMs,
+  const operationGenerationTimeoutMs = Math.min(
+    generationTimeoutMs ?? compactionGenerationTimeoutMs(operationTimeoutMs),
+    MAX_COMPACTION_GENERATION_TIMEOUT_MS,
   );
-  deadlineTimer.unref?.();
+  const deadline = new AbortController();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const armDeadline = (phase: "transport" | "generation", phaseTimeoutMs: number): void => {
+    if (deadline.signal.aborted) return;
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    deadlineTimer = setTimeout(
+      () => deadline.abort(new Error(`ChatGPT compaction ${phase} timed out after ${phaseTimeoutMs}ms`)),
+      phaseTimeoutMs,
+    );
+    deadlineTimer.unref?.();
+  };
+  const armGenerationDeadline = (): void => {
+    armDeadline("generation", operationGenerationTimeoutMs);
+  };
+  const onGenerationStarted = (): void => {
+    armGenerationDeadline();
+    generationLifecycle.onStarted?.();
+  };
+  armDeadline("transport", operationTimeoutMs);
   const operationSignal = signal
     ? AbortSignal.any([signal, deadline.signal])
     : deadline.signal;
@@ -303,7 +355,10 @@ export async function requestRetainedCompactionHandoff(
   if (operationSignal.aborted) abortBrowser();
   else operationSignal.addEventListener("abort", abortBrowser, { once: true });
   try {
-    const transactionPromise = broker.beginCompactionTransaction(traceId, operationTimeoutMs);
+    const transactionPromise = broker.beginCompactionTransaction(
+      traceId,
+      operationTimeoutMs + operationGenerationTimeoutMs,
+    );
     void transactionPromise.then(lateTransaction => {
       if (operationSignal.aborted && transaction !== lateTransaction) {
         broker.abortCompactionTransaction(lateTransaction.token);
@@ -325,19 +380,47 @@ export async function requestRetainedCompactionHandoff(
       conversationKey,
       requireRetainedConversation: true,
       abortSignal: browserAbort.signal,
+      onSubmitted: onGenerationStarted,
       onTextDelta: () => {},
     });
     const browserFailure = browser.then<never>(
       () => new Promise<never>(() => {}),
       error => { throw error; },
     );
-    const summary = await withCompactionAbort(
-      Promise.race([
-        broker.waitForCompactionHandoff(transaction.token, operationSignal),
-        browserFailure,
-      ]),
-      operationSignal,
-    );
+    const handoff = broker.waitForCompactionHandoff(transaction.token, operationSignal);
+    let summary: string;
+    try {
+      summary = await withCompactionAbort(
+        Promise.race([handoff, browserFailure]),
+        operationSignal,
+      );
+    } catch (error) {
+      // A consumed waiter is still authoritative. Check it first, then allow an in-flight MCP
+      // submission to cross the process boundary for a bounded grace period. Genuine browser
+      // failures remain failures when no structured handoff arrives in that window.
+      const accepted = broker.acceptedCompactionHandoff?.(transaction.token);
+      if (accepted !== undefined) {
+        summary = accepted;
+      } else if (!isChatGptCompactionHandoffRaceCandidate(error)) {
+        throw error;
+      } else {
+        const late = await withCompactionAbort(
+          Promise.race([
+            handoff.then(
+              value => ({ accepted: true as const, value }),
+              () => ({ accepted: false as const }),
+            ),
+            new Promise<{ accepted: false }>(resolve => {
+              const timer = setTimeout(() => resolve({ accepted: false }), COMPACTION_HANDOFF_ACCEPTANCE_GRACE_MS);
+              timer.unref?.();
+            }),
+          ]),
+          operationSignal,
+        );
+        if (!late.accepted) throw error;
+        summary = late.value;
+      }
+    }
     // The one-shot control submission is the terminal event for this purpose-built response.
     // ChatGPT may render no assistant text after a tool-only response, and therefore no Copy
     // action. End our owned turn explicitly and wait for the launcher/helper cleanup handshake.
@@ -360,7 +443,7 @@ export async function requestRetainedCompactionHandoff(
       ).catch(() => {});
     }
     operationSignal.removeEventListener("abort", abortBrowser);
-    clearTimeout(deadlineTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 
@@ -455,12 +538,19 @@ export function runStructuredCompactionOnce(
   const interrupted = structuredCompactionInterruption(owner);
   if (interrupted) return Promise.reject(interrupted);
   const abort = new AbortController();
+  const selector = structuredCompactionSelector(key);
+  structuredCompactionCore.begin(selector, "source_settling");
   const previousOwner = structuredCompactionOwners.get(owner.ownerKey);
   const physicalSettlements: Promise<void>[] = previousOwner ? [previousOwner] : [];
   const promise = Promise.resolve().then(async () => {
-    if (previousOwner) await withCompactionAbort(previousOwner, abort.signal);
-    if (abort.signal.aborted) throw abortReason(abort.signal);
-    return start(abort.signal, settlement => { physicalSettlements.push(settlement); });
+    try {
+      if (previousOwner) await withCompactionAbort(previousOwner, abort.signal);
+      if (abort.signal.aborted) throw abortReason(abort.signal);
+      return await start(abort.signal, settlement => { physicalSettlements.push(settlement); });
+    } catch (error) {
+      structuredCompactionCore.fail(selector, error);
+      throw error;
+    }
   });
   // Return a deadline failure promptly, while its physical browser owner still blocks retries
   // and cancel-all completion. A cancelled queued run must also retain its predecessor's gate.
