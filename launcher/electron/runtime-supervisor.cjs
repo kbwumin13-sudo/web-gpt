@@ -160,7 +160,6 @@ function withDeadline(promise, timeoutMs, description) {
       () => reject(new Error(`${description} did not settle within ${timeoutMs}ms`)),
       timeoutMs,
     );
-    if (typeof timer?.unref === "function") timer.unref();
   });
   return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
