@@ -334,6 +334,7 @@ function SetupSurface({ activateBrowser, browser, copy, devProfile, setError, sh
 }) {
   const [busy, setBusy] = useState(false);
   const manual = snapshot.state.browserInteractionMode === "manual";
+  const managedBrowser = snapshot.browserHost === "managed-chrome";
   const run = async (task: () => Promise<unknown>) => { if (busy) return; setBusy(true); setError(null); try { await task(); } catch (cause) { setError(messageOf(cause)); } finally { setBusy(false); } };
   const signIn = () => run(async () => { await activateBrowser(); await api!.openLogin(); });
   const smoke = () => run(async () => { await activateBrowser(); await api!.smokeTest(); updateState((await api!.snapshot()).state); });
@@ -341,8 +342,8 @@ function SetupSurface({ activateBrowser, browser, copy, devProfile, setError, sh
   return <ContentSurface eyebrow={copy.required} title={devProfile ? copy.devSetupTitle : copy.setupTitle} subtitle={devProfile ? copy.devSetupSubtitle : manual ? copy.manualInteractionBody : copy.setupSubtitle}>
     <SectionHeading label={devProfile ? copy.devCoreSetup : copy.coreSetup} />
     <div className="wg-setup-list">
-      {!manual ? <><SetupRow complete={browser?.authenticated === true} index={1} title={copy.stepAccount} description={copy.stepAccountBody} action={browser?.authenticated ? copy.signedIn : browser?.status === "loading" ? copy.checkingSignIn : copy.signIn} disabled={busy} onAction={signIn} /><SetupRow complete={snapshot.smokePassed} index={2} title={copy.stepSmoke} description={copy.stepSmokeBody} action={snapshot.smokePassed ? copy.smokePassed : copy.runSmoke} disabled={busy || browser?.authenticated !== true} onAction={smoke} /></> : null}
-      <SetupRow complete={snapshot.state.codexCatalogVerified === true} index={manual ? 1 : 3} title={devProfile ? copy.devStepInstall : copy.stepInstall} description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody} action={snapshot.state.coreSetupComplete ? devProfile ? copy.devReinstall : copy.reinstall : devProfile ? copy.devInstall : copy.install} disabled={busy || (!manual && !snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)} onAction={install} />
+      {!manual ? <><SetupRow complete={browser?.authenticated === true} index={1} title={copy.stepAccount} description={copy.stepAccountBody} action={browser?.authenticated ? copy.signedIn : browser?.status === "loading" ? copy.checkingSignIn : copy.signIn} disabled={busy} onAction={signIn} />{!managedBrowser ? <SetupRow complete={snapshot.smokePassed} index={2} title={copy.stepSmoke} description={copy.stepSmokeBody} action={snapshot.smokePassed ? copy.smokePassed : copy.runSmoke} disabled={busy || browser?.authenticated !== true} onAction={smoke} /> : null}</> : null}
+      <SetupRow complete={snapshot.state.codexCatalogVerified === true} index={manual ? 1 : managedBrowser ? 2 : 3} title={devProfile ? copy.devStepInstall : copy.stepInstall} description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody} action={snapshot.state.coreSetupComplete ? devProfile ? copy.devReinstall : copy.reinstall : devProfile ? copy.devInstall : copy.install} disabled={busy || (!manual && !managedBrowser && !snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)} onAction={install} />
     </div>
     {!devProfile && snapshot.state.codexRestartRequired ? <Notice icon="alert" tone="warning">{copy.restartCodex}</Notice> : null}
     <SectionHeading label={copy.mcp} meta={manual ? copy.required : copy.optional} spaced />

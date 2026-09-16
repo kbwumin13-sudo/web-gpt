@@ -114,6 +114,7 @@ export interface LauncherSnapshot {
   platform: string;
   packaged: boolean;
   version: string;
+  browserHost: "launcher" | "managed-chrome";
   smokePassed: boolean;
   operation: OperationState | null;
   update: UpdateState;

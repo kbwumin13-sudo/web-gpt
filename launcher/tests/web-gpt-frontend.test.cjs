@@ -24,6 +24,8 @@ test("Web GPT renderer preserves every browser and runtime bridge boundary", () 
   assert.match(source, /new ResizeObserver/);
   assert.match(source, /className="wg-tab-drag draggable"/);
   assert.match(source, /className="wg-welcome"/);
+  assert.match(source, /const managedBrowser = snapshot\.browserHost === "managed-chrome"/);
+  assert.match(source, /!managedBrowser \? <SetupRow/);
 });
 
 test("Web GPT uses its own mark and tokenized visual system", () => {
