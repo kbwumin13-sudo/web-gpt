@@ -3,6 +3,10 @@ import { observeWireStream, type ChatGptWireObservation } from "./turn-observati
 import { buildWireTranscript, wireTranscriptsEnabled, writeWireTranscript } from "./transcript-store";
 import { ChatGptWireCollector, type ChatGptWireStream } from "./wire-collector";
 import { attachChatGptWireTap } from "./wire-tap-host";
+import { resumedConversationStream, STREAM_HANDOFF } from "./handoff";
+import { decodeSseStream } from "./sse-frames";
+import { parseConversationFrame } from "./conversation-events";
+import { observeConversationEvents } from "./turn-observation";
 
 /**
  * Runs the wire observer alongside the DOM one without giving it any authority.
@@ -19,8 +23,6 @@ import { attachChatGptWireTap } from "./wire-tap-host";
 
 /** Normalised lengths closer than this ratio count as agreement; the two paths format Markdown differently. */
 const LENGTH_AGREEMENT_RATIO = 0.8;
-/** The envelope ChatGPT sends when a turn's answer continues on a different stream. */
-const STREAM_HANDOFF = "stream_handoff";
 
 export type ChatGptWireComparison =
   | "agreed"
@@ -92,6 +94,11 @@ export interface ChatGptWireTelemetrySnapshot {
    * are observed as empty. The count is how often that costs an observation.
    */
   handoffs_observed: number;
+  /**
+   * Of those, the ones whose continuation was found and folded. A gap between the two is the
+   * measure of handoffs this build still cannot follow.
+   */
+  handoffs_followed: number;
 }
 
 const MAX_TRACKED_SHAPES = 32;
@@ -114,6 +121,7 @@ let exactMatches = 0;
 let domRescues = 0;
 let serverStatements = 0;
 let handoffsObserved = 0;
+let handoffsFollowed = 0;
 const lastComparisonByTrace = new Map<string, ChatGptWireComparison>();
 const unrecognizedShapes = new Set<string>();
 const observedPaths = new Set<string>();
@@ -146,6 +154,7 @@ export function chatGptWireTelemetrySnapshot(): ChatGptWireTelemetrySnapshot {
     dom_rescues: domRescues,
     server_statements: serverStatements,
     handoffs_observed: handoffsObserved,
+    handoffs_followed: handoffsFollowed,
   };
 }
 
@@ -181,6 +190,7 @@ export function resetChatGptWireTelemetry(): void {
   domRescues = 0;
   serverStatements = 0;
   handoffsObserved = 0;
+  handoffsFollowed = 0;
   lastComparisonByTrace.clear();
   unrecognizedShapes.clear();
   observedPaths.clear();
@@ -314,6 +324,27 @@ export class ChatGptWireShadowSession {
   }
 
   /**
+   * The turn as it continued after a handoff, or undefined when no stream carried it.
+   *
+   * The continuation is looked for among the other streams of the same turn, which for the observed
+   * case is the WebSocket the page already holds open. A reassembly that the fold cannot read
+   * completely is discarded rather than returned: a partial observation that looks whole is worse
+   * than the honest empty one, because everything downstream trusts it the same way.
+   */
+  private followHandoff(chosen: ChatGptWireStream | undefined, conversationId?: string): ChatGptWireObservation | undefined {
+    for (const candidate of this.collector.snapshot()) {
+      if (candidate.id === chosen?.id || candidate.frames.length === 0) continue;
+      const sse = resumedConversationStream(candidate.raw, conversationId);
+      if (sse.length === 0) continue;
+      const observation = observeConversationEvents(decodeSseStream(sse).map(parseConversationFrame));
+      if (observation.counts.unrecognized > 0 || observation.unappliedDeltas > 0) continue;
+      if (!observation.endedTurn || observation.answer.length === 0) continue;
+      return observation;
+    }
+    return undefined;
+  }
+
+  /**
    * Fold what was observed and compare it against the DOM's conclusion. Returns the outcome so the
    * caller can log it; nothing here changes what the turn returns.
    */
@@ -341,7 +372,15 @@ export class ChatGptWireShadowSession {
       if (seen.frames.length > 0 && streamingPaths.size < MAX_TRACKED_PATHS) streamingPaths.add(path);
     }
     const stream = this.conversationStream();
-    const observation = stream ? observeWireStream(stream) : undefined;
+    const direct = stream ? observeWireStream(stream) : undefined;
+    // A turn ChatGPT moved off its conversation request continues on the socket the page already
+    // holds open, carrying the same event-stream text in topic messages. Reassembling it is what
+    // makes those turns observable at all; without it the request is four frames and no answer.
+    const resumed = direct?.counts.controlTypes.includes(STREAM_HANDOFF) === true && direct.answer.length === 0
+      ? this.followHandoff(stream, direct.conversationId)
+      : undefined;
+    if (resumed) handoffsFollowed += 1;
+    const observation = resumed ?? direct;
     if (observation) {
       streamsObserved += 1;
       unrecognizedFrames += observation.counts.unrecognized;
@@ -366,7 +405,7 @@ export class ChatGptWireShadowSession {
     // comparing, not a message to show anyone.
     const serverError = dom.failed ? observation?.error : undefined;
     if (serverError !== undefined) serverStatements += 1;
-    const handedOff = observation?.counts.controlTypes.includes(STREAM_HANDOFF) === true;
+    const handedOff = direct?.counts.controlTypes.includes(STREAM_HANDOFF) === true;
     if (handedOff) handoffsObserved += 1;
     /**
      * Whenever this observer lost a turn the page did read, keep every other stream that carried

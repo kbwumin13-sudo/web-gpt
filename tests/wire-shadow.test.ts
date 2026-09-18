@@ -169,6 +169,79 @@ test("a turn that handed its stream off records the streams it could have contin
   expect(transcript.companions![0]!.raw).toContain("t1");
 });
 
+test("a handed-off turn is followed onto the socket and observed there", async () => {
+  // The conversation request ends after four frames naming where the turn continues; the answer
+  // arrives on the socket the page already holds open. On the recorded turn this reassembly gave
+  // 480 frames, nothing unrecognised, and an answer identical to the one the page displayed.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  const streamItem = (offset: string, encoded: string) => JSON.stringify({
+    type: "message",
+    topic_id: "conversation-turn-1",
+    offset,
+    payload: {
+      type: "conversation-turn-stream",
+      payload: { type: "stream-item", conversation_id: "conv_1", turn_id: "t1", encoded_item: encoded },
+    },
+  });
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  for (const [index, encoded] of [
+    "data: \"v1\"\n\n",
+    `data: ${JSON.stringify({ p: "", o: "add", v: { message: { id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } } } })}\n\n`,
+    `data: ${JSON.stringify({ p: "/message/content/parts/0", o: "append", v: "resumed answer" })}\n\n`,
+    `data: ${JSON.stringify({ p: "", o: "patch", v: [{ p: "/message/end_turn", o: "replace", v: true }] })}\n\n`,
+    "data: [DONE]\n\n",
+  ].entries()) {
+    emit({ kind: "chunk", id: "ws", text: streamItem(`100-${index}`, encoded), at: 2 + index });
+  }
+  emitStream(emit, [
+    JSON.stringify({ type: "stream_handoff", conversation_id: "conv_1", options: [{ type: "subscribe_ws_topic" }] }),
+    "[DONE]",
+  ].map(payload => `data: ${payload}\n\n`).join(""));
+
+  const result = session.conclude({ answer: "resumed answer", failed: false });
+  expect(result.comparison).toBe("agreed");
+  expect(result.observation?.answer).toBe("resumed answer");
+  expect(chatGptWireTelemetrySnapshot()).toMatchObject({ handoffs_observed: 1, handoffs_followed: 1, exact: 1 });
+});
+
+test("a continuation the fold cannot read completely is not passed off as the turn", async () => {
+  // A partial observation that looks whole is worse than the honest empty one: everything
+  // downstream trusts it the same way.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  emit({
+    kind: "chunk",
+    id: "ws",
+    // A stream that never ends its turn.
+    text: JSON.stringify({
+      type: "message",
+      topic_id: "conversation-turn-1",
+      offset: "100-0",
+      payload: {
+        type: "conversation-turn-stream",
+        payload: {
+          type: "stream-item",
+          conversation_id: "conv_1",
+          encoded_item: `data: ${JSON.stringify({ p: "", o: "add", v: { message: { id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: ["half"] } } } })}\n\n`,
+        },
+      },
+    }),
+    at: 2,
+  });
+  emitStream(emit, [
+    JSON.stringify({ type: "stream_handoff", conversation_id: "conv_1", options: [{ type: "subscribe_ws_topic" }] }),
+    "[DONE]",
+  ].map(payload => `data: ${payload}\n\n`).join(""));
+
+  const result = session.conclude({ answer: "the page read it", failed: false });
+  expect(result.comparison).toBe("wire_empty");
+  expect(chatGptWireTelemetrySnapshot()).toMatchObject({ handoffs_observed: 1, handoffs_followed: 0 });
+});
+
 test("a turn this observer lost is recorded with every stream it could have been on", async () => {
   // Recording only when a handoff envelope was recognised missed the cases that matter most: one
   // lost turn selected the WebSocket itself and carried no envelope, so nothing about the
