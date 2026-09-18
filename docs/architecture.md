@@ -207,6 +207,46 @@ every later tool action in the same turn continues to present the current turn c
 ChatGPT status rows become reasoning summaries, while stable prose between rows becomes native
 Codex commentary.
 
+## Wire observation
+
+Turn decisions are read from the rendered DOM: whether a submission was accepted, which reply is
+this turn's, whether generation is still running, whether a block is reasoning or the answer,
+whether the turn ended. Each of those is an inference over a private, unversioned presentation
+layer, and each fails silently — a classification error returns an empty answer and raises nothing.
+Measured over this repository's history, the three files holding that logic account for 119 of the
+changes made by fix commits, against 5 for the Zero Risk path, which reads no DOM at all.
+
+ChatGPT's own client does not infer any of it. It streams each turn over `fetch`, and the facts the
+DOM path derives are fields in that stream. A page-side observer reads the same bytes:
+
+- **Nothing is forged.** The page's client builds and sends every request, so anti-automation
+  tokens, headers, and TLS characteristics remain exactly what ChatGPT produced. This observes
+  traffic; it never synthesises it.
+- **Nothing is perturbed.** The response passes through a `TransformStream` rather than being
+  `clone()`d or `tee()`d. There is no second consumer and therefore no added backpressure:
+  observation happens on the page's own read. A body the page never reads is never observed, which
+  is correct, because those are bytes the user never saw either.
+- **Nothing propagates.** Every observation path is guarded, and the host refuses any record that
+  does not match the expected shape — the binding is an entry point from a remote origin.
+
+Framing is decoded to the WHATWG event-stream rules, which are public and therefore implemented
+exactly. The payload schema above it is private, so it is written to *recognise* rather than to
+assume: a frame matching no known shape becomes an explicit `unrecognized` event naming its keys,
+and a patch the fold cannot apply is counted rather than approximated. `/healthz` reports both
+tallies under `wire_observation`; their target is zero, and a non-zero value names the shape still
+to be understood instead of leaving a wrong answer to be discovered by a user.
+
+The observer currently holds no authority. Every turn is still decided by the DOM path, and the two
+conclusions are compared per turn so the disagreement rate is measured before anything depends on
+it. The comparison is shaped around the failure that motivated it: `dom_empty` — the DOM found
+nothing while the stream carried a reply — is its own outcome rather than part of a generic
+mismatch, because that is the signature of the silent failure. Comparisons record lengths, not text.
+
+Raw transcripts are what turn a live failure into an offline regression test, and are also verbatim
+copies of a conversation. They are therefore written only when `CODEX_CHATGPT_WEB_WIRE_TRANSCRIPTS`
+is set, into an owner-only directory, pruned to a bounded window. The counters need no content and
+are always on.
+
 ## Memory plane
 
 Codex Runtime is the only control plane for long-term memory. The browser never opens its own
@@ -302,6 +342,16 @@ Browser-only mode uses the configured Chrome executable for backend-owned sign-i
 without a tunnel. Full mode separately downloads the official pinned
 `openai/tunnel-client` build for the current OS/architecture and verifies it against the release
 SHA-256 manifest.
+
+A build says which source produced it. The runtime manifest records the commit, whether that tree
+had uncommitted changes, and when the build ran; `/healthz`, `codex-chatgpt-web --build`, `doctor`,
+and the Launcher's first log record of each session all report it. Because a daemon keeps serving
+the build it started with, reinstalling a runtime changes nothing until that process restarts —
+both sides report the bundle they are running, so `doctor` decides that mismatch rather than
+leaving "the fix does not work" indistinguishable from "the fix is not running". The identity lives
+in the manifest rather than inside the bundle, because `bundleId` hashes the bundle's own files and
+an embedded timestamp would change that hash on every build; the manifest is excluded from the
+hash, so a build stays reproducible while still naming itself.
 
 On first launch, the embedded runtime is checked against a deterministic manifest covering every
 file path, size, and SHA-256 before any launcher port or window opens. The source, transactional

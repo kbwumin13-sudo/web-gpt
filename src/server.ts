@@ -2,6 +2,7 @@ import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-w
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retained-telemetry";
+import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow-observer";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
@@ -867,6 +868,10 @@ export function startServer(
           }),
           retained_conversation: chatGptRetainedTelemetrySnapshot(),
           memory_retrieval: memoryRetrievalSnapshot(),
+          // Shadow observation of ChatGPT's own transport, running alongside the DOM reading that
+          // still decides every turn. `comparisons` says how often the two agree; the unrecognized
+          // and unapplied counts say whether this build still understands the stream.
+          wire_observation: chatGptWireTelemetrySnapshot(),
           ...activity(),
         });
       }

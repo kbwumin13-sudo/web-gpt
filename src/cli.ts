@@ -31,6 +31,7 @@ import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions 
 import { installRuntimeKeyBytes, managedRuntimeKeyPath, readerMcpCommand, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { buildProvenance, describeBuild } from "./build-provenance";
+import { formatWireReplay, readWireCapture } from "./adapters/chatgpt-web/wire/replay";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
 import { authorizeReaderProject, listReaderProjects, revokeReaderProject } from "./reader";
@@ -48,6 +49,7 @@ Usage:
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web subagents <status|compatibility-v1|native>
   codex-chatgpt-web browser check
+  codex-chatgpt-web wire replay PATH
   codex-chatgpt-web dev launcher
   codex-chatgpt-web dev status [--json]
   codex-chatgpt-web dev setup <--browser-only|--full> [options]
@@ -789,6 +791,15 @@ async function main(): Promise<void> {
       await checkBrowserEngine(config);
       stdout.write("Playwright can launch the configured Chrome executable.\n");
     }
+  } else if (command === "wire") {
+    const action = args.shift();
+    if (action !== "replay") throw new Error("Wire command must be: wire replay PATH");
+    const path = args.shift();
+    if (!path) throw new Error("Wire replay requires the path of a recorded transcript or event-stream capture");
+    assertNoArgs(args);
+    // Replaying recorded bytes through the production fold is what makes a live failure
+    // reproducible offline instead of only describable.
+    stdout.write(formatWireReplay(readWireCapture(path)));
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();

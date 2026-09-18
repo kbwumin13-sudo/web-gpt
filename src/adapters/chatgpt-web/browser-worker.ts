@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
 import {
   atomicWriteFile,
@@ -83,6 +83,8 @@ import {
   chatGptStoppedThinkingError,
 } from "./adapter-error";
 import { isChatGptRetainedTurnRetryCandidate } from "./recovery-policy";
+import { chatGptNetworkError, withoutPlaywrightCallLog } from "./network-error";
+import { ChatGptWireShadowSession, chatGptWireShadowLog } from "./wire/shadow-observer";
 import {
   ChatGptLunaCheckpointStream,
   type CapturedChatGptLunaCheckpoint,
@@ -4411,11 +4413,15 @@ export class ChatGptBrowserWorker {
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
     const prepared = await prepare();
-    const diagnostics = new ChatGptBrowserDiagnostics(
-      turn.traceId,
-      this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
-      this.config.appName,
-    );
+    const diagnosticsRoot = this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns");
+    const diagnostics = new ChatGptBrowserDiagnostics(turn.traceId, diagnosticsRoot, this.config.appName);
+    // Runs alongside the DOM observation with no authority over it: this turn is decided exactly as
+    // before, while the same turn is watched over ChatGPT's own transport so the two can be compared.
+    const wireShadow = new ChatGptWireShadowSession(turn.traceId, join(dirname(diagnosticsRoot), "wire-transcripts"));
+    const concludeWireShadow = (answer: string, failed: boolean): void => {
+      const result = wireShadow.conclude({ answer, failed });
+      if (result.comparison !== "not_observed") console.info(chatGptWireShadowLog(turn.traceId, result));
+    };
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
     let diagnosticPage: Page | undefined;
@@ -4512,6 +4518,12 @@ export class ChatGptBrowserWorker {
       });
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
+      // A managed turn page is created blank and navigated afterwards, so the observer is in place
+      // before the first conversation request. A launcher page is already navigated and is covered
+      // from its next navigation onward.
+      await wireShadow.attach(page, message => console.info(
+        `[chatgpt-web] wire shadow trace=${turn.traceId} not attached: ${redactChatGptUiDiagnostic(message)}`,
+      ));
       const rebindLauncherPage = async (
         attempt: number,
         cause: Error,
@@ -5339,6 +5351,7 @@ export class ChatGptBrowserWorker {
         `[chatgpt-web] browser turn ${turn.traceId} completed`
         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
       );
+      concludeWireShadow(finalText, false);
       return finalText;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError"
@@ -5356,7 +5369,13 @@ export class ChatGptBrowserWorker {
       if (diagnosticPage && !diagnosticPage.isClosed()) {
         await diagnostics.capture(diagnosticPage, "turn-failed", error);
       }
-      throw error;
+      // A failed turn is the case worth comparing most: the wire says whether ChatGPT actually
+      // failed or whether only the DOM reading of it did.
+      concludeWireShadow("", true);
+      // A transport failure is about the network path, not about this bridge. Saying so — and
+      // dropping Playwright's call log, which describes its own waiting loop rather than the
+      // failure — is the difference between an actionable message and a stack trace.
+      throw chatGptNetworkError(error) ?? withoutPlaywrightCallLog(error);
     } finally {
       prepared.release();
       if (turnConnection) {
