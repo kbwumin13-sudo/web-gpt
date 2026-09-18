@@ -83,8 +83,8 @@ import {
   chatGptStoppedThinkingError,
 } from "./adapter-error";
 import { isChatGptRetainedTurnRetryCandidate } from "./recovery-policy";
-import { chatGptNetworkError, withoutPlaywrightCallLog } from "./network-error";
-import { ChatGptWireShadowSession, chatGptWireShadowLog } from "./wire/shadow-observer";
+import { chatGptNetworkError, withChatGptServerStatement, withoutPlaywrightCallLog } from "./network-error";
+import { ChatGptWireShadowSession, chatGptWireShadowLog, type ChatGptWireShadowResult } from "./wire/shadow-observer";
 import {
   ChatGptLunaCheckpointStream,
   type CapturedChatGptLunaCheckpoint,
@@ -4420,7 +4420,7 @@ export class ChatGptBrowserWorker {
     // this layer was built to catch — a complete wire reading is returned in its place. Every turn
     // where the DOM produced text is decided exactly as before.
     const wireShadow = new ChatGptWireShadowSession(turn.traceId, join(dirname(diagnosticsRoot), "wire-transcripts"));
-    const concludeWireShadow = (answer: string, failed: boolean): string | undefined => {
+    const concludeWireShadow = (answer: string, failed: boolean): ChatGptWireShadowResult => {
       const result = wireShadow.conclude({ answer, failed });
       if (result.comparison !== "not_observed") console.info(chatGptWireShadowLog(turn.traceId, result));
       if (result.rescuedAnswer !== undefined) {
@@ -4429,7 +4429,7 @@ export class ChatGptBrowserWorker {
           + ` because the page read none (chars=${result.rescuedAnswer.length})`,
         );
       }
-      return result.rescuedAnswer;
+      return result;
     };
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
@@ -5360,7 +5360,7 @@ export class ChatGptBrowserWorker {
         `[chatgpt-web] browser turn ${turn.traceId} completed`
         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
       );
-      return concludeWireShadow(finalText, false) ?? finalText;
+      return concludeWireShadow(finalText, false).rescuedAnswer ?? finalText;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError"
         && turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted) {
@@ -5379,11 +5379,15 @@ export class ChatGptBrowserWorker {
       }
       // A failed turn is the case worth comparing most: the wire says whether ChatGPT actually
       // failed or whether only the DOM reading of it did.
-      concludeWireShadow("", true);
+      const observed = concludeWireShadow("", true);
       // A transport failure is about the network path, not about this bridge. Saying so — and
       // dropping Playwright's call log, which describes its own waiting loop rather than the
       // failure — is the difference between an actionable message and a stack trace.
-      throw chatGptNetworkError(error) ?? withoutPlaywrightCallLog(error);
+      const reported = chatGptNetworkError(error) ?? withoutPlaywrightCallLog(error);
+      // When the stream carried a reason, ChatGPT's own words lead. The page can see that the
+      // surface is unusable but not why, and a capacity limit read as an expired login sends the
+      // reader to log in again for nothing.
+      throw withChatGptServerStatement(reported, observed.serverError);
     } finally {
       prepared.release();
       if (turnConnection) {

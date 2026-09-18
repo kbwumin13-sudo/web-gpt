@@ -128,6 +128,35 @@ export function withoutPlaywrightCallLog<T>(error: T): T {
 }
 
 /**
+ * Lead a failure with what ChatGPT said about it, keeping the reading taken from the page after it.
+ *
+ * The page-derived message is an inference: the DOM path can see that the surface is unusable but
+ * not why, so it names the most likely cause. One real failure was an upstream capacity limit read
+ * as an expired login, which sends the reader to log in again for no reason. The server's own
+ * statement is not an inference, so it goes first — and the inference is kept, because it is what
+ * the retry classification was decided on and dropping it would hide that the two disagreed.
+ *
+ * The error object is edited in place rather than replaced: its type decides abort handling, retry
+ * classification and the compaction handoff, all by `instanceof`.
+ */
+export function withChatGptServerStatement<T>(error: T, statement: string | undefined): T {
+  const trimmed = statement?.trim();
+  if (!trimmed || !(error instanceof Error)) return error;
+  const reading = withoutCallLog(error.message).trim();
+  // Nothing to add when the page already reported what the server said.
+  if (reading.includes(trimmed)) return error;
+  const message = reading.length === 0
+    ? `ChatGPT reported: ${trimmed}`
+    : `ChatGPT reported: ${trimmed} (the page was read as: ${reading})`;
+  try {
+    Object.defineProperty(error, "message", { value: message, writable: true, enumerable: false, configurable: true });
+  } catch {
+    // A message that cannot be rewritten stays as it was; formatting a failure must not add one.
+  }
+  return error;
+}
+
+/**
  * Build an explicit error for a browser transport failure, or return undefined when the failure is
  * not a transport one and belongs to whichever layer already understands it.
  */

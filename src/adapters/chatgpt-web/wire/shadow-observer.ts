@@ -79,6 +79,10 @@ export interface ChatGptWireTelemetrySnapshot {
    * than only logged.
    */
   dom_rescues: number;
+  /**
+   * Failed turns reported with ChatGPT's own words instead of an inference drawn from the page.
+   */
+  server_statements: number;
 }
 
 const MAX_TRACKED_SHAPES = 32;
@@ -99,6 +103,7 @@ let rejectedRecords = 0;
 let evictedWithFrames = 0;
 let exactMatches = 0;
 let domRescues = 0;
+let serverStatements = 0;
 const lastComparisonByTrace = new Map<string, ChatGptWireComparison>();
 const unrecognizedShapes = new Set<string>();
 const observedPaths = new Set<string>();
@@ -129,6 +134,7 @@ export function chatGptWireTelemetrySnapshot(): ChatGptWireTelemetrySnapshot {
     evicted_with_frames: evictedWithFrames,
     exact: exactMatches,
     dom_rescues: domRescues,
+    server_statements: serverStatements,
   };
 }
 
@@ -162,6 +168,7 @@ export function resetChatGptWireTelemetry(): void {
   evictedWithFrames = 0;
   exactMatches = 0;
   domRescues = 0;
+  serverStatements = 0;
   lastComparisonByTrace.clear();
   unrecognizedShapes.clear();
   observedPaths.clear();
@@ -216,6 +223,14 @@ export interface ChatGptWireShadowResult {
    * so this can rescue a turn that already failed and cannot change one that worked.
    */
   rescuedAnswer?: string;
+  /**
+   * What ChatGPT itself said went wrong, when the turn failed and the stream carried a reason.
+   *
+   * The DOM path can only see that the page is not in a usable state and has to infer why. One real
+   * failure was an upstream capacity limit that it read as an expired login — a message that sends
+   * the reader to log in again for no reason. The server's own statement is not an inference.
+   */
+  serverError?: string;
 }
 
 /**
@@ -335,6 +350,10 @@ export class ChatGptWireShadowSession {
       ? observation.answer
       : undefined;
     if (rescuedAnswer !== undefined) domRescues += 1;
+    // Only when the turn failed: on a successful turn a stream-level error is a fact worth
+    // comparing, not a message to show anyone.
+    const serverError = dom.failed ? observation?.error : undefined;
+    if (serverError !== undefined) serverStatements += 1;
     const transcriptPath = stream && observation && wireTranscriptsEnabled()
       ? writeWireTranscript(this.transcriptRoot, buildWireTranscript(this.traceId, stream, observation, new Date(), dom))
       : undefined;
@@ -345,6 +364,7 @@ export class ChatGptWireShadowSession {
       ...(observation ? { observation } : {}),
       ...(transcriptPath ? { transcriptPath } : {}),
       ...(rescuedAnswer === undefined ? {} : { rescuedAnswer }),
+      ...(serverError === undefined ? {} : { serverError }),
     };
   }
 }

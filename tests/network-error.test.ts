@@ -3,6 +3,7 @@ import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-erro
 import {
   chatGptNetworkError,
   chromiumNetworkErrorCode,
+  withChatGptServerStatement,
   withoutCallLog,
   withoutPlaywrightCallLog,
 } from "../src/adapters/chatgpt-web/network-error";
@@ -90,4 +91,41 @@ test("an error without a call log is returned untouched", () => {
   expect(withoutPlaywrightCallLog(error)).toBe(error);
   expect(error.message).toBe("something else failed");
   expect(withoutPlaywrightCallLog("not an error")).toBe("not an error");
+});
+
+test("what ChatGPT said leads the message, and the page's reading is kept behind it", () => {
+  // A real failure: an upstream capacity limit that the page path read as an expired login. Leading
+  // with the inference sends the reader to log in again for nothing; dropping it would hide that
+  // the two readings disagreed, and it is what the retry classification was decided on.
+  const error = new Error("ChatGPT web login is expired or the Temporary Chat surface is unavailable");
+  const reported = withChatGptServerStatement(error, "Selected model is at capacity.");
+  expect(reported).toBe(error);
+  expect(reported.message).toStartWith("ChatGPT reported: Selected model is at capacity.");
+  expect(reported.message).toContain("ChatGPT web login is expired");
+});
+
+test("a failure the page already reported correctly is not restated", () => {
+  const error = new Error("ChatGPT ended the turn: Selected model is at capacity.");
+  expect(withChatGptServerStatement(error, "Selected model is at capacity.").message)
+    .toBe("ChatGPT ended the turn: Selected model is at capacity.");
+});
+
+test("a turn that failed with nothing on the stream keeps the reading it has", () => {
+  const error = new Error("ChatGPT stopped responding after the task started");
+  expect(withChatGptServerStatement(error, undefined).message)
+    .toBe("ChatGPT stopped responding after the task started");
+  expect(withChatGptServerStatement(error, "   ").message)
+    .toBe("ChatGPT stopped responding after the task started");
+  expect(withChatGptServerStatement("not an error", "something")).toBe("not an error");
+});
+
+test("the statement survives an error whose message cannot be assigned", () => {
+  // Abort reasons and the compaction handoff are decided by `instanceof`, so the error object has
+  // to be the same one; `DOMException.message` is a prototype getter and assignment to it throws.
+  const abort = new DOMException("waiting failed\nCall log:\n  - waiting", "AbortError");
+  const reported = withChatGptServerStatement(abort, "Something went wrong.");
+  expect(reported).toBe(abort);
+  expect(reported).toBeInstanceOf(DOMException);
+  expect(reported.name).toBe("AbortError");
+  expect(reported.message).toBe("ChatGPT reported: Something went wrong. (the page was read as: waiting failed)");
 });

@@ -113,6 +113,31 @@ test("a turn the page read as empty is answered from the observed stream", async
   expect(chatGptWireTelemetrySnapshot().dom_rescues).toBe(1);
 });
 
+test("a failed turn carries what ChatGPT said, so the page's guess is not the only account", async () => {
+  // The page can see that the surface is unusable but not why. One real failure was an upstream
+  // capacity limit read as an expired login.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  emitStream(emit, `data: ${JSON.stringify({ error: { message: "Selected model is at capacity." } })}\n\n`);
+
+  const result = session.conclude({ answer: "", failed: true });
+  expect(result.serverError).toBe("Selected model is at capacity.");
+  expect(chatGptWireTelemetrySnapshot().server_statements).toBe(1);
+});
+
+test("a turn that succeeded does not report a stream error as its outcome", async () => {
+  // On a successful turn a stream-level error is a fact worth comparing, not a message to show.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  emitStream(emit, answerStream("the answer"), 500);
+
+  const result = session.conclude({ answer: "the answer", failed: false });
+  expect(result.serverError).toBeUndefined();
+  expect(chatGptWireTelemetrySnapshot().server_statements).toBe(0);
+});
+
 test("a turn the page did read is never answered from the observation", async () => {
   // The rescue may only add an answer where there was none. Anything else would let the observer
   // change turns that already work, which is exactly what shadow mode exists to avoid.
