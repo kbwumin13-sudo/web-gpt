@@ -1,3 +1,4 @@
+import { recordChatGptContextRetrieval } from "./context-telemetry";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
@@ -1060,6 +1061,9 @@ export class TurnBroker implements TurnBrokerOwner {
       console.info(
         `[chatgpt-web] broker trace=${channel.traceId} context_${request.contextAction ?? "invalid"}`,
       );
+      if (request.contextAction === "search" || request.contextAction === "read") {
+        recordChatGptContextRetrieval(channel.traceId, request.contextAction);
+      }
       if (request.contextAction === "search") return contextSearch(channel.context, arguments_);
       if (request.contextAction === "read") return contextRead(channel.context, arguments_);
       throw new Error("Codex context retrieval action is invalid");

@@ -4,6 +4,7 @@ import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker
 import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retained-telemetry";
 import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow-observer";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
+import { chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import {
@@ -868,6 +869,9 @@ export function startServer(
           }),
           retained_conversation: chatGptRetainedTelemetrySnapshot(),
           memory_retrieval: memoryRetrievalSnapshot(),
+          // The compact bootstrap leaves earlier records to retrieval. These say how often that
+          // was bet on and how often the bet was actually collected.
+          context_retrieval: chatGptContextTelemetrySnapshot(),
           // Shadow observation of ChatGPT's own transport, running alongside the DOM reading that
           // still decides every turn. `comparisons` says how often the two agree; the unrecognized
           // and unapplied counts say whether this build still understands the stream.

@@ -84,6 +84,7 @@ import {
 } from "./adapter-error";
 import { isChatGptRetainedTurnRetryCandidate } from "./recovery-policy";
 import { chatGptNetworkError, withChatGptServerStatement, withoutPlaywrightCallLog } from "./network-error";
+import { chatGptContextLog, recordChatGptContextOmitted } from "./context-telemetry";
 import { ChatGptWireShadowSession, chatGptWireShadowLog, type ChatGptWireShadowResult } from "./wire/shadow-observer";
 import {
   ChatGptLunaCheckpointStream,
@@ -4646,8 +4647,11 @@ export class ChatGptBrowserWorker {
         && this.config.browserHostDescriptorPath !== undefined;
       await diagnostics.capture(page, "browser-page-acquired");
       console.info(
-        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
+        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0}, omittedRecords=${prepared.omittedRecords ?? 0})`,
       );
+      // The compact packet is a bet that the model reads what it was not sent. Recording the size
+      // of the bet here is what lets `omitted_without_retrieval` say whether it is paying off.
+      recordChatGptContextOmitted(turn.traceId, prepared.omittedRecords ?? 0);
       if (multipartStages) {
         console.info(
           `[chatgpt-web] browser turn ${turn.traceId} multipart staging effort=${stagingMode.effort}`
@@ -5368,6 +5372,8 @@ export class ChatGptBrowserWorker {
         `[chatgpt-web] browser turn ${turn.traceId} completed`
         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
       );
+      const contextLine = chatGptContextLog(turn.traceId);
+      if (contextLine) console.info(contextLine);
       return concludeWireShadow(finalText, false).rescuedAnswer ?? finalText;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError"
