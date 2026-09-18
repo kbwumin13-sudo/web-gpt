@@ -18,11 +18,16 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     <div data-testid="prompt-textarea" id="composer-testid"></div>
     <div id="prompt-textarea"></div>
     <div contenteditable="true" data-lexical-editor="true" id="composer-lexical"></div>
+    <textarea class="wcDTda_fallbackTextarea" id="composer-fallback"></textarea>
     <button aria-haspopup="menu" data-tone="neutral" id="effort"></button>
     <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="model"></button>
   </form></body>`);
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
-  expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical"]);
+  // ChatGPT degrades to a plain textarea when its rich editor does not load. Measured live on
+  // 2026-09-18, that element carried no id, no data-testid, no role and no lexical marker, so every
+  // selector above missed it and every turn failed at preparation reporting an expired login. The
+  // search field stays excluded: the match is on the composer's own class, not on being a textarea.
+  expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical", "composer-fallback"]);
   expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model"]);
 });
 
