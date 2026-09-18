@@ -5,6 +5,7 @@ import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retaine
 import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow-observer";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
 import { chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
+import { chatGptCompactionTelemetrySnapshot } from "./adapters/chatgpt-web/compaction-telemetry";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import {
@@ -872,6 +873,9 @@ export function startServer(
           // The compact bootstrap leaves earlier records to retrieval. These say how often that
           // was bet on and how often the bet was actually collected.
           context_retrieval: chatGptContextTelemetrySnapshot(),
+          // A compaction that summarised correctly and reached nobody used to look exactly like one
+          // that worked. `abandoned` is that case.
+          compaction: chatGptCompactionTelemetrySnapshot(),
           // Shadow observation of ChatGPT's own transport, running alongside the DOM reading that
           // still decides every turn. `comparisons` says how often the two agree; the unrecognized
           // and unapplied counts say whether this build still understands the stream.

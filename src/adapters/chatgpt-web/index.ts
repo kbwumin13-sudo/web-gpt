@@ -1,3 +1,8 @@
+import {
+  recordChatGptCompactionFreshReason,
+  recordChatGptCompactionSettled,
+  recordChatGptCompactionStarted,
+} from "./compaction-telemetry";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
@@ -1010,6 +1015,9 @@ export function createChatGptWebAdapter(
             const compactionNativeIdentity = extractChatGptTurnIdentity(parsed);
             let sharedSummary = existingStructuredCompactionRun(compactionExecutionKey);
             if (!sharedSummary) {
+              // A round is expensive and shared. Recording when it starts is what lets a summary
+              // that reached nobody be told apart from one that was never produced.
+              recordChatGptCompactionStarted(compactionExecutionKey, "retained");
               sharedSummary = runStructuredCompactionOnce(
                 compactionExecutionKey,
                 {
@@ -1066,6 +1074,8 @@ export function createChatGptWebAdapter(
                   const sourceConversationKey = chatGptConversationKey(parsed, executionNamespace);
                   const runFreshCompactionFallback = async (reason: string): Promise<string> => {
                     console.warn(`[chatgpt-web] retained compaction fallback=${reason}`);
+                    recordChatGptCompactionFreshReason(reason);
+                    recordChatGptCompactionStarted(compactionExecutionKey, "fresh");
                     // Pro repeatedly stops without a checkpoint on large, read-only summarization
                     // prompts even though the same account completes High turns. Keep Pro for the
                     // user's task, but run this isolated fresh checkpoint pass at High so automatic
@@ -1273,11 +1283,17 @@ export function createChatGptWebAdapter(
                 && error instanceof DOMException
                 && error.name === "AbortError") {
                 // The observer detached; the shared exact compaction round continues and remains
-                // available to a canonical reconnect without a second browser submission.
+                // available to a canonical reconnect without a second browser submission. That is
+                // not a failure, but rethrowing in silence made a round that summarised correctly
+                // and reached nobody indistinguishable from one that worked.
+                const line = recordChatGptCompactionSettled(compactionExecutionKey, "abandoned", 0);
+                console.warn(line ?? "[chatgpt-web] compaction abandoned by its caller");
                 throw error;
               }
               const handoffError = error instanceof Error ? error : new Error(String(error));
               console.error("[chatgpt-web] structured context handoff failed:", handoffError);
+              const failedLine = recordChatGptCompactionSettled(compactionExecutionKey, "failed", 0);
+              if (failedLine) console.warn(failedLine);
               emit({
                 type: "error",
                 message: "ChatGPT did not complete the context handoff. Retry the task.",
@@ -1288,6 +1304,8 @@ export function createChatGptWebAdapter(
               });
               return;
             }
+            const deliveredLine = recordChatGptCompactionSettled(compactionExecutionKey, "delivered", summary.length);
+            if (deliveredLine) console.info(deliveredLine);
             emit({ type: "text_delta", text: summary, phase: "final_answer" });
             emitBrowserCompletion(
               { type: "final", answer: summary },

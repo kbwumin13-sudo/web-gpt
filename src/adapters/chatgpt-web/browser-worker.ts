@@ -5384,9 +5384,25 @@ export class ChatGptBrowserWorker {
         }
         throw turn.abortSignal.reason;
       }
+      // An aborted turn says only that something cancelled it; who did, and why, is in the abort
+      // reason. Without it the log read `failed: ChatGPT web turn aborted`, which sent the reader
+      // looking for a defect in the bridge after a compaction whose caller had simply stopped
+      // waiting. The reason is reported rather than inferred: a deadline, a user cancellation and
+      // a caller that detached all abort the same signal, and guessing between them is how a log
+      // line becomes confidently wrong.
+      const abortReason = error instanceof DOMException
+        && error.name === "AbortError"
+        && turn.abortSignal?.aborted === true
+        ? turn.abortSignal.reason
+        : undefined;
+      const abortDetail = abortReason === undefined
+        ? ""
+        : ` (aborted by: ${redactChatGptUiDiagnostic(
+          abortReason instanceof Error ? `${abortReason.name}: ${abortReason.message}` : String(abortReason),
+        )})`;
       console.error(
         `[chatgpt-web] browser turn ${turn.traceId} failed:`
-        + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}`,
+        + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}${abortDetail}`,
       );
       if (diagnosticPage && !diagnosticPage.isClosed()) {
         await diagnostics.capture(diagnosticPage, "turn-failed", error);
