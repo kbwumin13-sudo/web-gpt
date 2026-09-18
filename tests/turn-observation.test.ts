@@ -69,6 +69,70 @@ test("the shape of a real turn folds into its answer", () => {
   expect(observation.unappliedDeltas).toBe(0);
 });
 
+/** The completion patch ChatGPT sends for a message that is *not* the end of the turn. */
+const finishWithoutEndingTurn = () => ({
+  p: "",
+  o: "patch",
+  v: [
+    { p: "/message/status", o: "replace", v: "finished_successfully" },
+    { p: "/message/end_turn", o: "replace", v: false },
+  ],
+});
+
+test("progress narration before a tool call is not part of the answer", () => {
+  // A turn that calls tools speaks more than once: ChatGPT announces what it is about to do, calls
+  // the tool, and answers at the end. Joining everything the model addressed to the user overstated
+  // the answer by exactly that narration — on one recorded turn, 2738 chars against the 1967 the
+  // page showed — and the overstatement grew with the number of tool calls.
+  const observation = observe(
+    addMessage({ id: "n1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "I'll check the repository first."),
+    finishWithoutEndingTurn(),
+    addMessage({ id: "call1", author: { role: "assistant" }, recipient: "functions.exec", content: { content_type: "text", parts: [""] } }),
+    append(0, "ls"),
+    finishWithoutEndingTurn(),
+    addMessage({ id: "a1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "There are 97 files."),
+    finish(),
+    "[DONE]",
+  );
+  expect(observation.answer).toBe("There are 97 files.");
+  expect(observation.answer).not.toContain("I'll check");
+  expect(observation.endedTurn).toBeTrue();
+  expect(observation.toolCallCount).toBe(1);
+  expect(observation.unappliedDeltas).toBe(0);
+});
+
+test("the flag decides the answer, not the position", () => {
+  // Recorded streams patch `end_turn` once per message. On the turn measured above it was patched
+  // 40 times: 39 false and exactly one true. Selecting the last message that carried text would
+  // agree here by accident; the server's own flag is what is being read.
+  const observation = observe(
+    addMessage({ id: "a1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "The answer."),
+    finish(),
+    addMessage({ id: "recap", author: { role: "assistant" }, recipient: "all", content: { content_type: "reasoning_recap", parts: [""] } }),
+    append(0, "Thought about it."),
+    finishWithoutEndingTurn(),
+  );
+  expect(observation.answer).toBe("The answer.");
+  expect(observation.reasoning).toBe("Thought about it.");
+});
+
+test("a stream that never ends its turn still reports what the model was saying", () => {
+  // A cut-off stream is where the fold understands least, so it must not fall back to joining every
+  // message and restoring the overstatement exactly there.
+  const observation = observe(
+    addMessage({ id: "n1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "Looking into it."),
+    finishWithoutEndingTurn(),
+    addMessage({ id: "a1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "Partial ans"),
+  );
+  expect(observation.answer).toBe("Partial ans");
+  expect(observation.endedTurn).toBeFalse();
+});
+
 test("a frame carrying only a value continues the last addressed target", () => {
   const observation = observe(
     addMessage({ id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
@@ -89,8 +153,11 @@ test("reasoning is kept apart from the answer by content type, not by position",
     addMessage({ id: "m3", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: ["answer one"] } }),
     addMessage({ id: "m4", author: { role: "assistant" }, recipient: "browser", content: { content_type: "code", parts: ["search(...)"] } }),
     addMessage({ id: "m5", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: ["answer two"] } }),
+    finish(),
   );
-  expect(observation.answer).toBe("answer one\n\nanswer two");
+  // `m3` is the narration before the second tool call, not half of the answer. This assertion used
+  // to read "answer one\n\nanswer two", which is the shape that overstated every real turn.
+  expect(observation.answer).toBe("answer two");
   expect(observation.reasoning).toBe("considering");
   expect(observation.toolCallCount).toBe(2);
 });

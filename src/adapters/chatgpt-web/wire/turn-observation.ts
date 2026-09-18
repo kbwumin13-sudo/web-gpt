@@ -64,6 +64,30 @@ function emptyMessage(): MessageState {
   return { parts: [], endTurn: false };
 }
 
+/**
+ * The answer, out of everything the model addressed to the user.
+ *
+ * A turn that calls tools speaks more than once: ChatGPT emits a short line of progress narration
+ * before each batch of calls ("I'll check X first"), and the answer only at the end. Joining all of
+ * them overstated the answer by exactly that narration — on one recorded turn, 2738 chars against
+ * the 1967 the page showed, with the four narration messages accounting for 737 of the difference.
+ * The overstatement grew with the number of tool calls, which is why short turns agreed and real
+ * ones did not.
+ *
+ * ChatGPT marks the distinction itself: in that same stream `end_turn` was patched 40 times, 39 of
+ * them `false` and exactly one `true`. That flag is the server's own statement of which message
+ * ends the turn, so it decides here rather than a heuristic about ordering or length.
+ *
+ * When no message carries the flag the stream did not reach its end, and the last thing the model
+ * was saying is the closest thing to an answer that exists. Falling back to the join would restore
+ * the overstatement precisely in the case where the fold understands the stream least.
+ */
+function answerOf(spoken: readonly MessageState[]): string {
+  const ended = spoken.filter(message => message.endTurn);
+  const chosen = ended.at(-1) ?? spoken.at(-1);
+  return chosen?.parts.join("") ?? "";
+}
+
 /** A document root carrying `{message: {...}}`, which is how a new message enters the stream. */
 function messageFromValue(value: unknown): MessageState | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -199,7 +223,7 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     if (event.frameOperation !== undefined) stickyOperation = event.frameOperation;
   }
 
-  const answer: string[] = [];
+  const spoken: MessageState[] = [];
   const reasoning: string[] = [];
   const messageIds: string[] = [];
   let toolCallCount = 0;
@@ -214,11 +238,11 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     const text = message.parts.join("");
     if (text.length === 0) continue;
     if (isReasoning(message)) reasoning.push(text);
-    else if (message.role === "assistant") answer.push(text);
+    else if (message.role === "assistant") spoken.push(message);
   }
 
   return {
-    answer: answer.join("\n\n"),
+    answer: answerOf(spoken),
     reasoning: reasoning.join("\n\n"),
     toolCallCount,
     endedTurn,

@@ -61,6 +61,14 @@ export interface WireTranscript {
     error?: string;
   };
   observation: ChatGptWireObservation;
+  /**
+   * What the DOM concluded for the same turn.
+   *
+   * Without it a disagreement is only a pair of lengths, and the two explanations for "the wire read
+   * more" — the wire counting text that is not the answer, or the DOM losing part of one — cannot be
+   * told apart. Both have been observed, so the texts have to be side by side to decide.
+   */
+  dom?: { answer: string; failed: boolean };
   /** The bytes as received, which is what a replay consumes. */
   raw: string;
 }
@@ -70,6 +78,7 @@ export function buildWireTranscript(
   stream: ChatGptWireStream,
   observation: ChatGptWireObservation,
   now = new Date(),
+  dom?: { answer: string; failed: boolean },
 ): WireTranscript {
   return {
     traceId,
@@ -86,6 +95,7 @@ export function buildWireTranscript(
       ...(stream.error === undefined ? {} : { error: stream.error }),
     },
     observation,
+    ...(dom === undefined ? {} : { dom }),
     raw: stream.raw,
   };
 }

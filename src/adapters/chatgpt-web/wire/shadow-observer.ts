@@ -259,7 +259,7 @@ export class ChatGptWireShadowSession {
     const { comparison, wireChars, domChars } = compareWireToDom(observation, dom);
     comparisons[comparison] += 1;
     const transcriptPath = stream && observation && wireTranscriptsEnabled()
-      ? writeWireTranscript(this.transcriptRoot, buildWireTranscript(this.traceId, stream, observation))
+      ? writeWireTranscript(this.transcriptRoot, buildWireTranscript(this.traceId, stream, observation, new Date(), dom))
       : undefined;
     return {
       comparison,
