@@ -128,6 +128,14 @@ async function main(): Promise<void> {
   const liveLuna = process.argv.includes("--live-luna");
   const liveWeb = process.argv.includes("--live-web");
   const liveHigh = process.argv.includes("--live-high");
+  // The default prompt answers in two characters, which never keeps a response stream open long
+  // enough to reach ChatGPT's `stream_handoff`. That path stayed uncovered until a real task hit
+  // it, so the harness has to be able to ask for a long answer.
+  const promptFlag = process.argv.indexOf("--prompt");
+  const prompt = promptFlag >= 0 ? process.argv[promptFlag + 1] : undefined;
+  if (promptFlag >= 0 && (prompt === undefined || prompt.startsWith("--"))) {
+    throw new Error("--prompt requires a value");
+  }
   const config = loadConfig();
   if (config.browserHost === "launcher") throw new Error("Installed native gateway acceptance requires managed-chrome setup");
   if (config.nativeGatewayPort === config.port) throw new Error("Native gateway and Web backend ports are not isolated");
@@ -171,7 +179,7 @@ async function main(): Promise<void> {
       if (typeof threadId !== "string") throw new Error("thread/start returned no Luna thread id");
       const turnStarted = await client.request("turn/start", {
         threadId,
-        input: [{ type: "text", text: "Reply with OK only." }],
+        input: [{ type: "text", text: prompt ?? "Reply with OK only." }],
       }) as { turn?: { id?: unknown } };
       const turnId = turnStarted.turn?.id;
       if (typeof turnId !== "string") throw new Error("turn/start returned no Luna turn id");
