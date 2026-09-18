@@ -36,6 +36,11 @@ interface MessageState {
   recipient?: string;
   contentType?: string;
   parts: string[];
+  /**
+   * Segments the model already closed with `end_turn: false`, oldest first. These are the progress
+   * narration it spoke before each tool call; `parts` holds whatever it is saying now.
+   */
+  priorSegments: string[];
   status?: string;
   endTurn: boolean;
 }
@@ -61,7 +66,7 @@ export interface ChatGptWireObservation {
 }
 
 function emptyMessage(): MessageState {
-  return { parts: [], endTurn: false };
+  return { parts: [], priorSegments: [], endTurn: false };
 }
 
 /**
@@ -77,6 +82,11 @@ function emptyMessage(): MessageState {
  * ChatGPT marks the distinction itself: in that same stream `end_turn` was patched 40 times, 39 of
  * them `false` and exactly one `true`. That flag is the server's own statement of which message
  * ends the turn, so it decides here rather than a heuristic about ordering or length.
+ *
+ * The same narration also appears *inside* one message. ChatGPT keeps appending to a single
+ * `parts[0]` across tool calls, marking each pause with `end_turn: false`, so one message can hold
+ * two lines of narration and then the answer. `applyMessageField` closes a segment on each of those
+ * pauses, which leaves `parts` holding the final one — the answer.
  *
  * When no message carries the flag the stream did not reach its end, and the last thing the model
  * was saying is the closest thing to an answer that exists. Falling back to the join would restore
@@ -109,6 +119,7 @@ function messageFromValue(value: unknown): MessageState | undefined {
     ...(typeof record.recipient === "string" ? { recipient: record.recipient } : {}),
     ...(typeof content?.content_type === "string" ? { contentType: content.content_type } : {}),
     parts,
+    priorSegments: [],
     ...(typeof record.status === "string" ? { status: record.status } : {}),
     endTurn: record.end_turn === true,
   };
@@ -122,6 +133,15 @@ function applyMessageField(message: MessageState, path: string, value: unknown):
   }
   if (path === "/message/end_turn") {
     if (value === true) message.endTurn = true;
+    // `false` closes a segment rather than a message. ChatGPT keeps appending a turn's narration
+    // and its answer to the same `parts[0]`, marking each pause with `end_turn: false` while it
+    // calls a tool, and only the text after the last pause is the answer. Closing the segment here
+    // keeps `parts` holding the current one, so the fold reads the answer without having to know
+    // where the boundaries were.
+    if (value === false && message.parts.length > 0) {
+      message.priorSegments.push(message.parts.join(""));
+      message.parts = [];
+    }
     return true;
   }
   if (path === "/message/recipient" && typeof value === "string") {
@@ -163,7 +183,12 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
       // The same message id can be re-announced; continue it rather than starting a duplicate.
       const existing = message.id ? messages.find(candidate => candidate.id === message.id) : undefined;
       if (existing) {
-        Object.assign(existing, { ...message, parts: message.parts.length > 0 ? message.parts : existing.parts });
+        Object.assign(existing, {
+          ...message,
+          parts: message.parts.length > 0 ? message.parts : existing.parts,
+          // A re-announcement restates the message, not the segments it already closed.
+          priorSegments: existing.priorSegments,
+        });
         current = existing;
         return;
       }
@@ -235,6 +260,10 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
       toolCallCount += 1;
       continue;
     }
+    // Closed segments are the progress narration the model spoke before each tool call. They are
+    // commentary rather than the answer, and Codex renders commentary separately, so they are kept
+    // there instead of being dropped.
+    if (message.role === "assistant") reasoning.push(...message.priorSegments.filter(segment => segment.length > 0));
     const text = message.parts.join("");
     if (text.length === 0) continue;
     if (isReasoning(message)) reasoning.push(text);

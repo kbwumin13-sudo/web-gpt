@@ -103,6 +103,47 @@ test("progress narration before a tool call is not part of the answer", () => {
   expect(observation.unappliedDeltas).toBe(0);
 });
 
+/** Closing a segment: the model pauses to call a tool and will keep appending to this message. */
+const pauseSegment = () => ({ p: "/message/end_turn", o: "replace", v: false });
+
+test("narration and answer appended to one message are separated by the pauses between them", () => {
+  // ChatGPT does not always open a new message to narrate. On a recorded turn it appended two lines
+  // of narration and then the answer to a single `parts[0]`, marking each pause with
+  // `end_turn: false` while it called a tool. Reading the whole part gave 685 chars against the
+  // 528 the page showed; reading the segment after the last pause gives exactly 528.
+  const observation = observe(
+    addMessage({ id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "I'll run each step separately."),
+    pauseSegment(),
+    append(0, "One call was blocked; narrowing it."),
+    pauseSegment(),
+    append(0, "Exploration complete."),
+    finish(),
+    "[DONE]",
+  );
+  expect(observation.answer).toBe("Exploration complete.");
+  expect(observation.endedTurn).toBeTrue();
+  // The narration is commentary, not the answer, and is kept where Codex renders commentary.
+  expect(observation.reasoning).toContain("I'll run each step separately.");
+  expect(observation.reasoning).toContain("One call was blocked");
+  expect(observation.unappliedDeltas).toBe(0);
+});
+
+test("a message re-announced mid-turn keeps the segments it already closed", () => {
+  // The stream re-states a message as its status changes. That restates the message, not the
+  // narration it already finished, so the segments must survive the re-announcement.
+  const observation = observe(
+    addMessage({ id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] } }),
+    append(0, "Checking."),
+    pauseSegment(),
+    addMessage({ id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: [""] }, status: "in_progress" }),
+    append(0, "Done."),
+    finish(),
+  );
+  expect(observation.answer).toBe("Done.");
+  expect(observation.reasoning).toBe("Checking.");
+});
+
 test("the flag decides the answer, not the position", () => {
   // Recorded streams patch `end_turn` once per message. On the turn measured above it was patched
   // 40 times: 39 false and exactly one true. Selecting the last message that carried text would
