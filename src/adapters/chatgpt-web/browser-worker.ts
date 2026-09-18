@@ -4415,12 +4415,21 @@ export class ChatGptBrowserWorker {
     const prepared = await prepare();
     const diagnosticsRoot = this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns");
     const diagnostics = new ChatGptBrowserDiagnostics(turn.traceId, diagnosticsRoot, this.config.appName);
-    // Runs alongside the DOM observation with no authority over it: this turn is decided exactly as
-    // before, while the same turn is watched over ChatGPT's own transport so the two can be compared.
+    // Watches the same turn over ChatGPT's own transport. It has one power over the outcome, and
+    // only in the direction of recovery: when the DOM reads no answer at all — the silent failure
+    // this layer was built to catch — a complete wire reading is returned in its place. Every turn
+    // where the DOM produced text is decided exactly as before.
     const wireShadow = new ChatGptWireShadowSession(turn.traceId, join(dirname(diagnosticsRoot), "wire-transcripts"));
-    const concludeWireShadow = (answer: string, failed: boolean): void => {
+    const concludeWireShadow = (answer: string, failed: boolean): string | undefined => {
       const result = wireShadow.conclude({ answer, failed });
       if (result.comparison !== "not_observed") console.info(chatGptWireShadowLog(turn.traceId, result));
+      if (result.rescuedAnswer !== undefined) {
+        console.info(
+          `[chatgpt-web] browser turn ${turn.traceId} answered from the observed stream`
+          + ` because the page read none (chars=${result.rescuedAnswer.length})`,
+        );
+      }
+      return result.rescuedAnswer;
     };
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
@@ -5351,8 +5360,7 @@ export class ChatGptBrowserWorker {
         `[chatgpt-web] browser turn ${turn.traceId} completed`
         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
       );
-      concludeWireShadow(finalText, false);
-      return finalText;
+      return concludeWireShadow(finalText, false) ?? finalText;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError"
         && turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted) {

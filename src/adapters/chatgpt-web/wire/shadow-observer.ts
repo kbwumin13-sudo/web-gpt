@@ -66,10 +66,29 @@ export interface ChatGptWireTelemetrySnapshot {
    * non-zero value means a turn's own stream was lost rather than never seen. Targets zero.
    */
   evicted_with_frames: number;
+  /**
+   * Turns whose two readings were character-for-character identical after whitespace folding.
+   * `agreed` only means the lengths are within 20% of each other, which was enough to hide a fold
+   * that returned a turn's progress narration along with its answer. Exactness is the measure a
+   * cutover needs; agreement is the measure that a turn was not lost.
+   */
+  exact: number;
+  /**
+   * Turns the DOM read as empty where the wire held a complete answer and the observation was
+   * used instead. This is the failure the whole layer exists to catch, so it is counted rather
+   * than only logged.
+   */
+  dom_rescues: number;
 }
 
 const MAX_TRACKED_SHAPES = 32;
 const MAX_TRACKED_PATHS = 48;
+/**
+ * Traces whose latest outcome is remembered so a retried turn counts once. A turn can make several
+ * browser attempts, each concluding separately; counting all of them made the failing attempts of
+ * one turn look like several disagreeing turns, and the share is the number a cutover is judged on.
+ */
+const MAX_TRACKED_TRACES = 256;
 
 let turnsObserved = 0;
 let streamsObserved = 0;
@@ -78,6 +97,9 @@ let unappliedDeltas = 0;
 let attachFailures = 0;
 let rejectedRecords = 0;
 let evictedWithFrames = 0;
+let exactMatches = 0;
+let domRescues = 0;
+const lastComparisonByTrace = new Map<string, ChatGptWireComparison>();
 const unrecognizedShapes = new Set<string>();
 const observedPaths = new Set<string>();
 const streamingPaths = new Set<string>();
@@ -105,7 +127,28 @@ export function chatGptWireTelemetrySnapshot(): ChatGptWireTelemetrySnapshot {
     streaming_paths: [...streamingPaths].sort(),
     control_types: [...controlTypes].sort(),
     evicted_with_frames: evictedWithFrames,
+    exact: exactMatches,
+    dom_rescues: domRescues,
   };
+}
+
+/**
+ * Record a turn's outcome, replacing whatever that trace last reported.
+ *
+ * A retried turn concludes once per browser attempt. Counting each attempt turned one turn that
+ * eventually succeeded into two failures and a success, which is not what the share of agreeing
+ * turns is meant to say.
+ */
+function recordComparison(traceId: string, comparison: ChatGptWireComparison): void {
+  const previous = lastComparisonByTrace.get(traceId);
+  if (previous !== undefined) comparisons[previous] -= 1;
+  comparisons[comparison] += 1;
+  lastComparisonByTrace.set(traceId, comparison);
+  // Forgetting the oldest trace only stops it from being corrected later; its count stays.
+  if (lastComparisonByTrace.size > MAX_TRACKED_TRACES) {
+    const oldest = lastComparisonByTrace.keys().next();
+    if (!oldest.done) lastComparisonByTrace.delete(oldest.value);
+  }
 }
 
 /** Test seam. Process-wide totals are cumulative for the life of a daemon. */
@@ -117,6 +160,9 @@ export function resetChatGptWireTelemetry(): void {
   attachFailures = 0;
   rejectedRecords = 0;
   evictedWithFrames = 0;
+  exactMatches = 0;
+  domRescues = 0;
+  lastComparisonByTrace.clear();
   unrecognizedShapes.clear();
   observedPaths.clear();
   streamingPaths.clear();
@@ -164,6 +210,30 @@ export interface ChatGptWireShadowResult {
   domChars: number;
   observation?: ChatGptWireObservation;
   transcriptPath?: string;
+  /**
+   * The answer to return in place of the DOM's, when the DOM found none and the wire observed a
+   * complete one. Absent in every other case, including every case where the DOM produced text —
+   * so this can rescue a turn that already failed and cannot change one that worked.
+   */
+  rescuedAnswer?: string;
+}
+
+/**
+ * Whether this observation is complete enough to stand in for a DOM reading that found nothing.
+ *
+ * A turn that produced no answer is already a failure, so the only question is whether the wire's
+ * reading is trustworthy on its own. It is required to be a finished stream — the server marked a
+ * message as ending the turn *and* the stream reached its terminal sentinel — with nothing the fold
+ * failed to understand. A partial read substituted here would turn a visible failure into a
+ * plausible wrong answer, which is worse than the failure.
+ */
+function completeEnoughToRescue(wire: ChatGptWireObservation): boolean {
+  return wire.error === undefined
+    && wire.endedTurn
+    && wire.sawDone
+    && wire.counts.unrecognized === 0
+    && wire.unappliedDeltas === 0
+    && wire.answer.trim().length > 0;
 }
 
 /**
@@ -225,14 +295,14 @@ export class ChatGptWireShadowSession {
       return this.concludeOrThrow(dom);
     } catch {
       // Shadow observation has no authority over a turn, so it must not be able to end one either.
-      comparisons.not_observed += 1;
+      recordComparison(this.traceId, "not_observed");
       return { comparison: "not_observed", wireChars: 0, domChars: dom.answer.length };
     }
   }
 
   private concludeOrThrow(dom: { answer: string; failed: boolean }): ChatGptWireShadowResult {
     if (!this.attached) {
-      comparisons.not_observed += 1;
+      recordComparison(this.traceId, "not_observed");
       return { comparison: "not_observed", wireChars: 0, domChars: dom.answer.length };
     }
     const counts = this.rejected?.();
@@ -257,7 +327,14 @@ export class ChatGptWireShadowSession {
       }
     }
     const { comparison, wireChars, domChars } = compareWireToDom(observation, dom);
-    comparisons[comparison] += 1;
+    recordComparison(this.traceId, comparison);
+    if (observation && normalize(observation.answer) === normalize(dom.answer)) exactMatches += 1;
+    // The DOM read nothing where the wire read a finished answer. That is the silent failure this
+    // layer was built to catch, and catching it is worth more than watching it.
+    const rescuedAnswer = comparison === "dom_empty" && observation && completeEnoughToRescue(observation)
+      ? observation.answer
+      : undefined;
+    if (rescuedAnswer !== undefined) domRescues += 1;
     const transcriptPath = stream && observation && wireTranscriptsEnabled()
       ? writeWireTranscript(this.transcriptRoot, buildWireTranscript(this.traceId, stream, observation, new Date(), dom))
       : undefined;
@@ -267,6 +344,7 @@ export class ChatGptWireShadowSession {
       domChars,
       ...(observation ? { observation } : {}),
       ...(transcriptPath ? { transcriptPath } : {}),
+      ...(rescuedAnswer === undefined ? {} : { rescuedAnswer }),
     };
   }
 }

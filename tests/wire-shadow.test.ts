@@ -98,6 +98,91 @@ test("a DOM that saw nothing while the wire carried a reply is its own outcome",
   expect(compareWireToDom(wire, { answer: "", failed: false }).comparison).toBe("dom_empty");
 });
 
+test("a turn the page read as empty is answered from the observed stream", async () => {
+  // The silent failure this layer was built to catch. Watching it and then handing the user an
+  // empty turn anyway is worth less than recovering it, and the DOM already produced nothing, so
+  // there is no working behaviour to put at risk.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  emitStream(emit, answerStream("the answer the page missed"));
+
+  const result = session.conclude({ answer: "", failed: false });
+  expect(result.comparison).toBe("dom_empty");
+  expect(result.rescuedAnswer).toBe("the answer the page missed");
+  expect(chatGptWireTelemetrySnapshot().dom_rescues).toBe(1);
+});
+
+test("a turn the page did read is never answered from the observation", async () => {
+  // The rescue may only add an answer where there was none. Anything else would let the observer
+  // change turns that already work, which is exactly what shadow mode exists to avoid.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  emitStream(emit, answerStream("a".repeat(100)));
+
+  const result = session.conclude({ answer: "a".repeat(10), failed: false });
+  expect(result.comparison).toBe("length_mismatch");
+  expect(result.rescuedAnswer).toBeUndefined();
+  expect(chatGptWireTelemetrySnapshot().dom_rescues).toBe(0);
+});
+
+test("an unfinished observation does not stand in for a missing answer", async () => {
+  // A partial read substituted here turns a visible failure into a plausible wrong answer, which
+  // is worse than the failure. The stream has to have ended the turn and reached its sentinel.
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  await session.attach(page);
+  const truncated = `data: ${JSON.stringify({
+    p: "",
+    o: "add",
+    v: { message: { id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: ["half an ans"] } } },
+  })}\n\n`;
+  emitStream(emit, truncated);
+
+  const result = session.conclude({ answer: "", failed: false });
+  expect(result.comparison).toBe("dom_empty");
+  expect(result.rescuedAnswer).toBeUndefined();
+  expect(chatGptWireTelemetrySnapshot().dom_rescues).toBe(0);
+});
+
+test("a retried turn counts once, because the share of agreeing turns is what a cutover is judged on", async () => {
+  // One turn can make several browser attempts, each concluding separately. Counting all of them
+  // turned a turn that eventually succeeded into two failures and a success.
+  const { page, emit } = fakePage();
+  const root = temporaryDirectory();
+  const failed = new ChatGptWireShadowSession("trace_1", root);
+  await failed.attach(page);
+  emitStream(emit, answerStream("attempt one"));
+  expect(failed.conclude({ answer: "", failed: true }).comparison).toBe("error_mismatch");
+
+  const succeeded = new ChatGptWireShadowSession("trace_1", root);
+  await succeeded.attach(page);
+  emitStream(emit, answerStream("attempt two"));
+  expect(succeeded.conclude({ answer: "attempt two", failed: false }).comparison).toBe("agreed");
+
+  const snapshot = chatGptWireTelemetrySnapshot();
+  expect(snapshot.comparisons.agreed).toBe(1);
+  expect(snapshot.comparisons.error_mismatch).toBe(0);
+});
+
+test("exact agreement is counted apart from agreement, because the tolerance hid a real defect", async () => {
+  const { page, emit } = fakePage();
+  const root = temporaryDirectory();
+  const exact = new ChatGptWireShadowSession("trace_1", root);
+  await exact.attach(page);
+  emitStream(emit, answerStream("identical text"));
+  expect(exact.conclude({ answer: "identical text", failed: false }).comparison).toBe("agreed");
+  expect(chatGptWireTelemetrySnapshot().exact).toBe(1);
+
+  const close = new ChatGptWireShadowSession("trace_2", root);
+  await close.attach(page);
+  emitStream(emit, answerStream("a".repeat(100)));
+  // Within the 20% tolerance, so still `agreed` — and not exact.
+  expect(close.conclude({ answer: "a".repeat(90), failed: false }).comparison).toBe("agreed");
+  expect(chatGptWireTelemetrySnapshot()).toMatchObject({ exact: 1, comparisons: { agreed: 2 } });
+});
+
 test("a wire that saw nothing the DOM did find says this observer is still incomplete", () => {
   const wire = observeWireStream(streamOf("data: [DONE]\n\n"));
   expect(compareWireToDom(wire, { answer: "the DOM found this", failed: false }).comparison).toBe("wire_empty");
