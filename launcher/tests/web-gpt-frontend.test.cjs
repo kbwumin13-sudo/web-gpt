@@ -8,9 +8,17 @@ const read = (...parts) => fs.readFileSync(path.join(launcherRoot, ...parts), "u
 
 test("macOS renderer selects the independent Web GPT entry while the legacy renderer remains available", () => {
   const main = read("src", "main.tsx");
+  const config = read("vite.config.ts");
   const manifest = JSON.parse(read("package.json"));
-  assert.match(main, /VITE_LAUNCHER_FRONTEND === "web-gpt"/);
-  assert.match(main, /import\("\.\/web-gpt\/App"\)/);
+  // The entry is resolved while bundling. Choosing it at runtime put both renderers in the module
+  // graph, so a Web GPT build emitted the legacy one and every asset it referenced — 2.1 MB of
+  // screen recordings among them, inside an app with no way to load them.
+  assert.match(main, /from "#launcher-frontend"/);
+  assert.doesNotMatch(main, /import\("\.\/App"\)/);
+  assert.match(config, /VITE_LAUNCHER_FRONTEND === "web-gpt"/);
+  assert.match(config, /"#launcher-frontend":/);
+  assert.match(config, /\.\/src\/web-gpt\/App\.tsx/);
+  assert.match(config, /\.\/src\/App\.tsx/);
   assert.equal(manifest.scripts["build:renderer:mac"], "VITE_LAUNCHER_FRONTEND=web-gpt vite build");
   assert.equal(manifest.scripts["build:renderer"], "vite build");
 });

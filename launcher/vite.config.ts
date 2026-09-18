@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -27,10 +28,27 @@ function recordRendererVariant() {
   };
 }
 
+/**
+ * The renderer entry this build contains.
+ *
+ * Choosing between the two with a runtime conditional left both in the module graph, so a Web GPT
+ * build emitted the legacy renderer and its assets as well — including 2.1 MB of screen recordings
+ * that the shipped app has no way to load. Resolving the choice here means the other entry is never
+ * part of the build.
+ */
+const frontendEntry = process.env.VITE_LAUNCHER_FRONTEND === "web-gpt"
+  ? "./src/web-gpt/App.tsx"
+  : "./src/App.tsx";
+
 export default defineConfig({
   plugins: [react(), recordRendererVariant()],
   root: ".",
   base: "./",
+  resolve: {
+    alias: {
+      "#launcher-frontend": fileURLToPath(new URL(frontendEntry, import.meta.url)),
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
