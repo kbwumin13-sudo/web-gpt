@@ -69,6 +69,15 @@ export interface WireTranscript {
    * told apart. Both have been observed, so the texts have to be side by side to decide.
    */
   dom?: { answer: string; failed: boolean };
+  /**
+   * Every other stream that carried frames during the same turn.
+   *
+   * Recorded only when the chosen stream handed the turn off somewhere else. ChatGPT ends that
+   * stream after a `stream_handoff` envelope naming a `resume_sse_endpoint` and a
+   * `subscribe_ws_topic`, and the answer continues on whichever the page took. Which one, and in
+   * what shape, is not something to guess at a third time — so the candidates are captured whole.
+   */
+  companions?: { url: string; framing: "sse" | "message"; frames: number; raw: string }[];
   /** The bytes as received, which is what a replay consumes. */
   raw: string;
 }
@@ -79,6 +88,7 @@ export function buildWireTranscript(
   observation: ChatGptWireObservation,
   now = new Date(),
   dom?: { answer: string; failed: boolean },
+  companions?: readonly ChatGptWireStream[],
 ): WireTranscript {
   return {
     traceId,
@@ -96,6 +106,14 @@ export function buildWireTranscript(
     },
     observation,
     ...(dom === undefined ? {} : { dom }),
+    ...(companions === undefined || companions.length === 0 ? {} : {
+      companions: companions.map(candidate => ({
+        url: candidate.url,
+        framing: candidate.framing,
+        frames: candidate.frames.length,
+        raw: candidate.raw,
+      })),
+    }),
     raw: stream.raw,
   };
 }

@@ -138,6 +138,53 @@ test("a turn that succeeded does not report a stream error as its outcome", asyn
   expect(chatGptWireTelemetrySnapshot().server_statements).toBe(0);
 });
 
+test("a turn that handed its stream off records the streams it could have continued on", async () => {
+  // ChatGPT ends the conversation stream after a `stream_handoff` envelope naming a
+  // `resume_sse_endpoint` and a `subscribe_ws_topic`; the answer continues on whichever the page
+  // took. Following it is a matter of reading those bytes, and guessing at their shape has already
+  // been wrong twice, so the candidates are captured whole.
+  process.env[WIRE_TRANSCRIPT_ENV] = "1";
+  const root = join(temporaryDirectory(), "wire-transcripts");
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root);
+  await session.attach(page);
+  // The socket the page already holds open, then the conversation request that hands off to it.
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ topic: "t1" }), at: 2 });
+  emitStream(emit, [
+    JSON.stringify({ type: "stream_handoff", conversation_id: "c1", options: [{ type: "resume_sse_endpoint" }] }),
+    "[DONE]",
+  ].map(payload => `data: ${payload}\n\n`).join(""));
+
+  const result = session.conclude({ answer: "the page read it anyway", failed: false });
+  expect(result.comparison).toBe("wire_empty");
+  expect(chatGptWireTelemetrySnapshot().handoffs_observed).toBe(1);
+
+  const transcript = JSON.parse(readFileSync(result.transcriptPath!, "utf8")) as {
+    companions?: { url: string; framing: string; frames: number; raw: string }[];
+  };
+  expect(transcript.companions).toHaveLength(1);
+  expect(transcript.companions![0]!.url).toContain("/p4/ws/user/");
+  expect(transcript.companions![0]!.framing).toBe("message");
+  expect(transcript.companions![0]!.raw).toContain("t1");
+});
+
+test("a turn that was never handed off records no companion streams", async () => {
+  process.env[WIRE_TRANSCRIPT_ENV] = "1";
+  const root = join(temporaryDirectory(), "wire-transcripts");
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root);
+  await session.attach(page);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  emit({ kind: "chunk", id: "ws", text: "{}", at: 2 });
+  emitStream(emit, answerStream("the answer"));
+
+  const result = session.conclude({ answer: "the answer", failed: false });
+  const transcript = JSON.parse(readFileSync(result.transcriptPath!, "utf8")) as { companions?: unknown };
+  expect(transcript.companions).toBeUndefined();
+  expect(chatGptWireTelemetrySnapshot().handoffs_observed).toBe(0);
+});
+
 test("a turn the page did read is never answered from the observation", async () => {
   // The rescue may only add an answer where there was none. Anything else would let the observer
   // change turns that already work, which is exactly what shadow mode exists to avoid.

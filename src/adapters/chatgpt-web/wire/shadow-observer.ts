@@ -19,6 +19,8 @@ import { attachChatGptWireTap } from "./wire-tap-host";
 
 /** Normalised lengths closer than this ratio count as agreement; the two paths format Markdown differently. */
 const LENGTH_AGREEMENT_RATIO = 0.8;
+/** The envelope ChatGPT sends when a turn's answer continues on a different stream. */
+const STREAM_HANDOFF = "stream_handoff";
 
 export type ChatGptWireComparison =
   | "agreed"
@@ -83,6 +85,13 @@ export interface ChatGptWireTelemetrySnapshot {
    * Failed turns reported with ChatGPT's own words instead of an inference drawn from the page.
    */
   server_statements: number;
+  /**
+   * Turns whose conversation stream ended in a `stream_handoff` envelope. ChatGPT closes that
+   * stream after naming a `resume_sse_endpoint` and a `subscribe_ws_topic`, and the answer
+   * continues on whichever the page took — which this build does not yet follow, so these turns
+   * are observed as empty. The count is how often that costs an observation.
+   */
+  handoffs_observed: number;
 }
 
 const MAX_TRACKED_SHAPES = 32;
@@ -104,6 +113,7 @@ let evictedWithFrames = 0;
 let exactMatches = 0;
 let domRescues = 0;
 let serverStatements = 0;
+let handoffsObserved = 0;
 const lastComparisonByTrace = new Map<string, ChatGptWireComparison>();
 const unrecognizedShapes = new Set<string>();
 const observedPaths = new Set<string>();
@@ -135,6 +145,7 @@ export function chatGptWireTelemetrySnapshot(): ChatGptWireTelemetrySnapshot {
     exact: exactMatches,
     dom_rescues: domRescues,
     server_statements: serverStatements,
+    handoffs_observed: handoffsObserved,
   };
 }
 
@@ -169,6 +180,7 @@ export function resetChatGptWireTelemetry(): void {
   exactMatches = 0;
   domRescues = 0;
   serverStatements = 0;
+  handoffsObserved = 0;
   lastComparisonByTrace.clear();
   unrecognizedShapes.clear();
   observedPaths.clear();
@@ -354,8 +366,19 @@ export class ChatGptWireShadowSession {
     // comparing, not a message to show anyone.
     const serverError = dom.failed ? observation?.error : undefined;
     if (serverError !== undefined) serverStatements += 1;
+    // The stream named somewhere else to continue on. Recording the other streams that carried
+    // frames is what makes following it later a matter of reading rather than guessing.
+    const handedOff = observation?.counts.controlTypes.includes(STREAM_HANDOFF) === true;
+    if (handedOff) handoffsObserved += 1;
+    // By id, not identity: `snapshot()` rebuilds its entries on every call.
+    const companions = handedOff
+      ? this.collector.snapshot().filter(candidate => candidate.id !== stream?.id && candidate.frames.length > 0)
+      : undefined;
     const transcriptPath = stream && observation && wireTranscriptsEnabled()
-      ? writeWireTranscript(this.transcriptRoot, buildWireTranscript(this.traceId, stream, observation, new Date(), dom))
+      ? writeWireTranscript(
+        this.transcriptRoot,
+        buildWireTranscript(this.traceId, stream, observation, new Date(), dom, companions),
+      )
       : undefined;
     return {
       comparison,
@@ -377,6 +400,7 @@ export function chatGptWireShadowLog(traceId: string, result: ChatGptWireShadowR
     `wireChars=${result.wireChars}`,
     `domChars=${result.domChars}`,
   ];
+  if (result.observation?.counts.controlTypes.includes(STREAM_HANDOFF)) parts.push("handedOff=true");
   if (result.observation) {
     parts.push(
       `frames=${result.observation.counts.total}`,
