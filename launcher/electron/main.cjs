@@ -25,7 +25,7 @@ const {
   registerLoggedIpc,
 } = require("./logging.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
-const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
+const { ensurePackagedRuntime, installedBuildProvenance, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
@@ -500,6 +500,23 @@ async function loadRenderer(window) {
     return;
   }
   await window.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+}
+
+/**
+ * Which renderer this build contains. The two entries differ only by an environment variable, and
+ * packaging through the wrong script produces an app that launches, works, and quietly shows the
+ * previous renderer. Reporting it turns that into a fact in the log rather than something noticed
+ * by looking at the window.
+ */
+function rendererVariant() {
+  if (isDev) return "dev-server";
+  try {
+    const recorded = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "dist", "renderer-variant.json"), "utf8"));
+    return typeof recorded?.variant === "string" ? recorded.variant : "unknown";
+  } catch {
+    // A build predating this record, or an unreadable one.
+    return "unknown";
+  }
 }
 
 function validateLanguage(value) {
@@ -1158,6 +1175,15 @@ async function start() {
   const logger = createLogger({
     filePath: path.join(app.getPath("logs"), "launcher.jsonl"),
     publish: (record) => send("launcher:log", record),
+  });
+  // First record of every session, so a log answers which build produced it. A source edit only
+  // changes behaviour after a rebuild and reinstall, and the log used to be silent about which
+  // side of that boundary it came from.
+  logger.info("launcher.build", {
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    renderer: rendererVariant(),
+    ...(installedBuildProvenance(installedRuntimeRoot) ?? {}),
   });
   const startHidden = process.argv.includes("--hidden") && stateStore.read().onboardingComplete;
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");

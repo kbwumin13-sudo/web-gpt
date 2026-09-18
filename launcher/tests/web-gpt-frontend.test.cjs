@@ -59,3 +59,18 @@ test("public release and updater target the Web GPT repository and macOS workflo
   assert.doesNotMatch(buildWorkflow, /ubuntu-latest|windows-latest/);
   assert.match(workflow, /bun run --cwd launcher package:mac/);
 });
+
+test("a build records which renderer it contains, so the wrong packaging script is visible", () => {
+  // `package:mac` selects the Web GPT renderer; `app:package` — the cross-platform CI check — does
+  // not. Packaging through the wrong one produced an app that launched, worked, and quietly showed
+  // the previous renderer, which nothing reported.
+  const config = read("vite.config.ts");
+  assert.match(config, /RENDERER_VARIANT_FILE = "renderer-variant\.json"/);
+  assert.match(config, /VITE_LAUNCHER_FRONTEND === "web-gpt" \? "web-gpt" : "legacy"/);
+  assert.match(config, /recordRendererVariant\(\)/);
+
+  const main = read("electron", "main.cjs");
+  assert.match(main, /function rendererVariant\(\)/);
+  assert.match(main, /renderer-variant\.json/);
+  assert.match(main, /renderer: rendererVariant\(\)/);
+});

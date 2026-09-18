@@ -50,6 +50,7 @@ import { expandPreviousResponseInput, flushResponseState, rememberResponseState 
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
+import { buildProvenance } from "./build-provenance";
 import { VERSION } from "./version";
 import { processRunning } from "./process";
 
@@ -843,6 +844,9 @@ export function startServer(
           status: "ok",
           service: "codex-chatgpt-web",
           version: VERSION,
+          // Which build is answering, so a fix that was never installed is distinguishable from a
+          // fix that did not work.
+          build: buildProvenance(),
           mode: config.mode,
           pid: process.pid,
           port: config.port,

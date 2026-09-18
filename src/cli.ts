@@ -30,6 +30,7 @@ import { assertServiceIdle, cancelActiveTurns, getGatewayServiceStatus, getServi
 import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions } from "./setup";
 import { installRuntimeKeyBytes, managedRuntimeKeyPath, readerMcpCommand, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
+import { buildProvenance, describeBuild } from "./build-provenance";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
 import { authorizeReaderProject, listReaderProjects, revokeReaderProject } from "./reader";
@@ -94,6 +95,7 @@ Global:
   --home PATH                  Override ~/.codex-chatgpt-web
   -h, --help
   -v, --version
+  --build                      Report the commit and build this executable came from
 `;
 
 function takeOption(args: string[], name: string): string | undefined {
@@ -750,7 +752,13 @@ async function main(): Promise<void> {
     return;
   }
   if (takeFlag(args, "--version") || takeFlag(args, "-v")) {
+    // The Launcher compares this against its own version for an exact match, so it stays bare.
+    // Build identity is reported by --build.
     stdout.write(`${VERSION}\n`);
+    return;
+  }
+  if (takeFlag(args, "--build")) {
+    stdout.write(`${describeBuild(buildProvenance())}\n`);
     return;
   }
   const command = args.shift() ?? "help";

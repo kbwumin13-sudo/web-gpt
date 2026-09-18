@@ -1,3 +1,4 @@
+import { buildProvenance } from "./build-provenance";
 import { isChatGptWebModelSlug } from "./chatgpt-web-models";
 import { readCodexModelContextOverride, readCodexSubagentProtocol } from "./codex-integration";
 import type { AppConfig } from "./config";
@@ -7,6 +8,7 @@ import { forwardNativeCodexRequest, type NativeFetch, type NativeImageEndpoint }
 import { modelsRequest } from "./server";
 import { catalogMatchesExpected, expectedWebModelEfforts, expectedWebModels, publishedWebCatalogEvidence } from "./readiness";
 import { startService, waitForBackendReady } from "./service";
+import { VERSION } from "./version";
 
 export interface GatewayServer {
   port: number | undefined;
@@ -104,7 +106,15 @@ export function startGateway(
         return Response.json({
           status: "ok",
           service: "codex-chatgpt-web-gateway",
-          version: config.releaseVersion,
+          // The compiled version of this process, not the one its configuration asks for. Reporting
+          // `config.releaseVersion` made `doctor`'s version check compare that value against itself,
+          // so a gateway left over from an older install could never fail it.
+          version: VERSION,
+          // `doctor` checks this endpoint whenever the browser host is not the Launcher, so the
+          // gateway has to name its own build too; reporting it only from the backend left the
+          // stale-process check inert for exactly the configuration that uses a gateway.
+          build: buildProvenance(),
+          ...(backend?.build ? { backend_build: backend.build } : {}),
           pid: process.pid,
           port: config.nativeGatewayPort,
           backend_port: config.port,

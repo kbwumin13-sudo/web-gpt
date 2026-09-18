@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { defaultConfig } from "../src/config";
 import { startGateway, type GatewayServer } from "../src/gateway";
+import { buildProvenance } from "../src/build-provenance";
+import { VERSION } from "../src/version";
 
 const servers: GatewayServer[] = [];
 
@@ -149,4 +151,20 @@ test("gateway drains active native requests before shutdown", async () => {
     headers: { authorization: `Bearer ${gatewayConfig.controlToken}` },
   });
   expect(await resumed.json()).toMatchObject({ status: "ok", accepting_requests: true, active_requests: 0 });
+});
+
+test("the gateway names the build it is running, so a stale process is detectable", async () => {
+  // `doctor` checks this endpoint whenever the browser host is not the Launcher. Reporting only
+  // from the backend left its stale-process check inert for exactly the configuration that uses a
+  // gateway, and reporting `config.releaseVersion` as the version made the version check compare
+  // that value against itself.
+  const gatewayConfig = { ...config(), releaseVersion: "0.0.0-not-this-process" };
+  const server = startGateway(gatewayConfig, { ensureBackend: async () => {} });
+  servers.push(server);
+
+  const health = await (await fetch(`http://127.0.0.1:${server.port}/healthz`)).json() as Record<string, unknown>;
+  expect(health.service).toBe("codex-chatgpt-web-gateway");
+  expect(health.version).toBe(VERSION);
+  expect(health.version).not.toBe(gatewayConfig.releaseVersion);
+  expect(health.build).toMatchObject({ version: VERSION, kind: buildProvenance().kind });
 });
