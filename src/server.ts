@@ -4,6 +4,7 @@ import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker
 import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retained-telemetry";
 import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow-observer";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
+import { chatGptCapabilityTelemetrySnapshot } from "./adapters/chatgpt-web/capability-telemetry";
 import { chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
 import { chatGptCompactionTelemetrySnapshot } from "./adapters/chatgpt-web/compaction-telemetry";
 import { timingSafeEqual } from "node:crypto";
@@ -873,6 +874,9 @@ export function startServer(
           // The compact bootstrap leaves earlier records to retrieval. These say how often that
           // was bet on and how often the bet was actually collected.
           context_retrieval: chatGptContextTelemetrySnapshot(),
+          // What a turn spends finding out what it can do. `tool_inventory_gateway_execs` is the
+          // part a native Codex turn never pays: an outer command run to read a tool registry.
+          capability_traffic: chatGptCapabilityTelemetrySnapshot(),
           // A compaction that summarised correctly and reached nobody used to look exactly like one
           // that worked. `abandoned` is that case.
           compaction: chatGptCompactionTelemetrySnapshot(),

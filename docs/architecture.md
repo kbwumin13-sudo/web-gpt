@@ -125,8 +125,10 @@ handoff, cookie import, CDP login port, or temporary session-transfer directory.
 Automatic Full-mode first turns and normal cache misses receive a compact
 `<codex_bootstrap_context_json>` envelope containing the current task message. The omitted canonical
 system/developer/history records remain in the Runtime broker and are retrieved on demand through
-`codex_context_search` and `codex_context_read`, exposed via the existing
-`codex_tool_inventory`/`codex_tool_call` ABI. A retained continuation instead receives
+`codex_context_search` and `codex_context_read`, which are registered connector tools declared
+read-only. The `codex_tool_call` dispatch that carried them before remains as a compatibility path,
+because ChatGPT caches a connector's tool list under its identity and a conversation on the earlier
+schema cannot see a newly attached tool. A retained continuation instead receives
 `<codex_resume_context_json>`, carrying only the canonical suffix after its last assistant reply
 and omitting the system bootstrap that conversation already holds. Browser-only turns and
 compaction/new-epoch requests still receive the complete `<codex_context_json>` bootstrap because
@@ -137,6 +139,18 @@ attached natively with stable references; earlier images remain addressable in t
 Chat, so a resume does not resend them. The runtime does not create a context JSONL file, upload a
 synthetic context document, include prompt hashes, or silently truncate the envelope. Attachment
 acceptance and send readiness are verified before the turn begins.
+
+`codex_context_search` scores records rather than requiring one of them to contain the query as a
+string. A whole-phrase match still ranks first and in its original order, so a query that worked
+before returns what it returned before; behind it come records carrying some of the query's terms,
+ranked by how many. CJK runs contribute character bigrams, having no word separators to split on. A
+term carried by more than half the history is dropped when another term can carry the query, which
+finds the conversation's own filler words without a stop list. A query that matches nothing returns
+no matches and says so, with the tail of the history labelled as orientation rather than as results:
+an empty result is otherwise indistinguishable from an empty history, and a model that believes the
+history is empty stops asking it. Whether retrieval is working is measured, not assumed — `/healthz`
+reports `search_zero_matches` and `search_without_followup_read` next to the call counts, because
+having called search is not the same as having found anything.
 
 Retention is measured rather than assumed. Every turn that expected a retained conversation records
 a hit, or a miss naming each key component that rotated — and `conversation_lost` when nothing
@@ -262,6 +276,11 @@ model along two Runtime-owned paths:
   is told so explicitly, because silence would leave an empty search looking like an empty memory.
   Deeper capabilities remain discoverable through `codex_tool_inventory` and invocable by exact name
   with `codex_tool_call`, instead of requiring all such context to be preloaded into the prompt.
+  Discovery is not free: an inventory call that reaches the nested registry runs a program through
+  the outer `exec` gateway, which is a real command execution in the Codex task spent on the question
+  of what tools exist. `/healthz` reports those executions under `capability_traffic` separately from
+  the calls that did work, alongside the most inventory calls any one turn made — the number that
+  says whether caching the registry per turn would hit anything.
 
 Recalled memory carries explicit provenance — `kind=memory`, `source=openviking`,
 `trust=reference_data`, `instruction_authority=none` — and the shared contract states that

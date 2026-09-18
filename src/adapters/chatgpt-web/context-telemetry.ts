@@ -15,6 +15,12 @@
  * `omitted_without_retrieval` is the count that makes that visible. It is a signal rather than a
  * verdict — a follow-up can be answerable from the packet alone, and then not retrieving is
  * correct — so it is reported next to the totals it is drawn from rather than as a failure.
+ *
+ * Having called search is not the same as having found anything, and that turn proves it: the call
+ * happened and `retrieved_turns` would have counted it. `search_zero_matches` and
+ * `search_without_followup_read` separate a retrieval that worked from one that only occurred. A
+ * search that matches nothing, or that the model never follows with a read, is the shape of a turn
+ * that asked the history a question and then went somewhere else for the answer.
  */
 
 export interface ChatGptContextTelemetrySnapshot {
@@ -36,6 +42,13 @@ export interface ChatGptContextTelemetrySnapshot {
    * mean the compact packet is being trusted as if it were complete.
    */
   omitted_without_retrieval: number;
+  /** Searches that matched no canonical record. */
+  search_zero_matches: number;
+  /**
+   * Searches a turn never followed with a read. The model located records and then did not open
+   * any of them, which is how a retrieval that ran still leaves the answer unread.
+   */
+  search_without_followup_read: number;
 }
 
 let omittedTurns = 0;
@@ -43,13 +56,31 @@ let omittedRecords = 0;
 let retrievedTurns = 0;
 let searches = 0;
 let reads = 0;
+let searchZeroMatches = 0;
+let searchWithoutFollowupRead = 0;
+
+interface OpenTurn {
+  omitted: number;
+  retrieved: boolean;
+  /** Searches since the last read. Folded into the total when the turn answers. */
+  pendingSearches: number;
+}
 
 /**
  * Turns still open, and whether each has retrieved anything yet. Bounded because a turn that never
  * concludes — a crash, a lost page — must not accumulate here forever.
  */
 const MAX_TRACKED_TURNS = 256;
-const openTurns = new Map<string, { omitted: number; retrieved: boolean }>();
+const openTurns = new Map<string, OpenTurn>();
+
+function trackTurn(traceId: string, open: OpenTurn): OpenTurn {
+  openTurns.set(traceId, open);
+  if (openTurns.size > MAX_TRACKED_TURNS) {
+    const oldest = openTurns.keys().next();
+    if (!oldest.done) openTurns.delete(oldest.value);
+  }
+  return open;
+}
 
 export function chatGptContextTelemetrySnapshot(): ChatGptContextTelemetrySnapshot {
   return {
@@ -59,6 +90,8 @@ export function chatGptContextTelemetrySnapshot(): ChatGptContextTelemetrySnapsh
     searches,
     reads,
     omitted_without_retrieval: omittedTurns - retrievedTurns,
+    search_zero_matches: searchZeroMatches,
+    search_without_followup_read: searchWithoutFollowupRead,
   };
 }
 
@@ -69,25 +102,40 @@ export function resetChatGptContextTelemetry(): void {
   retrievedTurns = 0;
   searches = 0;
   reads = 0;
+  searchZeroMatches = 0;
+  searchWithoutFollowupRead = 0;
   openTurns.clear();
 }
 
 /** A turn was sent a packet that left `omitted` earlier records behind. */
 export function recordChatGptContextOmitted(traceId: string, omitted: number): void {
   if (omitted <= 0) return;
-  openTurns.set(traceId, { omitted, retrieved: false });
-  if (openTurns.size > MAX_TRACKED_TURNS) {
-    const oldest = openTurns.keys().next();
-    if (!oldest.done) openTurns.delete(oldest.value);
-  }
+  // A retried attempt re-sends the packet, so it replaces the discarded attempt's record rather
+  // than adding to it: what an abandoned attempt retrieved says nothing about the answer that ships.
+  trackTurn(traceId, { omitted, retrieved: false, pendingSearches: 0 });
 }
 
-/** The turn read some of what its packet left out. Counted once per turn, however many calls. */
-export function recordChatGptContextRetrieval(traceId: string, action: "search" | "read"): void {
-  if (action === "search") searches += 1;
-  else reads += 1;
-  const open = openTurns.get(traceId);
-  if (open) open.retrieved = true;
+/**
+ * The turn read some of what its packet left out. Counted once per turn, however many calls.
+ *
+ * `matches` is the number of canonical records a search located; omit it for a read.
+ */
+export function recordChatGptContextRetrieval(
+  traceId: string,
+  action: "search" | "read",
+  matches?: number,
+): void {
+  if (action === "search") {
+    searches += 1;
+    if (matches === 0) searchZeroMatches += 1;
+  } else reads += 1;
+  // A turn sent a complete packet can still search, and whether that search led anywhere is the
+  // same question. It has no omission to report, so it is tracked with `omitted` at zero.
+  const open = openTurns.get(traceId)
+    ?? trackTurn(traceId, { omitted: 0, retrieved: false, pendingSearches: 0 });
+  open.retrieved = true;
+  if (action === "search") open.pendingSearches += 1;
+  else open.pendingSearches = 0;
 }
 
 /**
@@ -104,6 +152,10 @@ export function chatGptContextLog(traceId: string): string | undefined {
   const open = openTurns.get(traceId);
   if (!open) return undefined;
   openTurns.delete(traceId);
+  searchWithoutFollowupRead += open.pendingSearches;
+  // A turn that was sent everything has no trade to report. Its searches are still counted above,
+  // because looking for something the packet already held is its own signal.
+  if (open.omitted <= 0) return undefined;
   omittedTurns += 1;
   omittedRecords += open.omitted;
   if (open.retrieved) retrievedTurns += 1;
