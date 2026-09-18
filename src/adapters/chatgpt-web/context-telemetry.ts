@@ -18,7 +18,11 @@
  */
 
 export interface ChatGptContextTelemetrySnapshot {
-  /** Turns whose packet left earlier records to retrieval. */
+  /**
+   * Turns that answered from a packet which left earlier records to retrieval. Turns that failed
+   * before the model replied are not counted: they cannot have retrieved anything, and counting
+   * them made an upstream capacity refusal read as a model trusting an incomplete packet.
+   */
   omitted_turns: number;
   /** Records those turns left out, summed. */
   omitted_records: number;
@@ -71,8 +75,6 @@ export function resetChatGptContextTelemetry(): void {
 /** A turn was sent a packet that left `omitted` earlier records behind. */
 export function recordChatGptContextOmitted(traceId: string, omitted: number): void {
   if (omitted <= 0) return;
-  omittedTurns += 1;
-  omittedRecords += omitted;
   openTurns.set(traceId, { omitted, retrieved: false });
   if (openTurns.size > MAX_TRACKED_TURNS) {
     const oldest = openTurns.keys().next();
@@ -85,15 +87,25 @@ export function recordChatGptContextRetrieval(traceId: string, action: "search" 
   if (action === "search") searches += 1;
   else reads += 1;
   const open = openTurns.get(traceId);
-  if (!open || open.retrieved) return;
-  open.retrieved = true;
-  retrievedTurns += 1;
+  if (open) open.retrieved = true;
 }
 
-/** One line per turn that was handed an incomplete packet, so the trade is visible per turn too. */
+/**
+ * Settle a turn that answered, and return the line describing its trade.
+ *
+ * Counting happens here rather than when the packet was built, because a turn that never reached
+ * the model cannot have retrieved anything. Counting at build time made the first two turns this
+ * shipped with — both refused upstream for capacity before generation began — read as two turns
+ * that trusted an incomplete packet, which is the opposite of what happened. The question this
+ * answers is only about turns that produced an answer: when the model replied, had it read what it
+ * was not sent.
+ */
 export function chatGptContextLog(traceId: string): string | undefined {
   const open = openTurns.get(traceId);
   if (!open) return undefined;
   openTurns.delete(traceId);
+  omittedTurns += 1;
+  omittedRecords += open.omitted;
+  if (open.retrieved) retrievedTurns += 1;
   return `[chatgpt-web] context trace=${traceId} omittedRecords=${open.omitted} retrieved=${open.retrieved}`;
 }
