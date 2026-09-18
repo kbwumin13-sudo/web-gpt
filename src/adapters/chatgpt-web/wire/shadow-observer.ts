@@ -366,12 +366,19 @@ export class ChatGptWireShadowSession {
     // comparing, not a message to show anyone.
     const serverError = dom.failed ? observation?.error : undefined;
     if (serverError !== undefined) serverStatements += 1;
-    // The stream named somewhere else to continue on. Recording the other streams that carried
-    // frames is what makes following it later a matter of reading rather than guessing.
     const handedOff = observation?.counts.controlTypes.includes(STREAM_HANDOFF) === true;
     if (handedOff) handoffsObserved += 1;
+    /**
+     * Whenever this observer lost a turn the page did read, keep every other stream that carried
+     * frames. Following a handoff needs the continuation's actual bytes, and recording them only
+     * when the handoff envelope was recognised missed the cases that matter most: one lost turn
+     * selected the WebSocket itself and carried no envelope at all, so nothing about the
+     * conversation request survived. `wire_empty` is the condition that says the answer went
+     * somewhere this build did not look, whatever the reason.
+     */
+    const lostTheTurn = handedOff || comparison === "wire_empty";
     // By id, not identity: `snapshot()` rebuilds its entries on every call.
-    const companions = handedOff
+    const companions = lostTheTurn
       ? this.collector.snapshot().filter(candidate => candidate.id !== stream?.id && candidate.frames.length > 0)
       : undefined;
     const transcriptPath = stream && observation && wireTranscriptsEnabled()

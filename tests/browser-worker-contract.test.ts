@@ -943,7 +943,9 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
         await expect(result).resolves.toMatchObject({ identity: "conversation-turn-assistant", locator: assistantLocator });
       } else {
         await expect(result).rejects.toThrow(scenario === "missing"
-          ? "ChatGPT accepted the message but did not expose its assistant turn in the DOM"
+          // Names the observed state rather than where this reader failed to find something: the
+          // old wording described its own DOM search, which is not something a reader can act on.
+          ? "ChatGPT accepted the message and began generating, but its page never rendered the reply."
           : "ChatGPT web turn timed out");
       }
       expect(observations).toBe(scenario === "turn-deadline" ? 1 : 2);

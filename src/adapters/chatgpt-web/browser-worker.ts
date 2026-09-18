@@ -2947,7 +2947,15 @@ export class ChatGptBrowserWorker {
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
         && !chatGptExternalProgressSuppressesDomHealth(progress, Date.now())) {
-        throw new Error("ChatGPT accepted the message but did not expose its assistant turn in the DOM");
+        // Names what happened rather than where it was noticed. "Did not expose its assistant turn
+        // in the DOM" describes this reader's own search, which tells the person reading it nothing
+        // they can act on — the observed state is that ChatGPT took the message and started
+        // generating while its page rendered no conversation at all.
+        throw new ChatGptWebAdapterError(
+          "ChatGPT accepted the message and began generating, but its page never rendered the reply."
+          + " This is a ChatGPT page problem rather than a bridge one, and it usually clears on a retry.",
+          { status: 502, errorType: "server_error", code: "chatgpt_page_never_rendered", retryable: true },
+        );
       }
       await this.waitForTurnDomOrExternalProgress(
         observationPage,

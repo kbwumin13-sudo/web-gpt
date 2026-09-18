@@ -169,6 +169,28 @@ test("a turn that handed its stream off records the streams it could have contin
   expect(transcript.companions![0]!.raw).toContain("t1");
 });
 
+test("a turn this observer lost is recorded with every stream it could have been on", async () => {
+  // Recording only when a handoff envelope was recognised missed the cases that matter most: one
+  // lost turn selected the WebSocket itself and carried no envelope, so nothing about the
+  // conversation request survived. `wire_empty` is the condition that says the answer went
+  // somewhere this build did not look, whatever the reason.
+  process.env[WIRE_TRANSCRIPT_ENV] = "1";
+  const root = join(temporaryDirectory(), "wire-transcripts");
+  const { page, emit } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root);
+  await session.attach(page);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify([{ id: 1, type: "reply" }]), at: 2 });
+  emitStream(emit, "data: [DONE]\n\n");
+
+  const result = session.conclude({ answer: "the page read this", failed: false });
+  expect(result.comparison).toBe("wire_empty");
+  // No handoff envelope was seen, and the companions are kept anyway.
+  expect(chatGptWireTelemetrySnapshot().handoffs_observed).toBe(0);
+  const transcript = JSON.parse(readFileSync(result.transcriptPath!, "utf8")) as { companions?: unknown[] };
+  expect(transcript.companions).toHaveLength(1);
+});
+
 test("a turn that was never handed off records no companion streams", async () => {
   process.env[WIRE_TRANSCRIPT_ENV] = "1";
   const root = join(temporaryDirectory(), "wire-transcripts");
