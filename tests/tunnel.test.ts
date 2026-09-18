@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { tunnelRuntimeCheck } from "../src/doctor";
 import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError, tunnelHealthFileFromInventory, tunnelStopReachedTerminalState } from "../src/tunnel";
 import { macOsSystemProxyEnvironment } from "../src/process";
 
@@ -74,7 +75,9 @@ describe("tunnel status boundary", () => {
       healthy: true,
       ready: true,
       state: "ready",
-      detail: "process_running=true healthy=true ready=true",
+      // The control-plane state is always stated: a runtime that reports none is not the same as
+      // one that reports a reachable control plane.
+      detail: "process_running=true healthy=true ready=true; control_plane_poll=unreported",
     });
     expect(parseTunnelStatus(JSON.stringify({
       process_running: false,
@@ -161,4 +164,71 @@ describe("tunnel status boundary", () => {
       stderr: "non-fatal warning",
     })).toBe('{"ready":true}');
   });
+});
+
+test("a failing control-plane poll is not reported as a healthy tunnel", () => {
+  // The loopback endpoints keep answering while the poll fails: the process is alive and listening,
+  // and the tunnel is no longer registered upstream. A turn then reaches ChatGPT, finds the
+  // connector unroutable, and reports a terminated session with nothing here having objected.
+  const status = parseTunnelStatus(JSON.stringify({
+    process_running: true,
+    healthy: true,
+    ready: true,
+    control_plane_poll_health: { state: "unhealthy", reason: "poll timed out; backing off" },
+  }));
+  expect(status.ok).toBeFalse();
+  expect(status.controlPlane).toEqual({ state: "unhealthy", reason: "poll timed out; backing off" });
+  expect(status.detail).toContain("control_plane_poll=unhealthy");
+  expect(tunnelRuntimeCheck(status).status).toBe("error");
+});
+
+test("a tunnel that is down because the backend is idle is not reported as a failure", () => {
+  // The backend owns the tunnel and stops both after two idle minutes, so between turns this is
+  // the healthy steady state. Calling it an error fails every doctor run that lands in a gap,
+  // which is how a check stops being read.
+  const status = parseTunnelStatus(JSON.stringify({
+    process_running: false,
+    healthy: false,
+    ready: false,
+    state: "stopped",
+  }));
+  expect(status.ok).toBeFalse();
+  const idle = tunnelRuntimeCheck(status, false);
+  expect(idle.status).toBe("warning");
+  expect(idle.message).toContain("backend is idle");
+  // The same runtime state while the backend is up is a real failure and stays an error.
+  expect(tunnelRuntimeCheck(status, true).status).toBe("error");
+  // An unknown backend state must not soften the verdict either.
+  expect(tunnelRuntimeCheck(status).status).toBe("error");
+});
+
+test("an unconfirmed control-plane poll is a warning, not a pass", () => {
+  const status = parseTunnelStatus(JSON.stringify({
+    process_running: true,
+    healthy: true,
+    ready: true,
+    local: { control_plane_poll_health: { state: "unknown", reason: "no live admin UI system snapshot" } },
+  }));
+  expect(status.ok).toBeTrue();
+  expect(status.controlPlane?.state).toBe("unknown");
+  const check = tunnelRuntimeCheck(status);
+  expect(check.status).toBe("warning");
+  expect(check.detail).toContain("control_plane_poll=unknown");
+});
+
+test("a reachable control plane passes and says so", () => {
+  const status = parseTunnelStatus(JSON.stringify({
+    process_running: true,
+    healthy: true,
+    ready: true,
+    control_plane_poll_health: { state: "healthy" },
+  }));
+  expect(tunnelRuntimeCheck(status).status).toBe("ok");
+  expect(status.detail).toContain("control_plane_poll=healthy");
+});
+
+test("a runtime that reports no control-plane state at all is not read as success", () => {
+  const status = parseTunnelStatus(JSON.stringify({ process_running: true, healthy: true, ready: true }));
+  expect(status.detail).toContain("control_plane_poll=unreported");
+  expect(tunnelRuntimeCheck(status).status).toBe("warning");
 });

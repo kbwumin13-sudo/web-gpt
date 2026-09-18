@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getGatewayServiceStatus, getServiceStatus } from "./service";
-import { tunnelStatus } from "./tunnel";
+import { tunnelStatus, type TunnelRuntimeStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
   inspectLauncherBrowserHost,
@@ -13,6 +13,7 @@ import {
   readLauncherBrowserHostDescriptor,
 } from "./launcher-browser-host";
 import { processRunning } from "./process";
+import { buildProvenance, describeBuild, staleDaemonBuild } from "./build-provenance";
 import { catalogMatchesExpected, expectedWebModelEfforts, expectedWebModels } from "./readiness";
 
 export type CheckStatus = "ok" | "warning" | "error";
@@ -62,39 +63,102 @@ function launcherOwnershipError(config: AppConfig, health: Record<string, unknow
   return undefined;
 }
 
-async function proxyCheck(config: AppConfig): Promise<DoctorCheck> {
+/**
+ * The tunnel's loopback endpoints keep answering while its control-plane poll fails, so "healthy
+ * and ready" on its own does not mean a ChatGPT connector can reach this machine. A turn in that
+ * state reaches ChatGPT, finds the connector unroutable, and comes back reporting a terminated
+ * session — with nothing here having said anything was wrong. The control-plane state is therefore
+ * part of the verdict, and an unreported one is stated rather than read as success.
+ *
+ * `backendReady` distinguishes a tunnel that failed from one that was never meant to be running.
+ * The backend owns the tunnel and stops both after two idle minutes (`backend-host.ts`), so on an
+ * idle machine a stopped tunnel is the healthy steady state — reporting it as an error would fail
+ * every `doctor` run that happens between turns, which teaches the reader to ignore this check.
+ */
+export function tunnelRuntimeCheck(runtime: TunnelRuntimeStatus, backendReady?: boolean): DoctorCheck {
+  if (!runtime.ok) {
+    if (backendReady === false) {
+      return {
+        id: "tunnel-runtime",
+        status: "warning",
+        message: "Tunnel runtime is stopped because the backend is idle; the next turn starts both",
+        detail: runtime.detail,
+      };
+    }
+    return { id: "tunnel-runtime", status: "error", message: "Tunnel runtime is not ready", detail: runtime.detail };
+  }
+  const state = runtime.controlPlane?.state;
+  if (state === undefined || state.toLowerCase() === "unknown") {
+    return {
+      id: "tunnel-runtime",
+      status: "warning",
+      message: "Tunnel runtime is running, but its connection to the OpenAI control plane is unconfirmed",
+      detail: runtime.detail,
+    };
+  }
+  return {
+    id: "tunnel-runtime",
+    status: "ok",
+    message: "Tunnel runtime is healthy and reaching the OpenAI control plane",
+    detail: runtime.detail,
+  };
+}
+
+/**
+ * The route check and the backend's running state come from the same `/healthz` snapshot, so the
+ * tunnel verdict downstream cannot contradict the route verdict by reading a second, later one.
+ * `backendReady` is undefined when the snapshot was never obtained.
+ */
+interface ProxyProbe {
+  check: DoctorCheck;
+  backendReady?: boolean;
+}
+
+async function proxyCheck(config: AppConfig): Promise<ProxyProbe> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2_000);
   try {
     const port = config.browserHost === "launcher" ? config.port : config.nativeGatewayPort;
     const expectedService = config.browserHost === "launcher" ? "codex-chatgpt-web" : "codex-chatgpt-web-gateway";
     const response = await fetch(`http://${config.host}:${port}/healthz`, { signal: controller.signal });
-    if (!response.ok) return { id: "proxy", status: "error", message: `Responses proxy returned HTTP ${response.status}` };
+    if (!response.ok) {
+      return { check: { id: "proxy", status: "error", message: `Responses proxy returned HTTP ${response.status}` } };
+    }
     const body = await response.json() as Record<string, unknown>;
+    // The launcher topology runs the backend in the process being probed; the native gateway
+    // reports a separate, lazily started one.
+    const backendReady = config.browserHost === "launcher"
+      ? body.accepting_turns === true
+      : typeof body.backend_ready === "boolean" ? body.backend_ready : undefined;
+    const fail = (check: DoctorCheck): ProxyProbe => ({ check, backendReady });
     if (body.service !== expectedService || body.status !== "ok") {
-      return { id: "proxy", status: "error", message: "The configured port belongs to another service" };
+      return fail({ id: "proxy", status: "error", message: "The configured port belongs to another service" });
     }
     if (config.browserHost === "launcher" && body.mode !== config.mode) {
-      return { id: "proxy", status: "error", message: `Daemon is running in ${String(body.mode)} mode; config requires ${config.mode}` };
+      return fail({ id: "proxy", status: "error", message: `Daemon is running in ${String(body.mode)} mode; config requires ${config.mode}` });
     }
     if (body.version !== config.releaseVersion) {
-      return { id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` };
+      return fail({ id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` });
+    }
+    const staleDaemon = staleDaemonBuild(body.build);
+    if (staleDaemon) {
+      return fail({ id: "proxy", status: "error", message: "The running daemon predates the installed runtime", detail: staleDaemon });
     }
     if (config.browserHost === "launcher" && body.accepting_turns !== true) {
-      return {
+      return fail({
         id: "proxy",
         status: "error",
         message: "Responses proxy is still drained and is not accepting Codex turns",
-      };
+      });
     }
     const ownershipError = config.browserHost === "launcher" ? launcherOwnershipError(config, body) : undefined;
     if (ownershipError) {
-      return { id: "proxy", status: "error", message: "Responses proxy ownership could not be verified", detail: ownershipError };
+      return fail({ id: "proxy", status: "error", message: "Responses proxy ownership could not be verified", detail: ownershipError });
     }
-    return { id: "proxy", status: "ok", message: `Codex route is healthy on 127.0.0.1:${port}` };
+    return fail({ id: "proxy", status: "ok", message: `Codex route is healthy on 127.0.0.1:${port}` });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    return { id: "proxy", status: "error", message: "Responses proxy is not reachable", detail };
+    return { check: { id: "proxy", status: "error", message: "Responses proxy is not reachable", detail } };
   } finally {
     clearTimeout(timeout);
   }
@@ -142,7 +206,9 @@ async function catalogCheck(config: AppConfig): Promise<DoctorCheck> {
 }
 
 export async function runDoctor(): Promise<DoctorReport> {
-  const checks: DoctorCheck[] = [];
+  const checks: DoctorCheck[] = [
+    { id: "build", status: "ok", message: `Build ${describeBuild(buildProvenance())}` },
+  ];
   let config: AppConfig;
   try {
     config = loadConfig();
@@ -226,7 +292,8 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "gateway-service", status: "ok", message: "macOS native gateway service is loaded" });
   }
-  checks.push(await proxyCheck(config));
+  const proxy = await proxyCheck(config);
+  checks.push(proxy.check);
   checks.push(await catalogCheck(config));
 
   if (config.mode === "full") {
@@ -264,9 +331,7 @@ export async function runDoctor(): Promise<DoctorReport> {
         : { id: "tunnel-service", status: "ok", message: "Backend Host owns the tunnel runtime" });
     }
     const runtime = tunnelStatus(config);
-    checks.push(runtime.ok
-      ? { id: "tunnel-runtime", status: "ok", message: "Tunnel runtime reports healthy and ready" }
-      : { id: "tunnel-runtime", status: "error", message: "Tunnel runtime is not ready", detail: runtime.detail });
+    checks.push(tunnelRuntimeCheck(runtime, proxy.backendReady));
     checks.push({
       id: "connector",
       status: "warning",
