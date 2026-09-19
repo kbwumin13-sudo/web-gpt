@@ -1,7 +1,7 @@
 export type Language = "en" | "zh-CN" | "ja";
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
-export type Surface = "browser" | "setup" | "mcp" | "activity" | "settings";
+export type Surface = "overview" | "browser" | "setup" | "mcp" | "activity" | "settings";
 
 export interface LauncherState {
   version: 1;

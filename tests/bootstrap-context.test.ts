@@ -76,6 +76,17 @@ test("a chat the person can already see is not sent its own history again", () =
   expect(bodies(selected)).toEqual(["follow-up"]);
 });
 
+test("the bootstrap always carries effective developer instructions", () => {
+  const selected = bootstrapContractMessages([
+    text("developer", "workspace is read-only"),
+    text("user", "inspect the repository"),
+    text("assistant", "I will inspect it."),
+    text("user", "continue"),
+  ]);
+  expect(roles(selected)).toEqual(["developer", "user", "assistant", "user"]);
+  expect(bodies(selected).at(0)).toBe("workspace is read-only");
+});
+
 test("the first turn of a conversation carries only itself", () => {
   expect(bodies(bootstrapContractMessages([text("user", "first request")]))).toEqual(["first request"]);
   expect(bootstrapContractMessages([])).toEqual([]);

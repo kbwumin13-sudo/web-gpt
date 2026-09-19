@@ -2167,6 +2167,8 @@ export class ChatGptBrowserWorker {
   private context?: BrowserContext;
   private page?: Page;
   private managedBrowserReady?: Promise<{ browser: Browser; context: BrowserContext }>;
+  /** Retained automatic conversations are scoped by the Runtime-derived conversation key. */
+  private readonly managedRetainedPages = new Map<string, Page>();
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
@@ -2292,10 +2294,18 @@ export class ChatGptBrowserWorker {
     this.context = undefined;
     this.page = undefined;
     this.managedBrowserReady = undefined;
+    this.managedRetainedPages.clear();
     // For connectOverCDP, Playwright implements Browser.close as a transport disconnect; it does
     // not close the launcher-owned Electron process. Always release that connection and its
     // artifact directory instead of leaking one per timeout/helper lifecycle.
     if (browser) await browser.close();
+  }
+
+  /** Retire one automatic retained conversation without affecting unrelated task tabs. */
+  async releaseRetainedConversation(conversationKey: string): Promise<void> {
+    const page = this.managedRetainedPages.get(conversationKey);
+    this.managedRetainedPages.delete(conversationKey);
+    if (page && !page.isClosed()) await page.close();
   }
 
   private async runStage<T>(
@@ -4301,7 +4311,15 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (this.config.browserHost !== "launcher") {
+      const retained = turn.conversationKey ? this.managedRetainedPages.get(turn.conversationKey) : undefined;
+      if (retained?.isClosed()) this.managedRetainedPages.delete(turn.conversationKey!);
+      const reused = retained !== undefined && !retained.isClosed();
+      if (turn.requireRetainedConversation && !reused) throw chatGptRetainedConversationUnavailableError();
+      if (reused && !turn.prepareResume) throw new Error("Managed Chrome reused a ChatGPT conversation without a continuation prompt");
+      await turn.onPreparedSelected?.(reused);
+      return this.runBrowserTurn(turn, undefined, retained, reused, reused || turn.retainConversation === true);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",
@@ -4404,6 +4422,7 @@ export class ChatGptBrowserWorker {
     launcherSurfaceId?: string,
     maintenancePage?: Page,
     reuseConversation = false,
+    managedRetentionEnabled = false,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
@@ -4443,6 +4462,7 @@ export class ChatGptBrowserWorker {
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
     let diagnosticPage: Page | undefined;
+    let retainManagedPage = false;
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const multipartTransactionId = prepared.multipart
@@ -5374,7 +5394,18 @@ export class ChatGptBrowserWorker {
       );
       const contextLine = chatGptContextLog(turn.traceId);
       if (contextLine) console.info(contextLine);
-      return concludeWireShadow(finalText, false).rescuedAnswer ?? finalText;
+      const wire = concludeWireShadow(finalText, false);
+      if (wire.rescuedAnswer !== undefined && finalText.length === 0) {
+        // The observer is complete enough to replace an empty DOM read. Feed it through the same
+        // append-only channel before returning so the Responses stream and terminal answer agree.
+        emitMarkdownDelta(wire.rescuedAnswer);
+        finalText = wire.rescuedAnswer;
+      }
+      if (managedRetentionEnabled && turn.conversationKey && !page.isClosed()) {
+        this.managedRetainedPages.set(turn.conversationKey, page);
+        retainManagedPage = true;
+      }
+      return finalText;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError"
         && turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted) {
@@ -5417,6 +5448,10 @@ export class ChatGptBrowserWorker {
       // When the stream carried a reason, ChatGPT's own words lead. The page can see that the
       // surface is unusable but not why, and a capacity limit read as an expired login sends the
       // reader to log in again for nothing.
+      if (managedRetentionEnabled && turn.conversationKey
+        && !(error instanceof ChatGptCompactionHandoffAccepted)) {
+        await this.releaseRetainedConversation(turn.conversationKey).catch(() => {});
+      }
       throw withChatGptServerStatement(reported, observed.serverError);
     } finally {
       prepared.release();
@@ -5426,7 +5461,7 @@ export class ChatGptBrowserWorker {
             `[chatgpt-web] failed to release launcher browser connection for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
           );
         });
-      } else if (managedPage && !managedPage.isClosed()) {
+      } else if (managedPage && !managedPage.isClosed() && !retainManagedPage) {
         await managedPage.close().catch(error => {
           console.error(
             `[chatgpt-web] failed to close managed browser tab for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,

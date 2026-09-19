@@ -15,6 +15,7 @@ export type IconName =
   | "link"
   | "logs"
   | "mcp"
+  | "overview"
   | "minus"
   | "plus"
   | "reload"
@@ -49,6 +50,7 @@ export function Icon({ name, ...props }: { name: IconName } & SVGProps<SVGSVGEle
       {name === "link" ? <><path {...stroke} d="m9.4 14.6 5.2-5.2" /><path {...stroke} d="M7.4 17.5H6a3.5 3.5 0 0 1 0-7h3M16.6 6.5H18a3.5 3.5 0 0 1 0 7h-3" /></> : null}
       {name === "logs" ? <><path {...stroke} d="M6 4h12v16H6zM9 8h6M9 12h6M9 16h4" /></> : null}
       {name === "mcp" ? <><path {...stroke} d="M8 7.5 12 4l4 3.5v5L12 16l-4-3.5v-5Z" /><path {...stroke} d="m8 12.5-3 2.7v3.3L8 21l3-2.5V16M16 12.5l3 2.7v3.3L16 21l-3-2.5V16" /></> : null}
+      {name === "overview" ? <><rect {...stroke} x="4" y="4" width="6" height="6" rx="1.4" /><rect {...stroke} x="14" y="4" width="6" height="6" rx="1.4" /><rect {...stroke} x="4" y="14" width="6" height="6" rx="1.4" /><path {...stroke} d="M14 17h6M17 14v6" /></> : null}
       {name === "minus" ? <path {...stroke} d="M5 12h14" /> : null}
       {name === "plus" ? <path {...stroke} d="M5 12h14M12 5v14" /> : null}
       {name === "reload" ? <><path {...stroke} d="M19 8a8 8 0 1 0 .3 7" /><path {...stroke} d="M19 4v4h-4" /></> : null}

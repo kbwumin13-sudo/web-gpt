@@ -36,6 +36,18 @@ test("Web GPT renderer preserves every browser and runtime bridge boundary", () 
   assert.match(source, /!managedBrowser \? <SetupRow/);
 });
 
+test("Web GPT presents readiness before browser controls and keeps diagnostics fact-based", () => {
+  const source = read("src", "web-gpt", "App.tsx");
+  const types = read("src", "types.ts");
+  assert.match(types, /"overview"/);
+  assert.match(source, /function OverviewSurface/);
+  assert.match(source, /codexCatalogVerified === true/);
+  assert.match(source, /mcpSetupComplete === true/);
+  assert.match(source, /mcpRuntimeInstalled === true/);
+  assert.match(source, /api!\.doctor\(\)/);
+  assert.match(source, /localToolsRequired/);
+});
+
 test("Web GPT uses its own mark and tokenized visual system", () => {
   const icons = read("src", "web-gpt", "icons.tsx");
   const styles = read("src", "web-gpt", "styles.css");
@@ -46,6 +58,18 @@ test("Web GPT uses its own mark and tokenized visual system", () => {
   assert.match(styles, /@import "[.]\/tokens[.]css"/);
   assert.match(tokens, /--wg-sidebar: 252px/);
   assert.match(styles, /prefers-reduced-motion/);
+  assert.doesNotMatch(tokens, /OpenAI Sans/);
+});
+
+test("legacy demo recordings and inherited brand paths do not remain in the launcher source", () => {
+  const legacy = read("src", "App.tsx");
+  assert.doesNotMatch(legacy, /mcp-create-tunnel|mcp-connect-connector|22\.2819|4\.9807/);
+  for (const name of [
+    "mcp-connect-connector.gif",
+    "mcp-connect-connector.mp4",
+    "mcp-create-tunnel.gif",
+    "mcp-create-tunnel.mp4",
+  ]) assert.equal(fs.existsSync(path.join(launcherRoot, "src", "assets", name)), false, `${name} must not ship`);
 });
 
 test("first-run onboarding no longer requires upstream social visits", () => {

@@ -17,7 +17,6 @@
   <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
-  <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="Free AI with no API fees">
 </p>
 
 Free and Go accounts get **ChatGPT Web — Luna** in Codex's native model picker. Accounts that
@@ -25,10 +24,6 @@ expose the reasoning selector keep **Instant**, **Medium**, **High**, **Extra Hi
 their subscription allows. The bridge sends the current compiled Codex task context to a fresh
 ChatGPT Temporary Chat, attaches images, and streams visible reasoning, tool activity, and Markdown
 back into the same Codex task.
-
-<p align="center">
-  <img src="assets/demo.gif" alt="A live ChatGPT Web turn using the native Codex harness" width="960">
-</p>
 
 ```text
 Codex task ──Responses + SSE──▶ Native Gateway ──native requests──▶ OpenAI Codex
@@ -41,12 +36,6 @@ Codex keeps the native task, context lifecycle, UI, and tool harness. The Native
 separate service and forwards native requests without waiting for the Web backend. Only a selected
 Web model task enters the task-bound ChatGPT Temporary Chat; in full mode, MCP connects ChatGPT back
 to the tools of that same Codex task until its next compaction boundary.
-
-> [!TIP]
-> I also built **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)**, a local
-> app that changes the ChatGPT/Codex voice in near real time. It never touches your account, browser
-> session, or ChatGPT requests, so using it carries no account-blocking risk. If you like my work,
-> give it a try.
 
 ## Highlights
 

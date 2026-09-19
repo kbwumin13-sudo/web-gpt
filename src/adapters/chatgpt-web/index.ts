@@ -398,10 +398,12 @@ export function createChatGptWebAdapter(
   };
   const manualInteraction = provider.chatgptWeb?.browserInteractionMode === "manual";
   const executionNamespace = chatGptWebExecutionNamespace(provider);
-  const retainedLauncherDescriptor = provider.chatgptWeb?.browserHost === "launcher"
+    const retainedLauncherDescriptor = provider.chatgptWeb?.browserHost === "launcher"
     && provider.chatgptWeb.browserHostDescriptorPath
       ? resolve(expandUserPath(provider.chatgptWeb.browserHostDescriptorPath))
       : undefined;
+  const managedBrowserRetention = provider.chatgptWeb?.browserHost === "managed-chrome";
+  const retainedConversationHostAvailable = retainedLauncherDescriptor !== undefined || managedBrowserRetention;
   if (manualInteraction) {
     if (!configuredCapabilities.localToolsEnabled) {
       throw new Error("ChatGPT Zero Risk requires the Full Codex harness");
@@ -462,7 +464,7 @@ export function createChatGptWebAdapter(
         ? "rolling_checkpoint_model"
         : !mode.localTools
           ? "no_local_tools"
-          : !retainedLauncherDescriptor
+          : !retainedConversationHostAvailable
             ? "no_retained_launcher"
             : !keyComponents
               ? "no_thread_identity"
@@ -487,10 +489,12 @@ export function createChatGptWebAdapter(
         ?? retainedConversationRecoveryRequest(checkpointInput.parsed)
       : undefined;
     const retainConversation = conversationKey !== undefined;
-    const releaseRetainedConversation = conversationKey && retainedLauncherDescriptor
-      ? async () => {
-        await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey);
-      }
+    const releaseRetainedConversation = conversationKey
+      ? retainedLauncherDescriptor
+        ? async () => { await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey); }
+        : managedBrowserRetention
+          ? async () => { await worker.releaseRetainedConversation(conversationKey); }
+          : undefined
       : undefined;
     const compileOptionsFor = (input: CodexParsedRequest, retainedResume = false) => {
       if (manualRequest) return {};
@@ -802,10 +806,15 @@ export function createChatGptWebAdapter(
     const externalProgress = new ChatGptExternalTurnProgress();
     let tokenSettled = false;
     let activeToken: string | undefined;
+    const canonicalContext = (): ChatGptTurnContextSnapshot => ({
+      ...(checkpointInput.parsed.context.systemPrompt !== undefined
+        ? { systemPrompt: checkpointInput.parsed.context.systemPrompt }
+        : {}),
+      messages: checkpointInput.parsed.context.messages,
+    });
     const prepareWith = async (input: CodexParsedRequest, retainedResume = false) => {
       const context: ChatGptTurnContextSnapshot = {
-        ...(input.context.systemPrompt !== undefined ? { systemPrompt: input.context.systemPrompt } : {}),
-        messages: input.context.messages,
+        ...canonicalContext(),
       };
       const turnToken = activeToken ?? await broker.register(
         environment,
@@ -1415,6 +1424,12 @@ export function createChatGptWebAdapter(
               turnToken = await withAbort(session.runtime.token, incoming.abortSignal);
               if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its trusted environment");
               await broker.updateEnvironment(turnToken, environment);
+              // The browser prompt may be an incremental resume, but Runtime retrieval must always
+              // expose the complete current Codex history, including tool results that just arrived.
+              await broker.updateContext(turnToken, {
+                ...(parsed.context.systemPrompt !== undefined ? { systemPrompt: parsed.context.systemPrompt } : {}),
+                messages: parsed.context.messages,
+              });
 
               const outstanding = session.outstanding();
               if (outstanding.length > 0) {
@@ -1483,9 +1498,16 @@ export function createChatGptWebAdapter(
                     externalProgress.assertToolBatchActive(revision);
                   }
                   return { type: "tools" as const, requests };
-                }).catch(error => toolWaitAbort.signal.aborted
-                  ? new Promise<never>(() => {})
-                  : Promise.reject(error))
+                }).catch(error => {
+                  // Cancellation revokes the broker binding before the browser promise necessarily
+                  // settles. Let that authoritative browser outcome report the cancellation rather
+                  // than turning the cleanup race into a misleading token-expired failure.
+                  if (toolWaitAbort.signal.aborted
+                    || (error instanceof Error && error.message === "turn token is invalid or expired")) {
+                    return new Promise<never>(() => {});
+                  }
+                  return Promise.reject(error);
+                })
                 : undefined;
               let nextTools = armNextTools();
               const browserOutcome = session.browserOutcome.then(outcome => ({ type: "browser" as const, outcome }));

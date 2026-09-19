@@ -17,7 +17,6 @@
   <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT ライセンス"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 および x64">
-  <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="API 料金なしの AI">
 </p>
 
 Free および Go アカウントでは、Codex のネイティブモデル選択画面に
@@ -25,10 +24,6 @@ Free および Go アカウントでは、Codex のネイティブモデル選�
 サブスクリプションで利用可能な **Instant**、**Medium**、**High**、**Extra High**、**Pro** を使用できます。
 ブリッジは、コンパイル済みの現在の Codex タスクコンテキストを新しい ChatGPT 一時チャットへ送り、
 画像を添付し、表示される reasoning、ツールアクティビティ、Markdown を同じ Codex タスクへストリーミングします。
-
-<p align="center">
-  <img src="assets/demo.gif" alt="ネイティブ Codex ハーネスを使用する ChatGPT Web ターン" width="960">
-</p>
 
 ```text
 Codex タスク ──Responses + SSE──▶ ヘッドレス Backend ──管理対象 Chrome──▶ ChatGPT
@@ -39,12 +34,6 @@ Codex タスク ──Responses + SSE──▶ ヘッドレス Backend ──管
 Codex はネイティブのタスク、コンテキストライフサイクル、UI、ツールハーネスを維持します。
 ローカル Responses ブリッジは、選択されたモデルのタスクだけをタスクに紐付いた ChatGPT 一時チャットへルーティングします。
 Full モードでは、次のコンパクション境界まで、MCP が ChatGPT を同じ Codex タスクのツールへ接続します。
-
-> [!TIP]
-> **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)** も開発しています。
-> ChatGPT/Codex の音声をローカル環境でほぼリアルタイムに変換するアプリです。
-> アカウント、ブラウザーセッション、ChatGPT リクエストには一切触れないため、
-> 使用によってアカウントがブロックされるリスクはありません。気に入っていただけたら、ぜひお試しください。
 
 ## 主な特長
 

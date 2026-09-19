@@ -20,7 +20,7 @@
   --wg-shadow-heavy: oklch(0% 0 0 / 0.42);
   --wg-overlay: oklch(0% 0 0 / 0.42);
 
-  --wg-font-ui: "OpenAI Sans", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", "Yu Gothic UI", "Meiryo", "Segoe UI", sans-serif;
+  --wg-font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", "Yu Gothic UI", "Meiryo", "Segoe UI", sans-serif;
   --wg-font-display: "Avenir Next", "SF Pro Display", var(--wg-font-ui);
   --wg-font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
 

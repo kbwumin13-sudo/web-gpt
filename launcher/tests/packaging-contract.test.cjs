@@ -41,11 +41,17 @@ test("launcher publishes native packages for all supported desktop operating sys
   assert.deepEqual(manifest.build.win.target, ["nsis"]);
   assert.equal(manifest.build.win.icon, "assets/icon.ico");
   assert.deepEqual(manifest.build.linux.target, ["AppImage"]);
+  assert.equal(manifest.build.mac.icon, "assets/icon.icns");
   assert.ok(manifest.build.files.includes("assets/icon.png"));
+  assert.ok(manifest.build.files.includes("assets/icon.icns"));
+  assert.ok(manifest.build.files.includes("assets/icon.svg"));
   assert.ok(manifest.build.files.includes("assets/linux-appimage-runner.sh"));
   assert.ok(manifest.build.asarUnpack.includes("assets/linux-appimage-runner.sh"));
   assert.equal(manifest.build.afterPack, undefined);
   assert.ok(fs.existsSync(path.join(launcherRoot, "assets", "icon.ico")));
+  assert.ok(fs.existsSync(path.join(launcherRoot, "assets", "icon.icns")));
+  assert.match(fs.readFileSync(path.join(launcherRoot, "assets", "icon.svg"), "utf8"), /M276 350/);
+  assert.doesNotMatch(fs.readFileSync(path.join(launcherRoot, "assets", "icon.svg"), "utf8"), /22\.2819|4\.9807/);
   assert.equal(manifest.build.nsis.oneClick, false);
   assert.equal(manifest.build.nsis.perMachine, false);
   assert.equal(manifest.build.nsis.allowElevation, false);
