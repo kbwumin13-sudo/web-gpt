@@ -685,6 +685,9 @@ export function compileChatGptWebPrompt(
   const outputControlContract = parsed._compactionRequest
   ? []
   : [
+    ...(!parsed.options.outputFormat ? [
+      "When delivering local artifacts of any file type (PDF, Word, spreadsheets, presentations, images, audio, video, archives, code, or other files), use clickable Markdown links: [descriptive name](/absolute/path/to/file). Use the actual absolute local path established by task context or tool results. For paths containing spaces or parentheses, use [descriptive name](</absolute/path/to/My Report.pdf>). Do not wrap the link or its label in backticks, and do not use file:// or a bare path as the delivery link. Never invent a local path or relabel a ChatGPT sandbox download as a local file; a remote-only artifact needs its real accessible download URL until it has been saved locally. Respect any explicit user output-format requirement.",
+    ] : []),
     ...(parsed.options.verbosity === "low"
       ? ["Codex requested low response verbosity. Keep the final user-facing answer concise and direct while still satisfying every explicit requirement."]
       : parsed.options.verbosity === "medium"

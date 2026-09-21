@@ -21,6 +21,17 @@ turndown.addRule("removeSvg", {
   filter: node => node.nodeName === "SVG",
   replacement: () => "",
 });
+// Preserve local artifact destinations across DOM extraction, including spaces and parentheses.
+turndown.addRule("localArtifactLinks", {
+  filter: node => node.nodeName === "A"
+    && /^\/(?!\/)/.test((node as HTMLElement).getAttribute("href") ?? ""),
+  replacement: (content, node) => {
+    const target = (node as HTMLElement).getAttribute("href")!
+      .replaceAll("<", "%3C").replaceAll(">", "%3E")
+      .replaceAll("\n", "%0A").replaceAll("\r", "%0D");
+    return `[${content}](<${target}>)`;
+  },
+});
 turndown.addRule("linkInlineFilePaths", {
   filter: node => inlineFilePath(node) !== undefined,
   replacement: (_content, node) => {

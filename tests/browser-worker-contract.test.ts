@@ -831,7 +831,11 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
     last() { return this; },
     isVisible: async () => false,
   };
-  const assistantLocator = { id: "assistant-turn" };
+  const assistantLocator = {
+    id: "assistant-turn",
+    getByText: () => hiddenLocator,
+    getByTestId: () => hiddenLocator,
+  };
   const makePage = (name: string) => ({
     name,
     isClosed: () => false,

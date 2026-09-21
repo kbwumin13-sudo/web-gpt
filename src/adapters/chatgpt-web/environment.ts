@@ -288,11 +288,27 @@ export function isChatGptCompactionContinuation(parsed: CodexParsedRequest): boo
 
 /** Parse a claim only: the caller must compare it with this turn's native rollout authority. */
 export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
+  return extractChatGptEnvironmentClaim(parsed);
+}
+
+/** Native skill expansion appends its instruction as the final user message. */
+export function hasChatGptSkillExpansion(parsed: CodexParsedRequest): boolean {
+  const input = record(parsed._rawBody)?.input;
+  const last = Array.isArray(input)
+    ? record(input.findLast(value => record(value)?.type === "message" && record(value)?.role === "user"))
+    : undefined;
+  return last?.type === "message" && last.role === "user"
+    && /^<skill(?:\s|>)[\s\S]*<\/skill>$/.test(rawMessageText(last).trim());
+}
+
+/** Unattributed input is a claim, never authority; authenticate it against the exact native turn. */
+export function extractChatGptEnvironmentClaim(parsed: CodexParsedRequest, allowUnattributed = false): ChatGptTurnEnvironment {
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const body = record(parsed._rawBody);
   const updates = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
     const item = record(value);
-    if (item?.type !== "message" || item.role !== "user" || itemTurnId(item) !== turnId
+    if (item?.type !== "message" || item.role !== "user"
+      || (itemTurnId(item) !== turnId && !(allowUnattributed && itemTurnId(item) === undefined))
       || typeof item.id !== "string" || !item.id) return [];
     // Native compaction groups plugins, instructions and environment into sibling content parts.
     // Read the environment part without treating the surrounding preamble as part of its XML.

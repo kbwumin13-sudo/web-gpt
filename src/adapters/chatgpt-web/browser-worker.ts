@@ -1493,6 +1493,7 @@ export class ChatGptTurnDomHealthTracker {
   private missingResponseSince?: number;
   private emptyCompletionSince?: number;
   private emptyPostToolAnswerSince?: number;
+  private lastReasoningText?: string;
   private missingCompletionAction?: { text: string; since: number };
 
   constructor(
@@ -1520,6 +1521,7 @@ export class ChatGptTurnDomHealthTracker {
     completionActionVisible: boolean;
     externalProgressLive?: boolean;
     postToolAnswerExpected?: boolean;
+    reasoningText?: string;
   }, now = Date.now()): string | undefined {
     if (state.responsePresent) this.sawResponse = true;
     if (state.externalProgressLive) {
@@ -1555,6 +1557,11 @@ export class ChatGptTurnDomHealthTracker {
       }
     }
 
+    // Semantic reasoning changes prove forward progress; a spinner alone does not.
+    if (state.reasoningText && state.reasoningText !== this.lastReasoningText) {
+      this.emptyPostToolAnswerSince = undefined;
+    }
+    this.lastReasoningText = state.reasoningText;
     const emptyPostToolAnswer = state.postToolAnswerExpected === true
       && state.responsePresent
       && state.currentText.length === 0
@@ -2901,6 +2908,15 @@ export class ChatGptBrowserWorker {
         );
       } catch (error) {
         const latestProgress = externalProgress?.snapshot();
+        if (error instanceof ChatGptBrowserObservationTimeoutError && !recoverObservation) {
+          if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+          recoveryAttempts += 1;
+          if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) throw error;
+          // Managed Chrome has no Launcher rebind callback. Re-read this accepted message,
+          // without navigating, resending, or charging a transient probe to turn retries.
+          await withBrowserTurnAbort(new Promise(resolve => setTimeout(resolve, 250)), signal);
+          continue;
+        }
         if (error instanceof ChatGptBrowserObservationTimeoutError && recoverObservation) {
           recoveryAttempts += 1;
           if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
@@ -2946,6 +2962,11 @@ export class ChatGptBrowserWorker {
             {},
           )).visibleText
           : "";
+        // The first rendered assistant can already be an error. Releasing its boundary would
+        // dispatch native work before the main loop notices the failed response.
+        if (identity) await throwIfChatGptTerminalErrorAlert(
+          observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+        );
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
       }
@@ -3452,7 +3473,14 @@ export class ChatGptBrowserWorker {
         );
         return evidence;
       } catch (error) {
-        if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !recoverObservation) throw error;
+        if (abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+        if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
+        if (!recoverObservation) {
+          recoveryAttempts += 1;
+          if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) throw error;
+          await withBrowserTurnAbort(new Promise(resolve => setTimeout(resolve, 250)), abortSignal);
+          continue;
+        }
         recoveryAttempts += 1;
         if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
           throw new Error(
@@ -5138,8 +5166,15 @@ export class ChatGptBrowserWorker {
               snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
             }
           } catch (error) {
-            if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !launcherSurfaceId) throw error;
+            if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
             consecutiveObservationRebinds += 1;
+            if (!launcherSurfaceId) {
+              if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) throw error;
+              responseDomCache.key = undefined;
+              responseDomCache.snapshot = undefined;
+              await withBrowserTurnAbort(new Promise(resolve => setTimeout(resolve, 250)), turn.abortSignal);
+              continue;
+            }
             if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
               throw new Error(
                 `ChatGPT browser DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
@@ -5182,6 +5217,8 @@ export class ChatGptBrowserWorker {
         if (turn.externalProgress
           && externalProgressSnapshot
           && completionTracker.needsToolBatchObservation(externalProgressSnapshot.lastToolBatchRevision)) {
+          // The response may have failed while its DOM snapshot was being read or rebound.
+          await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
           completionTracker.observeToolBatch(
             externalProgressSnapshot.lastToolBatchRevision,
             snapshot.visibleText,
@@ -5231,6 +5268,7 @@ export class ChatGptBrowserWorker {
             completionActionVisible: snapshot.completionActionVisible,
             externalProgressLive,
             postToolAnswerExpected,
+            reasoningText: snapshot.traceBlocks.map(block => block.text).join("\n"),
           });
           if (domError) {
             if (await continueAfterStoppedTurn(

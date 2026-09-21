@@ -27,6 +27,16 @@ function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexP
   };
 }
 
+test("all ordinary prompt paths request local artifact links regardless of file type", () => {
+  const capabilities = { localToolsEnabled: true, solAvailable: true, proAvailable: true };
+  for (const options of [undefined, { retainedResume: true }, { bootstrapContract: true }] as const) {
+    const compiled = compileChatGptWebPrompt(request("high"), capabilities, "turn_12345678901234567890123456789012", options);
+    expect(compiled.text).toContain("local artifacts of any file type");
+    expect(compiled.text).toContain("[descriptive name](</absolute/path/to/My Report.pdf>)");
+    expect(compiled.text).toContain("Never invent a local path");
+  }
+});
+
 test("Full-mode Pro prompts pass one stable turn token directly to native actions", () => {
   const token = "turn_12345678901234567890123456789012";
   const parsed = request("max");

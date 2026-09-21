@@ -5,10 +5,11 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Page, Locator } from "playwright-core";
 import { buildResponseJSON } from "../src/bridge";
 import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, throwIfChatGptTerminalErrorAlert, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptCapabilityTelemetrySnapshot } from "../src/adapters/chatgpt-web/capability-telemetry";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
@@ -3675,6 +3676,75 @@ describe("ChatGPT outer-native harness v4", () => {
       if (timedOutToken) broker.revoke(timedOutToken);
       if (replacementToken) broker.revoke(replacementToken);
       await broker.close();
+    }
+  }, 10_000);
+
+  test("a terminal first assistant observation cannot emit a pending native tool", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-terminal-first-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://terminal-first-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, ...toolCapabilities },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    const hidden = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
+    const visible = { last() { return this; }, isVisible: async () => true };
+    const failedAssistant = { getByText: () => visible, getByTestId: () => hidden };
+    const page = {
+      isClosed: () => false,
+      locator: (selector: string) => selector.startsWith("[data-turn-id=") ? failedAssistant : hidden,
+    } as unknown as Page;
+    const observer = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      submissionDomState: async () => ({ turnIdentities: ["current"], userIdentities: [], responseIdentities: ["current"] }),
+      responseDomSnapshot: async () => ({ visibleText: "Something went wrong. Please see help.openai.com." }),
+    }) as {
+      waitForNewAssistantTurn(...args: unknown[]): Promise<{ locator: Locator }>;
+    };
+    let invocationOutcome: Promise<unknown> | undefined;
+    let finished!: () => void;
+    const browserFinished = new Promise<void>(resolve => { finished = resolve; });
+    worker.run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("missing test turn token");
+        turn.onSubmitted?.();
+        const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+        invocationOutcome = callTurnBroker(socketPath, {
+          method: "invoke", bindingId: claimed.bindingId, wireName: "exec_command",
+          arguments: { cmd: "must not run after terminal observation" },
+        }, null).catch(error => error);
+        const progress = turn.externalProgress!;
+        let snapshot = progress.snapshot();
+        while (snapshot.lastToolBatchRevision === 0) snapshot = await progress.waitForChange(snapshot.revision);
+        const binding = await observer.waitForNewAssistantTurn(
+          page, { initialTurnIdentities: [], domCache: {} }, undefined, undefined,
+          progress, 60_000, new ChatGptCompletionTracker(),
+        );
+        // Diagnostic capture yields between acquiring the assistant and the main loop's check.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        await throwIfChatGptTerminalErrorAlert(binding.locator);
+        throw new Error("terminal response was accepted");
+      } finally {
+        prepared.release();
+        finished();
+      }
+    };
+    const events: AdapterEvent[] = [];
+    try {
+      await createChatGptWebAdapter(provider, { broker }).runTurn!(
+        rawWireRequest(environmentXml), { headers: new Headers() }, event => events.push(event),
+      );
+      await browserFinished;
+      expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "upstream_server_error" });
+    } finally {
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
+      await broker.close();
+      await invocationOutcome;
     }
   }, 10_000);
 

@@ -1,6 +1,16 @@
 import { expect, test } from "bun:test";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
 
+test("preserves local artifact links of every type with spaces and parentheses", () => {
+  for (const name of ["报告.pdf", "文档.docx", "表格.xlsx", "幻灯片.pptx", "图片.png", "音频.mp3", "视频.mp4", "归档.zip", "脚本.py", "LICENSE"]) {
+    const path = `/Users/example/My Outputs (final)/${name}`;
+    expect(chatGptHtmlToMarkdown(`<p><a href="${path}">${name}</a></p>`))
+      .toBe(`[${name}](<${path}>)`);
+  }
+  expect(chatGptHtmlToMarkdown('<a href="https://example.com/report.pdf">下载</a>'))
+    .toBe('[下载](https://example.com/report.pdf)');
+});
+
 test("turns observed inline file path formats into Markdown links", () => {
   const cases = [
     {
