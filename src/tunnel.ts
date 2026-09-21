@@ -314,7 +314,29 @@ export interface TunnelRuntimeStatus {
   healthy: boolean;
   ready: boolean;
   state?: string;
+  /**
+   * Whether the runtime is still reaching the OpenAI control plane.
+   *
+   * `healthy` and `ready` describe the runtime's own loopback endpoints, which keep answering while
+   * the control-plane poll fails: the process is alive and listening, and the tunnel is no longer
+   * registered upstream. A turn then reaches ChatGPT, finds the connector unroutable, and reports a
+   * terminated session, while this check says the tunnel is fine. `tunnel-client` separates the two,
+   * so the distinction is read from it rather than inferred.
+   */
+  controlPlane?: { state: string; reason?: string };
   detail: string;
+}
+
+/** States `tunnel-client` reports when its control-plane poll is failing rather than merely unobserved. */
+const FAILING_CONTROL_PLANE_STATES = new Set(["unhealthy", "failing", "degraded", "error", "down"]);
+
+function controlPlanePollHealth(parsed: Record<string, unknown>): { state: string; reason?: string } | undefined {
+  const direct = nestedRecord(parsed, "control_plane_poll_health")
+    ?? nestedRecord(nestedRecord(parsed, "local"), "control_plane_poll_health");
+  const state = direct?.state;
+  if (typeof state !== "string" || state.length === 0) return undefined;
+  const reason = direct?.reason;
+  return { state, ...(typeof reason === "string" && reason.trim() ? { reason: reason.trim() } : {}) };
 }
 
 function loopbackHealthBaseUrl(value: string): string | undefined {
@@ -485,19 +507,35 @@ export function parseTunnelStatus(output: string, exitStatus = 0): TunnelRuntime
       : [];
     const explicitError = typeof parsed.error === "string" && parsed.error ? parsed.error : undefined;
     const logTail = runtimeLogTail(parsed);
-    const ok = processRunning && healthy && ready;
+    const controlPlane = controlPlanePollHealth(parsed);
+    // A failing control-plane poll leaves the loopback endpoints answering, so it has to veto the
+    // verdict rather than be reported alongside a healthy one.
+    const controlPlaneFailing = controlPlane !== undefined && FAILING_CONTROL_PLANE_STATES.has(controlPlane.state.toLowerCase());
+    const ok = processRunning && healthy && ready && !controlPlaneFailing;
+    const controlPlaneDetail = controlPlane
+      ? `control_plane_poll=${controlPlane.state}${controlPlane.reason ? ` (${controlPlane.reason})` : ""}`
+      : "control_plane_poll=unreported";
     const detail = ok
-      ? "process_running=true healthy=true ready=true"
+      ? `process_running=true healthy=true ready=true; ${controlPlaneDetail}`
       : safeTunnelDetail([
         `process_running=${processRunning}`,
         `healthy=${healthy}`,
         `ready=${ready}`,
         ...(state ? [`state=${state}`] : []),
+        controlPlaneDetail,
         ...(explicitError ? [explicitError] : []),
         ...issues,
         ...(logTail ? [`runtime_log=${logTail}`] : []),
       ].join("; "));
-    return { ok, processRunning, healthy, ready, ...(state ? { state } : {}), detail };
+    return {
+      ok,
+      processRunning,
+      healthy,
+      ready,
+      ...(state ? { state } : {}),
+      ...(controlPlane ? { controlPlane } : {}),
+      detail,
+    };
   } catch {
     return { ok: false, processRunning: false, healthy: false, ready: false, detail: `tunnel-client returned non-JSON status: ${safeTunnelDetail(output)}` };
   }

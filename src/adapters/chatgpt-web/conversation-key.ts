@@ -70,6 +70,16 @@ function componentFingerprint(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value ?? null)).digest("hex").slice(0, 12);
 }
 
+/**
+ * Stable fingerprint of the native compaction epoch a request belongs to. A compaction boundary
+ * ends one ChatGPT conversation and opens another, so anything scoped to a single conversation —
+ * the retained key, and the per-turn retry budget — has to rotate with it.
+ */
+export function chatGptCompactionEpochFingerprint(parsed: CodexParsedRequest): string {
+  const raw = parsed._rawBody as { input?: unknown[] } | undefined;
+  return componentFingerprint(compactionEpoch(raw?.input));
+}
+
 /** One fingerprint per key component, so a retained miss can name what actually rotated. */
 export interface ChatGptConversationKeyComponents {
   threadId: string;
@@ -84,13 +94,12 @@ export function chatGptConversationKeyComponents(
 ): ChatGptConversationKeyComponents | undefined {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId) return undefined;
-  const raw = parsed._rawBody as { input?: unknown[] } | undefined;
   return {
     threadId: identity.threadId,
     model: componentFingerprint(parsed.modelId),
     reasoning: componentFingerprint(parsed.options.reasoning),
     systemPrompt: componentFingerprint(parsed.context.systemPrompt ?? []),
-    compaction: componentFingerprint(compactionEpoch(raw?.input)),
+    compaction: chatGptCompactionEpochFingerprint(parsed),
   };
 }
 

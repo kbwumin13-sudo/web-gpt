@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
 import {
   atomicWriteFile,
@@ -83,6 +83,9 @@ import {
   chatGptStoppedThinkingError,
 } from "./adapter-error";
 import { isChatGptRetainedTurnRetryCandidate } from "./recovery-policy";
+import { chatGptNetworkError, withChatGptServerStatement, withoutPlaywrightCallLog } from "./network-error";
+import { chatGptContextLog, recordChatGptContextOmitted } from "./context-telemetry";
+import { ChatGptWireShadowSession, chatGptWireShadowLog, type ChatGptWireShadowResult } from "./wire/shadow-observer";
 import {
   ChatGptLunaCheckpointStream,
   type CapturedChatGptLunaCheckpoint,
@@ -1490,6 +1493,7 @@ export class ChatGptTurnDomHealthTracker {
   private missingResponseSince?: number;
   private emptyCompletionSince?: number;
   private emptyPostToolAnswerSince?: number;
+  private lastReasoningText?: string;
   private missingCompletionAction?: { text: string; since: number };
 
   constructor(
@@ -1517,6 +1521,7 @@ export class ChatGptTurnDomHealthTracker {
     completionActionVisible: boolean;
     externalProgressLive?: boolean;
     postToolAnswerExpected?: boolean;
+    reasoningText?: string;
   }, now = Date.now()): string | undefined {
     if (state.responsePresent) this.sawResponse = true;
     if (state.externalProgressLive) {
@@ -1552,6 +1557,11 @@ export class ChatGptTurnDomHealthTracker {
       }
     }
 
+    // Semantic reasoning changes prove forward progress; a spinner alone does not.
+    if (state.reasoningText && state.reasoningText !== this.lastReasoningText) {
+      this.emptyPostToolAnswerSince = undefined;
+    }
+    this.lastReasoningText = state.reasoningText;
     const emptyPostToolAnswer = state.postToolAnswerExpected === true
       && state.responsePresent
       && state.currentText.length === 0
@@ -2164,6 +2174,8 @@ export class ChatGptBrowserWorker {
   private context?: BrowserContext;
   private page?: Page;
   private managedBrowserReady?: Promise<{ browser: Browser; context: BrowserContext }>;
+  /** Retained automatic conversations are scoped by the Runtime-derived conversation key. */
+  private readonly managedRetainedPages = new Map<string, Page>();
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
@@ -2289,10 +2301,18 @@ export class ChatGptBrowserWorker {
     this.context = undefined;
     this.page = undefined;
     this.managedBrowserReady = undefined;
+    this.managedRetainedPages.clear();
     // For connectOverCDP, Playwright implements Browser.close as a transport disconnect; it does
     // not close the launcher-owned Electron process. Always release that connection and its
     // artifact directory instead of leaking one per timeout/helper lifecycle.
     if (browser) await browser.close();
+  }
+
+  /** Retire one automatic retained conversation without affecting unrelated task tabs. */
+  async releaseRetainedConversation(conversationKey: string): Promise<void> {
+    const page = this.managedRetainedPages.get(conversationKey);
+    this.managedRetainedPages.delete(conversationKey);
+    if (page && !page.isClosed()) await page.close();
   }
 
   private async runStage<T>(
@@ -2888,6 +2908,15 @@ export class ChatGptBrowserWorker {
         );
       } catch (error) {
         const latestProgress = externalProgress?.snapshot();
+        if (error instanceof ChatGptBrowserObservationTimeoutError && !recoverObservation) {
+          if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+          recoveryAttempts += 1;
+          if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) throw error;
+          // Managed Chrome has no Launcher rebind callback. Re-read this accepted message,
+          // without navigating, resending, or charging a transient probe to turn retries.
+          await withBrowserTurnAbort(new Promise(resolve => setTimeout(resolve, 250)), signal);
+          continue;
+        }
         if (error instanceof ChatGptBrowserObservationTimeoutError && recoverObservation) {
           recoveryAttempts += 1;
           if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
@@ -2933,6 +2962,11 @@ export class ChatGptBrowserWorker {
             {},
           )).visibleText
           : "";
+        // The first rendered assistant can already be an error. Releasing its boundary would
+        // dispatch native work before the main loop notices the failed response.
+        if (identity) await throwIfChatGptTerminalErrorAlert(
+          observationPage.locator(`[data-turn-id=${JSON.stringify(identity)}]`),
+        );
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
       }
@@ -2945,7 +2979,15 @@ export class ChatGptBrowserWorker {
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
         && !chatGptExternalProgressSuppressesDomHealth(progress, Date.now())) {
-        throw new Error("ChatGPT accepted the message but did not expose its assistant turn in the DOM");
+        // Names what happened rather than where it was noticed. "Did not expose its assistant turn
+        // in the DOM" describes this reader's own search, which tells the person reading it nothing
+        // they can act on — the observed state is that ChatGPT took the message and started
+        // generating while its page rendered no conversation at all.
+        throw new ChatGptWebAdapterError(
+          "ChatGPT accepted the message and began generating, but its page never rendered the reply."
+          + " This is a ChatGPT page problem rather than a bridge one, and it usually clears on a retry.",
+          { status: 502, errorType: "server_error", code: "chatgpt_page_never_rendered", retryable: true },
+        );
       }
       await this.waitForTurnDomOrExternalProgress(
         observationPage,
@@ -3431,7 +3473,14 @@ export class ChatGptBrowserWorker {
         );
         return evidence;
       } catch (error) {
-        if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !recoverObservation) throw error;
+        if (abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+        if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
+        if (!recoverObservation) {
+          recoveryAttempts += 1;
+          if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) throw error;
+          await withBrowserTurnAbort(new Promise(resolve => setTimeout(resolve, 250)), abortSignal);
+          continue;
+        }
         recoveryAttempts += 1;
         if (recoveryAttempts > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
           throw new Error(
@@ -4290,7 +4339,15 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (this.config.browserHost !== "launcher") {
+      const retained = turn.conversationKey ? this.managedRetainedPages.get(turn.conversationKey) : undefined;
+      if (retained?.isClosed()) this.managedRetainedPages.delete(turn.conversationKey!);
+      const reused = retained !== undefined && !retained.isClosed();
+      if (turn.requireRetainedConversation && !reused) throw chatGptRetainedConversationUnavailableError();
+      if (reused && !turn.prepareResume) throw new Error("Managed Chrome reused a ChatGPT conversation without a continuation prompt");
+      await turn.onPreparedSelected?.(reused);
+      return this.runBrowserTurn(turn, undefined, retained, reused, reused || turn.retainConversation === true);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",
@@ -4393,6 +4450,7 @@ export class ChatGptBrowserWorker {
     launcherSurfaceId?: string,
     maintenancePage?: Page,
     reuseConversation = false,
+    managedRetentionEnabled = false,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
@@ -4411,14 +4469,28 @@ export class ChatGptBrowserWorker {
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
     const prepared = await prepare();
-    const diagnostics = new ChatGptBrowserDiagnostics(
-      turn.traceId,
-      this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
-      this.config.appName,
-    );
+    const diagnosticsRoot = this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns");
+    const diagnostics = new ChatGptBrowserDiagnostics(turn.traceId, diagnosticsRoot, this.config.appName);
+    // Watches the same turn over ChatGPT's own transport. It has one power over the outcome, and
+    // only in the direction of recovery: when the DOM reads no answer at all — the silent failure
+    // this layer was built to catch — a complete wire reading is returned in its place. Every turn
+    // where the DOM produced text is decided exactly as before.
+    const wireShadow = new ChatGptWireShadowSession(turn.traceId, join(dirname(diagnosticsRoot), "wire-transcripts"));
+    const concludeWireShadow = (answer: string, failed: boolean): ChatGptWireShadowResult => {
+      const result = wireShadow.conclude({ answer, failed });
+      if (result.comparison !== "not_observed") console.info(chatGptWireShadowLog(turn.traceId, result));
+      if (result.rescuedAnswer !== undefined) {
+        console.info(
+          `[chatgpt-web] browser turn ${turn.traceId} answered from the observed stream`
+          + ` because the page read none (chars=${result.rescuedAnswer.length})`,
+        );
+      }
+      return result;
+    };
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
     let diagnosticPage: Page | undefined;
+    let retainManagedPage = false;
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const multipartTransactionId = prepared.multipart
@@ -4512,6 +4584,12 @@ export class ChatGptBrowserWorker {
       });
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
+      // A managed turn page is created blank and navigated afterwards, so the observer is in place
+      // before the first conversation request. A launcher page is already navigated and is covered
+      // from its next navigation onward.
+      await wireShadow.attach(page, message => console.info(
+        `[chatgpt-web] wire shadow trace=${turn.traceId} not attached: ${redactChatGptUiDiagnostic(message)}`,
+      ));
       const rebindLauncherPage = async (
         attempt: number,
         cause: Error,
@@ -4617,8 +4695,11 @@ export class ChatGptBrowserWorker {
         && this.config.browserHostDescriptorPath !== undefined;
       await diagnostics.capture(page, "browser-page-acquired");
       console.info(
-        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
+        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0}, omittedRecords=${prepared.omittedRecords ?? 0})`,
       );
+      // The compact packet is a bet that the model reads what it was not sent. Recording the size
+      // of the bet here is what lets `omitted_without_retrieval` say whether it is paying off.
+      recordChatGptContextOmitted(turn.traceId, prepared.omittedRecords ?? 0);
       if (multipartStages) {
         console.info(
           `[chatgpt-web] browser turn ${turn.traceId} multipart staging effort=${stagingMode.effort}`
@@ -5085,8 +5166,15 @@ export class ChatGptBrowserWorker {
               snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
             }
           } catch (error) {
-            if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !launcherSurfaceId) throw error;
+            if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
             consecutiveObservationRebinds += 1;
+            if (!launcherSurfaceId) {
+              if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) throw error;
+              responseDomCache.key = undefined;
+              responseDomCache.snapshot = undefined;
+              await withBrowserTurnAbort(new Promise(resolve => setTimeout(resolve, 250)), turn.abortSignal);
+              continue;
+            }
             if (consecutiveObservationRebinds > MAX_CHATGPT_BROWSER_PAGE_REBINDS) {
               throw new Error(
                 `ChatGPT browser DOM remained unresponsive after ${MAX_CHATGPT_BROWSER_PAGE_REBINDS} same-page rebinds`,
@@ -5129,6 +5217,8 @@ export class ChatGptBrowserWorker {
         if (turn.externalProgress
           && externalProgressSnapshot
           && completionTracker.needsToolBatchObservation(externalProgressSnapshot.lastToolBatchRevision)) {
+          // The response may have failed while its DOM snapshot was being read or rebound.
+          await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
           completionTracker.observeToolBatch(
             externalProgressSnapshot.lastToolBatchRevision,
             snapshot.visibleText,
@@ -5178,6 +5268,7 @@ export class ChatGptBrowserWorker {
             completionActionVisible: snapshot.completionActionVisible,
             externalProgressLive,
             postToolAnswerExpected,
+            reasoningText: snapshot.traceBlocks.map(block => block.text).join("\n"),
           });
           if (domError) {
             if (await continueAfterStoppedTurn(
@@ -5339,6 +5430,19 @@ export class ChatGptBrowserWorker {
         `[chatgpt-web] browser turn ${turn.traceId} completed`
         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
       );
+      const contextLine = chatGptContextLog(turn.traceId);
+      if (contextLine) console.info(contextLine);
+      const wire = concludeWireShadow(finalText, false);
+      if (wire.rescuedAnswer !== undefined && finalText.length === 0) {
+        // The observer is complete enough to replace an empty DOM read. Feed it through the same
+        // append-only channel before returning so the Responses stream and terminal answer agree.
+        emitMarkdownDelta(wire.rescuedAnswer);
+        finalText = wire.rescuedAnswer;
+      }
+      if (managedRetentionEnabled && turn.conversationKey && !page.isClosed()) {
+        this.managedRetainedPages.set(turn.conversationKey, page);
+        retainManagedPage = true;
+      }
       return finalText;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError"
@@ -5349,14 +5453,44 @@ export class ChatGptBrowserWorker {
         }
         throw turn.abortSignal.reason;
       }
+      // An aborted turn says only that something cancelled it; who did, and why, is in the abort
+      // reason. Without it the log read `failed: ChatGPT web turn aborted`, which sent the reader
+      // looking for a defect in the bridge after a compaction whose caller had simply stopped
+      // waiting. The reason is reported rather than inferred: a deadline, a user cancellation and
+      // a caller that detached all abort the same signal, and guessing between them is how a log
+      // line becomes confidently wrong.
+      const abortReason = error instanceof DOMException
+        && error.name === "AbortError"
+        && turn.abortSignal?.aborted === true
+        ? turn.abortSignal.reason
+        : undefined;
+      const abortDetail = abortReason === undefined
+        ? ""
+        : ` (aborted by: ${redactChatGptUiDiagnostic(
+          abortReason instanceof Error ? `${abortReason.name}: ${abortReason.message}` : String(abortReason),
+        )})`;
       console.error(
         `[chatgpt-web] browser turn ${turn.traceId} failed:`
-        + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}`,
+        + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}${abortDetail}`,
       );
       if (diagnosticPage && !diagnosticPage.isClosed()) {
         await diagnostics.capture(diagnosticPage, "turn-failed", error);
       }
-      throw error;
+      // A failed turn is the case worth comparing most: the wire says whether ChatGPT actually
+      // failed or whether only the DOM reading of it did.
+      const observed = concludeWireShadow("", true);
+      // A transport failure is about the network path, not about this bridge. Saying so — and
+      // dropping Playwright's call log, which describes its own waiting loop rather than the
+      // failure — is the difference between an actionable message and a stack trace.
+      const reported = chatGptNetworkError(error) ?? withoutPlaywrightCallLog(error);
+      // When the stream carried a reason, ChatGPT's own words lead. The page can see that the
+      // surface is unusable but not why, and a capacity limit read as an expired login sends the
+      // reader to log in again for nothing.
+      if (managedRetentionEnabled && turn.conversationKey
+        && !(error instanceof ChatGptCompactionHandoffAccepted)) {
+        await this.releaseRetainedConversation(turn.conversationKey).catch(() => {});
+      }
+      throw withChatGptServerStatement(reported, observed.serverError);
     } finally {
       prepared.release();
       if (turnConnection) {
@@ -5365,7 +5499,7 @@ export class ChatGptBrowserWorker {
             `[chatgpt-web] failed to release launcher browser connection for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
           );
         });
-      } else if (managedPage && !managedPage.isClosed()) {
+      } else if (managedPage && !managedPage.isClosed() && !retainManagedPage) {
         await managedPage.close().catch(error => {
           console.error(
             `[chatgpt-web] failed to close managed browser tab for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,

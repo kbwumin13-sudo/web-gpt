@@ -1,5 +1,6 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { getGatewayServiceStatus, getServiceStatus } from "../src/service";
 import { getCodexConfigPath, inspectCodexIntegration } from "../src/codex-integration";
 import { loadConfig } from "../src/config";
@@ -128,6 +129,18 @@ async function main(): Promise<void> {
   const liveLuna = process.argv.includes("--live-luna");
   const liveWeb = process.argv.includes("--live-web");
   const liveHigh = process.argv.includes("--live-high");
+  const liveWorkspaceTask = process.argv.includes("--live-workspace-task");
+  if (liveWorkspaceTask && !liveHigh) {
+    throw new Error("--live-workspace-task requires --live-high so the tool-capable task uses the High route");
+  }
+  // The default prompt answers in two characters, which never keeps a response stream open long
+  // enough to reach ChatGPT's `stream_handoff`. That path stayed uncovered until a real task hit
+  // it, so the harness has to be able to ask for a long answer.
+  const promptFlag = process.argv.indexOf("--prompt");
+  const prompt = promptFlag >= 0 ? process.argv[promptFlag + 1] : undefined;
+  if (promptFlag >= 0 && (prompt === undefined || prompt.startsWith("--"))) {
+    throw new Error("--prompt requires a value");
+  }
   const config = loadConfig();
   if (config.browserHost === "launcher") throw new Error("Installed native gateway acceptance requires managed-chrome setup");
   if (config.nativeGatewayPort === config.port) throw new Error("Native gateway and Web backend ports are not isolated");
@@ -160,18 +173,22 @@ async function main(): Promise<void> {
     let liveTurn: Record<string, unknown> | undefined;
     if (liveLuna || liveWeb || liveHigh) {
       const liveModel = liveLuna ? "gpt-5.6-luna" : liveHigh ? "chatgpt-web/high" : "chatgpt-web/light";
+      const workspace = liveWorkspaceTask ? mkdtempSync(join(tmpdir(), "codex-chatgpt-web-live-task-")) : process.cwd();
+      if (liveWorkspaceTask) writeFileSync(join(workspace, "input.txt"), "alpha\n", { mode: 0o600 });
       const started = await client.request("thread/start", {
-        cwd: process.cwd(),
+        cwd: workspace,
         model: liveModel,
         approvalPolicy: "never",
-        sandbox: "read-only",
+        sandbox: liveWorkspaceTask ? "workspace-write" : "read-only",
         ephemeral: true,
       }) as { thread?: { id?: unknown } };
       const threadId = started.thread?.id;
       if (typeof threadId !== "string") throw new Error("thread/start returned no Luna thread id");
       const turnStarted = await client.request("turn/start", {
         threadId,
-        input: [{ type: "text", text: "Reply with OK only." }],
+        input: [{ type: "text", text: prompt ?? (liveWorkspaceTask
+          ? "Read input.txt. Create result.txt containing exactly `alpha: verified` followed by one newline. Then run a command that reads result.txt to verify it. Finish only after the command succeeds."
+          : "Reply with OK only.") }],
       }) as { turn?: { id?: unknown } };
       const turnId = turnStarted.turn?.id;
       if (typeof turnId !== "string") throw new Error("turn/start returned no Luna turn id");
@@ -184,7 +201,27 @@ async function main(): Promise<void> {
         const turn = (completed as RpcMessage & { params?: { turn?: Record<string, unknown> } }).params?.turn;
         throw new Error(`${liveModel} turn completed with status ${String(status ?? "unknown")}: ${JSON.stringify(turn ?? {})}`);
       }
-      liveTurn = { model: liveModel, thread_id: threadId, turn_id: turnId, status, notification: completed.method };
+      const workspaceResult = liveWorkspaceTask
+        ? (() => {
+          try {
+            const actual = readFileSync(join(workspace, "result.txt"), "utf8");
+            if (actual !== "alpha: verified\n") {
+              throw new Error(`workspace task wrote unexpected result.txt: ${JSON.stringify(actual)}`);
+            }
+            return { verified: true };
+          } finally {
+            rmSync(workspace, { recursive: true, force: true });
+          }
+        })()
+        : undefined;
+      liveTurn = {
+        model: liveModel,
+        thread_id: threadId,
+        turn_id: turnId,
+        status,
+        notification: completed.method,
+        ...(workspaceResult ? { workspace_task: workspaceResult } : {}),
+      };
     }
     const backendService = getServiceStatus();
     const gatewayService = getGatewayServiceStatus();

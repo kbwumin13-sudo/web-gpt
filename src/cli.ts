@@ -30,6 +30,8 @@ import { assertServiceIdle, cancelActiveTurns, getGatewayServiceStatus, getServi
 import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions } from "./setup";
 import { installRuntimeKeyBytes, managedRuntimeKeyPath, readerMcpCommand, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
+import { buildProvenance, describeBuild } from "./build-provenance";
+import { formatWireReplay, readWireCapture } from "./adapters/chatgpt-web/wire/replay";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
 import { authorizeReaderProject, listReaderProjects, revokeReaderProject } from "./reader";
@@ -47,6 +49,7 @@ Usage:
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web subagents <status|compatibility-v1|native>
   codex-chatgpt-web browser check
+  codex-chatgpt-web wire replay PATH
   codex-chatgpt-web dev launcher
   codex-chatgpt-web dev status [--json]
   codex-chatgpt-web dev setup <--browser-only|--full> [options]
@@ -94,6 +97,7 @@ Global:
   --home PATH                  Override ~/.codex-chatgpt-web
   -h, --help
   -v, --version
+  --build                      Report the commit and build this executable came from
 `;
 
 function takeOption(args: string[], name: string): string | undefined {
@@ -750,7 +754,13 @@ async function main(): Promise<void> {
     return;
   }
   if (takeFlag(args, "--version") || takeFlag(args, "-v")) {
+    // The Launcher compares this against its own version for an exact match, so it stays bare.
+    // Build identity is reported by --build.
     stdout.write(`${VERSION}\n`);
+    return;
+  }
+  if (takeFlag(args, "--build")) {
+    stdout.write(`${describeBuild(buildProvenance())}\n`);
     return;
   }
   const command = args.shift() ?? "help";
@@ -781,6 +791,15 @@ async function main(): Promise<void> {
       await checkBrowserEngine(config);
       stdout.write("Playwright can launch the configured Chrome executable.\n");
     }
+  } else if (command === "wire") {
+    const action = args.shift();
+    if (action !== "replay") throw new Error("Wire command must be: wire replay PATH");
+    const path = args.shift();
+    if (!path) throw new Error("Wire replay requires the path of a recorded transcript or event-stream capture");
+    assertNoArgs(args);
+    // Replaying recorded bytes through the production fold is what makes a live failure
+    // reproducible offline instead of only describable.
+    stdout.write(formatWireReplay(readWireCapture(path)));
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();

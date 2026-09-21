@@ -335,7 +335,21 @@ been set, so the numbers describe the system without yet arguing about it.
 declared as `codex_context_search/read`, and memory retrieval is now resolved from the turn's own
 registry and named in the prompt by exact wire name. The model no longer has to discover whether
 retrieval exists, and a turn without it is told so rather than left to read an empty search as an
-empty memory. Neither change touches the Native2 public ABI.
+empty memory.
+
+Runtime history retrieval has since become two registered connector tools rather than two names
+dispatched inside `codex_tool_call`. Naming a capability tells the model it exists; attaching it is
+what puts its arguments in front of the model, which through the generic wrapper it could only get
+by running an inventory call first — and an inventory call costs an outer command execution. The two
+are also the one bridge capability with no external effect, and they can now say so: declared
+read-only and non-destructive, instead of inheriting `codex_tool_call`'s open-world annotations.
+
+This is the first change that does touch the Native2 public ABI, and the cost is the one the ABI
+was pinned for: ChatGPT caches a connector's tool list under its identity, so a conversation on the
+existing connector will not see the new tools. The `codex_tool_call` path stays for them and the
+prompt names both, so nothing regresses — but the benefit only reaches a conversation whose
+connector was created after the change. Making it reach the rest is a connector identity migration,
+which is a separate decision and not one this change makes.
 
 The bridge still cannot conjure a capability the Runtime never registered, and pretending otherwise
 would be the wrong fix. What it can do is refuse to let the dependency be silent: retrieval
@@ -349,6 +363,16 @@ task message plus the retrieval contract; system/developer/history records stay 
 remaining work is to add the smallest safe task identity and memory digest, and to prove live Web
 behavior retrieves omitted records before acting. Compaction/new epochs deliberately retain complete
 snapshots until that live evidence exists.
+
+The live evidence needed here is about retrieval working, not retrieval happening, and the two were
+being conflated. The failure that prompted this — a model that searched, matched nothing, and
+answered from the filesystem about the wrong books — would have counted as a turn that retrieved.
+Two things changed as a result. Search now scores records against the query's terms instead of
+requiring one record to contain the whole query, which is what made a correctly-asked question
+return nothing; and a search that still matches nothing says so rather than returning a result
+shaped like an empty history. `search_zero_matches` and `search_without_followup_read` are reported
+next to the existing counts, so a retrieval that ran and found nothing is no longer filed as a
+retrieval that worked.
 
 The normal Full path now has the intended shape; live logged-in verification and retained-hit
 aggregation remain before the giant envelope can be treated as an exceptional path in production.

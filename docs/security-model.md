@@ -97,6 +97,25 @@ ChatGPT DOM and labels are not a stable API. Selectors are narrow; Full-mode com
 stable completed-turn evidence and, after tools, a new final-answer projection. UI drift fails the
 turn; it never chooses another model, starts another transport, or returns a fabricated success.
 
+### Page-side wire observation
+
+The observer added to read ChatGPT's own conversation stream does not widen the account-facing
+surface: it wraps `fetch` inside the page and passes the response through unchanged, so every
+request is still built and sent by ChatGPT's client. No request is synthesised, no header or token
+is constructed, and no endpoint is called that the page was not already calling. A `TransformStream`
+is used rather than `clone()` or `tee()`, so no second consumer exists to alter timing.
+
+It does add one inbound edge: the page can call a host binding. That edge is treated as untrusted.
+Every record is validated field by field against the accepted shape, with bounded identifier, URL,
+and message lengths; anything else is refused and counted, never stored or acted on. Records accepted
+from one page are capped, and retained stream state is bounded in both size and count, so a page
+cannot grow this process. A refused or failed tap degrades to no observation and never to a failed
+turn, because the observer holds no authority over turn outcomes.
+
+Transcripts recorded from that stream are verbatim conversation content. They are off unless
+`CODEX_CHATGPT_WEB_WIRE_TRANSCRIPTS=1`, written owner-only, pruned to a bounded window, and never
+part of the safe log export. The always-on counters carry frame shapes and lengths, not text.
+
 ### Login-state isolation
 
 The backend keeps ChatGPT login and automatic model turns in one private managed Chrome profile.

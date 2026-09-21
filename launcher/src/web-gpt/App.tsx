@@ -91,15 +91,11 @@ function Onboarding({ copy, setError, snapshot, updateState }: {
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
 }) {
-  const [stage, setStage] = useState<0 | 1 | 2>(snapshot.state.language ? 1 : 0);
+  const [stage, setStage] = useState<0 | 1>(snapshot.state.language ? 1 : 0);
   const [selectedLanguage, setSelectedLanguage] = useState<Language>(snapshot.state.language ?? "en");
   const [selectedMode, setSelectedMode] = useState<BrowserInteractionMode>(snapshot.state.browserInteractionMode);
   const [busy, setBusy] = useState(false);
   const localized = copyFor(selectedLanguage);
-  const open = async (url: string) => {
-    setError(null);
-    try { await api!.openExternal(url); } catch (cause) { setError(messageOf(cause)); }
-  };
   const chooseLanguage = async () => {
     setBusy(true);
     try {
@@ -121,31 +117,23 @@ function Onboarding({ copy, setError, snapshot, updateState }: {
       </header>
       <section className="wg-welcome-stage">
         <div className="wg-welcome-mark"><BrandMark /></div>
-        <span className="wg-welcome-step">0{stage + 1} / 03</span>
-        <h1>{stage === 0 ? localized.chooseLanguage : stage === 1 ? localized.interactionMode : localized.supportTitle}</h1>
-        <p>{stage === 0 ? localized.chooseLanguageHint : stage === 1 ? localized.interactionModeBody : localized.supportBody}</p>
+        <span className="wg-welcome-step">0{stage + 1} / 02</span>
+        <h1>{stage === 0 ? localized.chooseLanguage : localized.interactionMode}</h1>
+        <p>{stage === 0 ? localized.chooseLanguageHint : localized.interactionModeBody}</p>
         {stage === 0 ? (
           <div className="wg-welcome-options" role="radiogroup" aria-label={localized.chooseLanguage}>
             <WelcomeOption active={selectedLanguage === "en"} marker="EN" label={localized.english} detail="English" onClick={() => setSelectedLanguage("en")} />
             <WelcomeOption active={selectedLanguage === "zh-CN"} marker="简" label={localized.chinese} detail="Simplified Chinese" onClick={() => setSelectedLanguage("zh-CN")} />
             <WelcomeOption active={selectedLanguage === "ja"} marker="日" label={localized.japanese} detail="日本語" onClick={() => setSelectedLanguage("ja")} />
           </div>
-        ) : stage === 1 ? (
-          <InteractionPicker copy={localized} disabled={busy} mode={selectedMode} onChange={setSelectedMode} />
         ) : (
-          <>
-            <div className="wg-welcome-links">
-              <button onClick={() => void open(snapshot.urls.github)} type="button"><Icon name="github" />{localized.project}<Icon name="external" /></button>
-              <button onClick={() => void open(DEVELOPER_URL)} type="button"><Icon name="link" />{localized.developer}<Icon name="external" /></button>
-            </div>
-            <div className="wg-notice tone-success"><Icon name="spark" /><span>{localized.tagline}</span></div>
-          </>
+          <InteractionPicker copy={localized} disabled={busy} mode={selectedMode} onChange={setSelectedMode} />
         )}
       </section>
       <footer className="wg-welcome-footer">
-        <div>{stage > 0 ? <button className="wg-text-button" disabled={busy} onClick={() => setStage((stage - 1) as 0 | 1 | 2)} type="button">{localized.previous}</button> : null}</div>
-        <div className="wg-progress" aria-label={`${stage + 1} / 3`}>{[0, 1, 2].map((index) => <span className={index < stage ? "is-complete" : index === stage ? "is-active" : ""} key={index} />)}</div>
-        <button className="wg-primary" disabled={busy} onClick={() => stage === 0 ? void chooseLanguage() : stage === 1 ? setStage(2) : void finish()} type="button">{stage === 2 ? localized.finishWelcome : localized.continue}</button>
+        <div>{stage > 0 ? <button className="wg-text-button" disabled={busy} onClick={() => setStage((stage - 1) as 0 | 1)} type="button">{localized.previous}</button> : null}</div>
+        <div className="wg-progress" aria-label={`${stage + 1} / 2`}>{[0, 1].map((index) => <span className={index < stage ? "is-complete" : index === stage ? "is-active" : ""} key={index} />)}</div>
+        <button className="wg-primary" disabled={busy} onClick={() => stage === 0 ? void chooseLanguage() : void finish()} type="button">{stage === 1 ? localized.finishWelcome : localized.continue}</button>
       </footer>
     </main>
   );
@@ -160,7 +148,7 @@ function Shell({ browser, copy, logs, operation, setError, snapshot, updateState
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
 }) {
-  const initialSurface: Surface = snapshot.state.coreSetupComplete ? "browser" : "setup";
+  const initialSurface: Surface = snapshot.state.coreSetupComplete ? "overview" : "setup";
   const [surface, setSurface] = useState<Surface>(initialSurface);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [compact, setCompact] = useState(window.matchMedia(COMPACT_QUERY).matches);
@@ -240,16 +228,15 @@ function Shell({ browser, copy, logs, operation, setError, snapshot, updateState
         {sidebarOpen ? <div className="wg-sidebar-content">
           <div className="wg-brand-row">
             <div className="wg-brand-identity"><BrandMark small /><strong>{copy.product}</strong>{dev ? <em className="wg-dev-badge">DEV</em> : null}</div>
-            <div className="wg-brand-actions">
-              <button aria-label={copy.project} className="wg-icon-button" onClick={() => void api!.openExternal(snapshot.urls.github).catch((cause) => setError(messageOf(cause)))} type="button"><Icon name="github" /></button>
-              <button aria-label={copy.developer} className="wg-icon-button" onClick={() => void api!.openExternal(DEVELOPER_URL).catch((cause) => setError(messageOf(cause)))} type="button"><Icon name="link" /></button>
-            </div>
           </div>
           <nav className="wg-sidebar-nav" aria-label={copy.workspace}>
-            <NavGroup label={copy.workspace}><NavItem active={surface === "browser"} icon="browser" label={copy.browser} onClick={() => navigate("browser")} badge={browser?.status === "error" ? "error" : undefined} /></NavGroup>
+            <NavGroup label={copy.workspace}>
+              <NavItem active={surface === "overview"} icon="overview" label={copy.overview} onClick={() => navigate("overview")} />
+              <NavItem active={surface === "browser"} icon="browser" label={copy.browser} onClick={() => navigate("browser")} badge={browser?.status === "error" ? "error" : undefined} />
+            </NavGroup>
             <NavGroup label={copy.configuration}>
               <NavItem active={surface === "setup"} icon="setup" label={copy.setup} onClick={() => navigate("setup")} badge={!snapshot.state.coreSetupComplete ? "required" : undefined} />
-              <NavItem active={surface === "mcp"} icon="mcp" label={copy.mcp} onClick={() => { setMcpTargetMode(null); navigate("mcp"); }} badge={snapshot.state.mcpSetupComplete ? undefined : "optional"} />
+              <NavItem active={surface === "mcp"} icon="mcp" label={copy.mcp} onClick={() => { setMcpTargetMode(null); navigate("mcp"); }} badge={snapshot.state.mcpSetupComplete ? undefined : "required"} />
             </NavGroup>
             <NavGroup label={copy.runtime}><NavItem active={surface === "activity"} icon="activity" label={copy.activity} onClick={() => navigate("activity")} /></NavGroup>
           </nav>
@@ -260,6 +247,7 @@ function Shell({ browser, copy, logs, operation, setError, snapshot, updateState
         </div> : null}
       </aside>
       <section className="wg-workspace">
+        {surface === "overview" ? <OverviewSurface browser={browser} copy={copy} operation={operation} openActivity={() => navigate("activity")} openSetup={() => navigate("setup")} snapshot={snapshot} /> : null}
         {surface === "browser" ? <BrowserSurface browser={browser} browserSlotRef={setBrowserSlot} copy={copy} interactionMode={snapshot.state.browserInteractionMode} operation={operation} platform={snapshot.platform} setError={setError} /> : null}
         {surface === "setup" ? <SetupSurface activateBrowser={activateBrowser} browser={browser} copy={copy} devProfile={dev} setError={setError} showMcp={() => navigate("mcp")} snapshot={snapshot} updateState={updateState} /> : null}
         {surface === "mcp" ? <McpSurface copy={copy} devProfile={dev} interactionMode={mcpTargetMode ?? snapshot.state.browserInteractionMode} onDone={() => navigate("setup")} operation={operation} setError={setError} snapshot={snapshot} updateState={updateState} /> : null}
@@ -268,6 +256,44 @@ function Shell({ browser, copy, logs, operation, setError, snapshot, updateState
       </section>
     </main>
   );
+}
+
+function OverviewSurface({ browser, copy, operation, openActivity, openSetup, snapshot }: {
+  browser: BrowserState | null;
+  copy: Copy;
+  operation: OperationState | null;
+  openActivity: () => void;
+  openSetup: () => void;
+  snapshot: LauncherSnapshot;
+}) {
+  const authenticated = browser?.authenticated === true;
+  const catalogReady = snapshot.state.codexCatalogVerified === true;
+  const harnessReady = snapshot.state.mcpSetupComplete === true && snapshot.state.mcpRuntimeInstalled === true;
+  const taskReady = authenticated && catalogReady && harnessReady;
+  const next = !authenticated
+    ? { title: copy.stepAccount, body: copy.stepAccountBody }
+    : !catalogReady
+      ? { title: copy.stepInstall, body: copy.stepInstallBody }
+      : !harnessReady
+        ? { title: copy.localToolsRequired, body: copy.localToolsRequiredBody }
+        : { title: copy.readyForTasks, body: copy.connectionSubtitle };
+  const cards: Array<{ label: string; body: string; ready: boolean }> = [
+    { label: copy.accountConnection, body: authenticated ? copy.signedIn : copy.unavailable, ready: authenticated },
+    { label: copy.modelCatalog, body: catalogReady ? copy.healthy : copy.unavailable, ready: catalogReady },
+    { label: copy.localHarness, body: harnessReady ? copy.mcpReady : copy.unavailable, ready: harnessReady },
+    { label: copy.taskRuntime, body: operation?.status === "running" ? operation.message : copy.status, ready: operation?.status !== "failed" },
+  ];
+  return <ContentSurface title={copy.overviewTitle} subtitle={copy.overviewSubtitle}>
+    <section className={`wg-readiness${taskReady ? " is-ready" : ""}`}>
+      <div><span>{taskReady ? copy.readyForTasks : copy.notReadyForTasks}</span><strong>{next.title}</strong><p>{next.body}</p></div>
+      <button className="wg-primary" onClick={taskReady ? openActivity : openSetup} type="button"><Icon name={taskReady ? "activity" : "setup"} />{taskReady ? copy.openActivity : copy.openSetup}</button>
+    </section>
+    <div className="wg-readiness-grid">
+      {cards.map(card => <article className={`wg-readiness-card${card.ready ? " is-ready" : ""}`} key={card.label}><StateDot state={card.ready ? "ready" : "idle"} /><span>{card.label}</span><strong>{card.body}</strong></article>)}
+    </div>
+    <SectionHeading label={copy.nextAction} spaced />
+    <button className="wg-next-row" onClick={openSetup} type="button"><Icon name="setup" /><span><strong>{copy.connectionTitle}</strong><small>{copy.connectionSubtitle}</small></span><Icon name="chevron" /></button>
+  </ContentSurface>;
 }
 
 function BrowserSurface({ browser, browserSlotRef, copy, interactionMode, operation, platform, setError }: {
@@ -339,14 +365,15 @@ function SetupSurface({ activateBrowser, browser, copy, devProfile, setError, sh
   const signIn = () => run(async () => { await activateBrowser(); await api!.openLogin(); });
   const smoke = () => run(async () => { await activateBrowser(); await api!.smokeTest(); updateState((await api!.snapshot()).state); });
   const install = () => run(async () => { await api!.setupCore(); updateState((await api!.snapshot()).state); });
-  return <ContentSurface eyebrow={copy.required} title={devProfile ? copy.devSetupTitle : copy.setupTitle} subtitle={devProfile ? copy.devSetupSubtitle : manual ? copy.manualInteractionBody : copy.setupSubtitle}>
+  return <ContentSurface eyebrow={copy.required} title={devProfile ? copy.devSetupTitle : copy.connectionTitle} subtitle={devProfile ? copy.devSetupSubtitle : manual ? copy.manualInteractionBody : copy.connectionSubtitle}>
     <SectionHeading label={devProfile ? copy.devCoreSetup : copy.coreSetup} />
     <div className="wg-setup-list">
       {!manual ? <><SetupRow complete={browser?.authenticated === true} index={1} title={copy.stepAccount} description={copy.stepAccountBody} action={browser?.authenticated ? copy.signedIn : browser?.status === "loading" ? copy.checkingSignIn : copy.signIn} disabled={busy} onAction={signIn} />{!managedBrowser ? <SetupRow complete={snapshot.smokePassed} index={2} title={copy.stepSmoke} description={copy.stepSmokeBody} action={snapshot.smokePassed ? copy.smokePassed : copy.runSmoke} disabled={busy || browser?.authenticated !== true} onAction={smoke} /> : null}</> : null}
       <SetupRow complete={snapshot.state.codexCatalogVerified === true} index={manual ? 1 : managedBrowser ? 2 : 3} title={devProfile ? copy.devStepInstall : copy.stepInstall} description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody} action={snapshot.state.coreSetupComplete ? devProfile ? copy.devReinstall : copy.reinstall : devProfile ? copy.devInstall : copy.install} disabled={busy || (!manual && !managedBrowser && !snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)} onAction={install} />
     </div>
     {!devProfile && snapshot.state.codexRestartRequired ? <Notice icon="alert" tone="warning">{copy.restartCodex}</Notice> : null}
-    <SectionHeading label={copy.mcp} meta={manual ? copy.required : copy.optional} spaced />
+    <SectionHeading label={copy.mcp} meta={copy.localToolsRequired} spaced />
+    {!snapshot.state.mcpSetupComplete ? <Notice icon="alert" tone="warning">{copy.localToolsRequiredBody}</Notice> : null}
     <button className="wg-next-row" disabled={!manual && !snapshot.state.codexCatalogVerified} onClick={showMcp} type="button"><Icon name="mcp" /><span><strong>{devProfile ? copy.devMcpTitle : copy.mcpTitle}</strong><small>{devProfile ? copy.devMcpBody : copy.mcpBody}</small></span><em>{snapshot.state.mcpSetupComplete ? copy.mcpReady : copy.configureMcp}</em><Icon name="chevron" /></button>
   </ContentSurface>;
 }
@@ -394,7 +421,19 @@ function McpSurface({ copy, devProfile, interactionMode, onDone, operation, setE
 }
 
 function ActivitySurface({ copy, language, logs, setError }: { copy: Copy; language: Language; logs: LogRecord[]; setError: (message: string | null) => void }) {
-  return <ContentSurface title={copy.activityTitle} subtitle={copy.activitySubtitle}><div className="wg-activity-head"><SectionHeading label={copy.recentActivity} /><button className="wg-secondary" onClick={() => void api!.exportLogs().catch((cause) => setError(messageOf(cause)))} type="button"><Icon name="external" />{copy.exportSafeLog}</button></div><div className="wg-activity-table">{logs.length === 0 ? <div className="wg-browser-empty"><Icon name="logs" /><span>{copy.noLogs}</span></div> : [...logs].reverse().map((record, index) => <div className="wg-activity-row" key={`${record.at}-${record.event}-${index}`}><StateDot state={record.level === "error" ? "error" : record.level === "warning" ? "busy" : "ready"} /><div><strong>{humanEvent(record.event)}</strong><span>{logDetail(record.detail)}</span></div><time>{formatTime(record.at, language)}</time></div>)}</div></ContentSurface>;
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [busy, setBusy] = useState(false);
+  const diagnose = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try { setDoctor(await api!.doctor()); } catch (cause) { setError(messageOf(cause)); } finally { setBusy(false); }
+  };
+  return <ContentSurface title={copy.diagnosticsTitle} subtitle={copy.diagnosticsSubtitle}>
+    <div className="wg-activity-head"><SectionHeading label={copy.recentActivity} /><div className="wg-activity-actions"><button className="wg-secondary" disabled={busy} onClick={() => void diagnose()} type="button"><Icon name="activity" />{copy.runDoctor}</button><button className="wg-secondary" onClick={() => void api!.exportLogs().catch((cause) => setError(messageOf(cause)))} type="button"><Icon name="external" />{copy.exportSafeLog}</button></div></div>
+    {doctor ? <DoctorSummary copy={copy} language={language} report={doctor} /> : null}
+    <div className="wg-activity-table">{logs.length === 0 ? <div className="wg-browser-empty"><Icon name="logs" /><span>{copy.noLogs}</span></div> : [...logs].reverse().map((record, index) => <div className="wg-activity-row" key={`${record.at}-${record.event}-${index}`}><StateDot state={record.level === "error" ? "error" : record.level === "warning" ? "busy" : "ready"} /><div><strong>{humanEvent(record.event)}</strong><span>{logDetail(record.detail)}</span></div><time>{formatTime(record.at, language)}</time></div>)}</div>
+  </ContentSurface>;
 }
 
 function SettingsSurface({ configureInteractionMode, copy, devProfile, language, setError, snapshot, updateState }: {
@@ -429,7 +468,7 @@ function SettingsSurface({ configureInteractionMode, copy, devProfile, language,
     {!devProfile ? <button className="wg-diagnostic-row" disabled={busy} onClick={() => void run(async () => { await api!.cancelTurns(); setCancelled(true); })} type="button"><Icon name="close" /><span><strong>{copy.cancelTurns}</strong><small>{cancelled ? copy.turnsCancelled : copy.cancelTurnsBody}</small></span><Icon name="chevron" /></button> : null}
     {!devProfile ? <button className="wg-diagnostic-row" disabled={busy} onClick={() => void run(async () => { const result = await api!.uninstallIntegration(); if (!result.cancelled) { updateState(result.state); setRemoved(true); } })} type="button"><Icon name="close" /><span><strong>{copy.uninstallIntegration}</strong><small>{removed ? copy.integrationRemoved : copy.uninstallIntegrationBody}</small></span><Icon name="chevron" /></button> : null}
     {doctor ? <DoctorSummary copy={copy} language={language} report={doctor} /> : null}
-    <div className="wg-about"><BrandMark small /><span><strong>{copy.product}</strong><small>{devProfile ? "DEV · " : ""}{snapshot.platform} · v{snapshot.version}</small></span></div>
+    <div className="wg-about"><BrandMark small /><span><strong>{copy.product}</strong><small>{devProfile ? "DEV · " : ""}{snapshot.platform} · v{snapshot.version}</small></span><div className="wg-about-links"><button onClick={() => void api!.openExternal(snapshot.urls.github).catch((cause) => setError(messageOf(cause)))} type="button">{copy.project}<Icon name="external" /></button><button onClick={() => void api!.openExternal(DEVELOPER_URL).catch((cause) => setError(messageOf(cause)))} type="button">{copy.developer}<Icon name="external" /></button></div></div>
   </ContentSurface>;
 }
 

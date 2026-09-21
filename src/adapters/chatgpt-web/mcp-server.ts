@@ -26,6 +26,8 @@ const BRIDGE_TOOL_NAMES = new Set([
   "codex_view_image",
   "codex_tool_inventory",
   "codex_tool_call",
+  "codex_context_search",
+  "codex_context_read",
   "codex_turn_complete",
 ]);
 
@@ -45,16 +47,20 @@ const turnTokenSchema = z.string().min(20).max(256);
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
 const CODEX_CONTEXT_SEARCH_WIRE_NAME = "codex_context_search";
 const CODEX_CONTEXT_READ_WIRE_NAME = "codex_context_read";
-const contextSearchArgumentsSchema = z.object({
+// One shape per capability, used both as the registered tool's schema and to validate the same
+// capability reached through the older codex_tool_call path.
+const contextSearchArgumentsShape = {
   query: z.string().max(500).optional(),
   offset: z.number().int().min(0).max(100_000).default(0),
   limit: z.number().int().min(1).max(20).default(10),
-});
-const contextReadArgumentsSchema = z.object({
+};
+const contextReadArgumentsShape = {
   message_indices: z.array(z.number().int().min(0).max(50_000)).min(1).max(20),
   include_system: z.boolean().default(false),
   max_chars: z.number().int().min(1_000).max(500_000).default(100_000),
-});
+};
+const contextSearchArgumentsSchema = z.object(contextSearchArgumentsShape);
+const contextReadArgumentsSchema = z.object(contextReadArgumentsShape);
 // Match Codex's default wait interval while returning before the MCP invocation deadline.
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 30_000;
 const AGENT_WAIT_TRANSPORT_RULE = `ChatGPT Web transport rule: wait for exactly ${CHATGPT_WEB_AGENT_WAIT_POLL_MS / 1_000} seconds per call, matching the Codex default, then release the MCP channel so spawned Web agents can use their own tools. A wait timeout is not task completion; check agent progress and wait again if needed. Keep the native tool's declared arguments.`;
@@ -263,7 +269,7 @@ function runtimeContextToolDescriptors(includeSchema: boolean): Array<Record<str
       wire_name: CODEX_CONTEXT_SEARCH_WIRE_NAME,
       name: CODEX_CONTEXT_SEARCH_WIRE_NAME,
       namespace: null,
-      description: "Search the canonical Codex message history held by the Runtime. Results return message_index values for codex_context_read.",
+      description: "Search the canonical Codex message history held by the Runtime. Call it directly as an attached tool; results return message_index values for codex_context_read.",
       kind: "runtime",
       ...(includeSchema ? {
         parameters: {
@@ -281,7 +287,7 @@ function runtimeContextToolDescriptors(includeSchema: boolean): Array<Record<str
       wire_name: CODEX_CONTEXT_READ_WIRE_NAME,
       name: CODEX_CONTEXT_READ_WIRE_NAME,
       namespace: null,
-      description: "Read exact canonical Codex messages by message_index from the Runtime, optionally including the canonical system prompt.",
+      description: "Read exact canonical Codex messages by message_index from the Runtime, optionally including the canonical system prompt. Call it directly as an attached tool.",
       kind: "runtime",
       ...(includeSchema ? {
         parameters: {
@@ -583,7 +589,7 @@ export async function runChatGptMcpServer(options: {
     try {
       const claimed = await callTurnBroker<Omit<ClaimedTurn, "activityId">>(
         options.brokerSocketPath,
-        { method: "claim", token: turnToken, activityId, contract },
+        { method: "claim", token: turnToken, activityId, contract, toolName },
         contract === "safe" ? null : 5_000,
         extra.signal,
       );
@@ -670,6 +676,7 @@ export async function runChatGptMcpServer(options: {
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
     signal?: AbortSignal,
+    purpose?: "tool_inventory",
   ) => {
     const timeoutMs = chatGptMcpInvocationTimeout(bound);
     try {
@@ -678,6 +685,7 @@ export async function runChatGptMcpServer(options: {
         bindingId,
         wireName: wireName(tool),
         freeform: tool.freeform === true,
+        ...(purpose ? { purpose } : {}),
         ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
       }, timeoutMs, signal);
       return asMcpResult(response);
@@ -711,6 +719,30 @@ export async function runChatGptMcpServer(options: {
       }
       throw error;
     }
+  };
+
+  /**
+   * Runtime-owned history retrieval. The Runtime answers it from the canonical snapshot it already
+   * holds, so it needs no outer Codex tool, no approval and no sandbox: the turn's own context is
+   * not an external effect.
+   */
+  const retrieveContext = async (
+    action: "search" | "read",
+    requestId: string,
+    claimed: ClaimedTurn,
+    arguments_: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) => {
+    if (claimed.contextAvailable !== true) {
+      throw new Error("Codex context retrieval is unavailable for this turn");
+    }
+    const response = await callTurnBroker<Record<string, unknown>>(options.brokerSocketPath, {
+      method: "context_read",
+      token: requestId,
+      contextAction: action,
+      arguments: arguments_,
+    }, chatGptMcpInvocationTimeout(claimed.environment), signal);
+    return result(response);
   };
 
   const invokeNestedNative = (
@@ -867,6 +899,60 @@ export async function runChatGptMcpServer(options: {
     ),
   );
 
+  // Registered rather than reached through codex_tool_call, because a capability the Runtime always
+  // implements, that only reads, and whose schema never changes has nothing to gain from a generic
+  // wrapper. Attaching it is what puts its arguments in front of the model: a search it has to guess
+  // the shape of is the search that missed.
+  server.registerTool(
+    CODEX_CONTEXT_SEARCH_WIRE_NAME,
+    {
+      title: "Search this Codex task's canonical history",
+      description: afterSafeStart(
+        contract,
+        "Search the canonical Codex message history the Runtime holds for this task, including records omitted from this prompt."
+        + " Returns ranked previews with the message_index values to pass to codex_context_read.",
+      ),
+      inputSchema: { ...turnReferenceInput(contract), ...contextSearchArgumentsShape },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input, extra) => {
+      const requestId = turnReference(contract, input);
+      const { query, offset, limit } = input;
+      return withClaimedTurn(CODEX_CONTEXT_SEARCH_WIRE_NAME, requestId, extra, claimed => retrieveContext(
+        "search",
+        requestId,
+        claimed,
+        { ...(query !== undefined ? { query } : {}), offset, limit },
+        extra.signal,
+      ));
+    },
+  );
+
+  server.registerTool(
+    CODEX_CONTEXT_READ_WIRE_NAME,
+    {
+      title: "Read this Codex task's canonical records",
+      description: afterSafeStart(
+        contract,
+        "Read exact canonical Codex messages by the message_index values returned by codex_context_search,"
+        + " optionally including the canonical system prompt.",
+      ),
+      inputSchema: { ...turnReferenceInput(contract), ...contextReadArgumentsShape },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input, extra) => {
+      const requestId = turnReference(contract, input);
+      const { message_indices, include_system, max_chars } = input;
+      return withClaimedTurn(CODEX_CONTEXT_READ_WIRE_NAME, requestId, extra, claimed => retrieveContext(
+        "read",
+        requestId,
+        claimed,
+        { message_indices, include_system, max_chars },
+        extra.signal,
+      ));
+    },
+  );
+
   server.registerTool(
     "codex_tool_inventory",
     {
@@ -931,7 +1017,7 @@ export async function runChatGptMcpServer(options: {
               // our own MCP namespace in Zero Risk).
               excludedNames: excludedGatewayNames,
             }),
-          }, extra.signal);
+          }, extra.signal, "tool_inventory");
           const catalog = gatewayToolCatalogPage(response, new Set(excludedGatewayNames));
           nestedTotal = catalog.total;
           nestedPage = catalog.tools.map(tool => ({
@@ -998,23 +1084,23 @@ export async function runChatGptMcpServer(options: {
       }
       return withClaimedTurn("codex_tool_call", requestId, extra, async claimed => {
         const bound = claimed.environment;
+        // Compatibility path. Both capabilities are registered tools now; a ChatGPT conversation
+        // holding a cached connector schema, or following a prompt from before they were attached,
+        // still reaches the same Runtime retrieval through the name it knows.
         if (wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME || wire_name === CODEX_CONTEXT_READ_WIRE_NAME) {
           if (input !== undefined) {
             throw new Error(`${wire_name} accepts structured arguments, not freeform input`);
           }
-          if (claimed.contextAvailable !== true) {
-            throw new Error("Codex context retrieval is unavailable for this turn");
-          }
-          const contextArguments = wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME
-            ? contextSearchArgumentsSchema.parse(args ?? {})
-            : contextReadArgumentsSchema.parse(args ?? {});
-          const response = await callTurnBroker<Record<string, unknown>>(options.brokerSocketPath, {
-            method: "context_read",
-            token: requestId,
-            contextAction: wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME ? "search" : "read",
-            arguments: contextArguments,
-          }, chatGptMcpInvocationTimeout(bound), extra.signal);
-          return result(response);
+          const search = wire_name === CODEX_CONTEXT_SEARCH_WIRE_NAME;
+          return retrieveContext(
+            search ? "search" : "read",
+            requestId,
+            claimed,
+            search
+              ? contextSearchArgumentsSchema.parse(args ?? {})
+              : contextReadArgumentsSchema.parse(args ?? {}),
+            extra.signal,
+          );
         }
         const tool = safeVisibleTools(bound, contract)
           .find(candidate => wireName(candidate) === wire_name);

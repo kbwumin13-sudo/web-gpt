@@ -2,7 +2,11 @@ import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-w
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retained-telemetry";
+import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow-observer";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
+import { chatGptCapabilityTelemetrySnapshot } from "./adapters/chatgpt-web/capability-telemetry";
+import { chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
+import { chatGptCompactionTelemetrySnapshot } from "./adapters/chatgpt-web/compaction-telemetry";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import {
@@ -50,6 +54,7 @@ import { expandPreviousResponseInput, flushResponseState, rememberResponseState 
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
+import { buildProvenance } from "./build-provenance";
 import { VERSION } from "./version";
 import { processRunning } from "./process";
 
@@ -843,6 +848,9 @@ export function startServer(
           status: "ok",
           service: "codex-chatgpt-web",
           version: VERSION,
+          // Which build is answering, so a fix that was never installed is distinguishable from a
+          // fix that did not work.
+          build: buildProvenance(),
           mode: config.mode,
           pid: process.pid,
           port: config.port,
@@ -863,6 +871,19 @@ export function startServer(
           }),
           retained_conversation: chatGptRetainedTelemetrySnapshot(),
           memory_retrieval: memoryRetrievalSnapshot(),
+          // The compact bootstrap leaves earlier records to retrieval. These say how often that
+          // was bet on and how often the bet was actually collected.
+          context_retrieval: chatGptContextTelemetrySnapshot(),
+          // What a turn spends finding out what it can do. `tool_inventory_gateway_execs` is the
+          // part a native Codex turn never pays: an outer command run to read a tool registry.
+          capability_traffic: chatGptCapabilityTelemetrySnapshot(),
+          // A compaction that summarised correctly and reached nobody used to look exactly like one
+          // that worked. `abandoned` is that case.
+          compaction: chatGptCompactionTelemetrySnapshot(),
+          // Shadow observation of ChatGPT's own transport, running alongside the DOM reading that
+          // still decides every turn. `comparisons` says how often the two agree; the unrecognized
+          // and unapplied counts say whether this build still understands the stream.
+          wire_observation: chatGptWireTelemetrySnapshot(),
           ...activity(),
         });
       }

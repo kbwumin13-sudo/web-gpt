@@ -854,6 +854,33 @@ describe("trusted Codex task environment continuity", () => {
     return { codexHome, request, rolloutPath };
   }
 
+  test("projectless skill context is recovered only when its authority matches the current native rollout", () => {
+    const { codexHome, request } = resumedRootFixture();
+    const body = request._rawBody as { client_metadata: Record<string, string>; input: unknown[] };
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    metadata.workspaces = {};
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    body.input = [
+      { type: "message", id: "msg_env", role: "user", content: [{ type: "input_text", text: environmentXml }] },
+      { type: "message", id: "msg_prompt", role: "user", content: [{ type: "input_text", text: "Read the attached document" }] },
+      { type: "message", id: "msg_skill", role: "user", content: [{ type: "input_text", text: "<skill><name>reader</name></skill>" }] },
+    ];
+    expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(store.resolve(request).cwd).toBe(root);
+    const forged = structuredClone(request);
+    const forgedBody = forged._rawBody as { input: Array<{ content: Array<{ text: string }> }> };
+    forgedBody.input[0]!.content[0]!.text = environmentXml.replace(`<cwd>${root}</cwd>`, `<cwd>${resolve(root, "outside")}</cwd>`);
+    expect(() => store.resolve(forged)).toThrow();
+    const stale = structuredClone(request);
+    const staleBody = stale._rawBody as { client_metadata: Record<string, string> };
+    staleBody.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, turn_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+    expect(() => store.resolve(stale)).toThrow();
+    body.input.push({ type: "function_call", call_id: "call_probe", name: "pwd", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_probe", output: root });
+    expect(store.resolve(request).cwd).toBe(root);
+  });
+
   test("recovers an ordinary resumed task from its exact current rollout with an empty bridge cache", () => {
     const { codexHome, request } = resumedRootFixture();
     request.context.tools = [{ name: "current_tool", description: "current", parameters: { type: "object" } }];

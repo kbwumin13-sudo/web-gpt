@@ -7,6 +7,8 @@ import {
   extractChatGptTurnEnvironment,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
+  extractChatGptEnvironmentClaim,
+  hasChatGptSkillExpansion,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
@@ -180,6 +182,25 @@ export class ChatGptThreadEnvironmentStore {
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       const sameThread = this.get(identity.threadId);
       if (hasCurrentContext && !currentCompaction && !historicalMessages) {
+        // Skill expansion can separate the environment from the user's instruction, including
+        // in projectless tasks with no Git metadata. The current native rollout is authoritative;
+        // neither the supplied XML nor a cached previous turn may grant filesystem access here.
+        const rootIdentity = extractChatGptRootThreadMetadata(parsed);
+        if (rootIdentity && identity.turnId && hasChatGptSkillExpansion(parsed)) {
+          const claim = extractChatGptEnvironmentClaim(parsed, true);
+          const native = resolveCurrentCodexRolloutEnvironment({
+            codexHome: this.codexHome,
+            ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+            lineage: rootIdentity,
+            turnId: identity.turnId,
+            tools: parsed.context.tools,
+          });
+          if (native) {
+            if (!sameAuthority(claim, native)) throw new Error("Environment claim conflicts with its current Codex rollout");
+            this.set(identity.threadId, native);
+            return native;
+          }
+        }
         if (sameThread && sparseV2CompactionContinuation(parsed)) {
           try {
             const currentClaim = extractChatGptContinuationEnvironmentClaim(parsed);

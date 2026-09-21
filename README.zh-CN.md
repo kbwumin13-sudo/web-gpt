@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="#快速开始"><strong>快速开始</strong></a> ·
+  <a href="#quick-start"><strong>快速开始</strong></a> ·
   <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>最新版本</strong></a> ·
   <a href="docs/architecture.md"><strong>架构</strong></a> ·
   <a href="TROUBLESHOOTING.md"><strong>故障排除</strong></a> ·
@@ -70,6 +70,8 @@ Codex 会保留原生任务、上下文生命周期、界面和工具 harness。
 临时聊天是 ChatGPT 的隐私模式，并不代表匿名或仅在本地推理：提示仍会由 OpenAI 处理，并受账户
 设置及 OpenAI [临时聊天政策](https://help.openai.com/en/articles/8914046-temporary-chat-faq)
 约束。本项目为非官方项目；用户仍需自行遵守适用的 OpenAI 条款和工作区政策。
+
+<a id="quick-start"></a>
 
 ## 快速开始
 

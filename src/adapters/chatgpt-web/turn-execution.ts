@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
 import { chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
+import { chatGptCompactionEpochFingerprint } from "./conversation-key";
 import {
   chatGptTurnUserRevisionHistory,
   extractChatGptCompactionSourceRevision,
@@ -230,13 +231,24 @@ export function chatGptTurnRoundKey(parsed: CodexParsedRequest): string {
   });
 }
 
-/** Stable identity for limiting automatic retries of one native Codex turn. */
+/**
+ * Stable identity for limiting automatic retries of one native Codex turn within one compaction
+ * epoch.
+ *
+ * Codex keeps the same `turn_id` across a compaction boundary, but that boundary retires the
+ * ChatGPT conversation and opens a new one. A budget keyed on `turn_id` alone therefore charged the
+ * old conversation's failures to the fresh one: a turn that exhausted its retries before compacting
+ * made the first turn of the next epoch fail immediately with a non-retryable error, before any
+ * browser work, on a conversation that had never failed. The epoch is part of what the budget is
+ * counting against, so it is part of the key.
+ */
 export function chatGptTurnRetryKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-turn retry budgeting");
   return createHash("sha256").update(JSON.stringify({
     threadId: identity.threadId,
     turnId: identity.turnId,
+    compaction: chatGptCompactionEpochFingerprint(parsed),
     purpose: parsed._compactionRequest ? "compaction" : "response",
   })).digest("hex");
 }

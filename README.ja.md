@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="#クイックスタート"><strong>クイックスタート</strong></a> ·
+  <a href="#quick-start"><strong>クイックスタート</strong></a> ·
   <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>最新リリース</strong></a> ·
   <a href="docs/architecture.md"><strong>アーキテクチャ</strong></a> ·
   <a href="TROUBLESHOOTING.md"><strong>トラブルシューティング</strong></a> ·
@@ -74,6 +74,8 @@ Full モードでは、次のコンパクション境界まで、MCP が ChatGPT
 プロンプトは引き続き OpenAI によって処理され、アカウント設定および OpenAI の
 [一時チャットポリシー](https://help.openai.com/en/articles/8914046-temporary-chat-faq)が適用されます。
 このプロジェクトは非公式です。適用される OpenAI の利用規約とワークスペースポリシーを守る責任は利用者にあります。
+
+<a id="quick-start"></a>
 
 ## クイックスタート
 

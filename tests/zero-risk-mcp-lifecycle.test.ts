@@ -280,8 +280,12 @@ describe("Zero Risk public MCP ABI", () => {
       expect(client.getInstructions()).toContain("begin with codex_turn_start using the request_id");
       expect(client.getInstructions()).toContain("send the complete answer with codex_turn_complete");
       const listed = await client.listTools();
+      // Zero Risk receives the same compact bootstrap, so it needs the same Runtime retrieval, and
+      // it is attached here for the same reason: a read of this task's own history is not a command.
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
+        "codex_context_read",
+        "codex_context_search",
         "codex_exec",
         "codex_tool_call",
         "codex_tool_inventory",

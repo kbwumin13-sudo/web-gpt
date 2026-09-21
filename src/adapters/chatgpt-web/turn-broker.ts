@@ -1,3 +1,8 @@
+import {
+  recordChatGptCapabilityCall,
+  recordChatGptToolInventoryGatewayExec,
+} from "./capability-telemetry";
+import { recordChatGptContextRetrieval } from "./context-telemetry";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
@@ -142,6 +147,10 @@ interface BrokerRequest {
   finalAnswer?: string;
   contract?: "native" | "safe";
   contextAction?: "search" | "read";
+  /** The bridge tool this claim is for, counted so a turn's capability traffic is visible. */
+  toolName?: string;
+  /** Why an invocation was made, when it was not the model's own request. */
+  purpose?: "tool_inventory";
 }
 
 interface BrokerResponse {
@@ -243,10 +252,60 @@ function redactContextText(value: string): string {
   return value.replace(RETIRED_CONTEXT_HANDLE, handle => `[retired ${handle.split("_", 1)[0]} handle]`);
 }
 
+const CONTEXT_SEARCH_MIN_TERM_CHARS = 2;
+const CONTEXT_SEARCH_MAX_TERMS = 24;
+const CONTEXT_SEARCH_PREVIEW_CHARS = 1_000;
+const CONTEXT_SEARCH_NO_MATCH_MESSAGES = 5;
+const CONTEXT_SEARCH_NO_MATCH_PREVIEW_CHARS = 300;
+const CONTEXT_SEARCH_CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{2,}/gu;
+
+/**
+ * Split a query into terms a stored message can be scored against.
+ *
+ * Whole-phrase containment is what this search used to require, and requiring it is why a model
+ * that asked the right question in slightly different words got nothing back. Latin words separate
+ * on whitespace and punctuation; CJK has neither, so a CJK run also contributes its character
+ * bigrams and a query written as one clause still has something to match on. Single characters are
+ * dropped from both languages because they match nearly every message and rank nothing.
+ */
+function contextSearchTerms(query: string): string[] {
+  const words = new Set<string>();
+  const bigrams = new Set<string>();
+  for (const token of query.split(/[\s\p{P}\p{S}]+/u)) {
+    if (token.length >= CONTEXT_SEARCH_MIN_TERM_CHARS) words.add(token);
+    for (const run of token.match(CONTEXT_SEARCH_CJK) ?? []) {
+      const characters = [...run];
+      for (let index = 0; index + 2 <= characters.length; index += 1) {
+        bigrams.add(characters.slice(index, index + 2).join(""));
+      }
+    }
+  }
+  // Every term costs a pass over the whole history, and the query is allowed 500 characters — as
+  // CJK that is hundreds of bigrams. Whole words are kept ahead of bigrams because they are the
+  // more selective of the two, and the rest of a query that long adds nothing a cap takes away.
+  return [...words, ...bigrams].slice(0, CONTEXT_SEARCH_MAX_TERMS);
+}
+
+interface ContextSearchEntry {
+  index: number;
+  message: CodexMessage;
+  text: string;
+  haystack: string;
+}
+
+function contextSearchResult(entry: ContextSearchEntry, previewChars: number): Record<string, unknown> {
+  return {
+    message_index: entry.index,
+    role: entry.message.role,
+    timestamp: entry.message.timestamp,
+    preview: entry.text.slice(0, previewChars),
+  };
+}
+
 function contextSearch(
   snapshot: ChatGptTurnContextSnapshot,
   arguments_: Record<string, unknown>,
-): Record<string, unknown> {
+): Record<string, unknown> & { total: number } {
   const query = typeof arguments_.query === "string" ? arguments_.query.trim().toLowerCase() : "";
   const offset = Number.isSafeInteger(arguments_.offset) && (arguments_.offset as number) >= 0
     ? arguments_.offset as number
@@ -254,22 +313,74 @@ function contextSearch(
   const limit = Number.isSafeInteger(arguments_.limit) && (arguments_.limit as number) > 0
     ? Math.min(arguments_.limit as number, 20)
     : 10;
-  const matches = snapshot.messages.flatMap((message, index) => {
+  const entries: ContextSearchEntry[] = snapshot.messages.map((message, index) => {
     const text = redactContextText(contextMessageText(message));
-    const haystack = `${message.role}\n${text}`.toLowerCase();
-    if (query && !haystack.includes(query)) return [];
-    return [{
-      message_index: index,
-      role: message.role,
-      timestamp: message.timestamp,
-      preview: text.slice(0, 1_000),
-    }];
+    return { index, message, text, haystack: `${message.role}\n${text}`.toLowerCase() };
   });
-  const page = matches.slice(offset, offset + limit);
+  const page = (matched: ContextSearchEntry[]) => {
+    const window = matched.slice(offset, offset + limit);
+    return {
+      messages: window.map(entry => contextSearchResult(entry, CONTEXT_SEARCH_PREVIEW_CHARS)),
+      total: matched.length,
+      next_offset: offset + window.length < matched.length ? offset + window.length : null,
+    };
+  };
+  // No query browses the history in order. That is the one case where rank means nothing.
+  if (!query) return page(entries);
+
+  const terms = contextSearchTerms(query);
+  // One pass over the history, because each term costs a scan of every stored message and the
+  // frequencies below are derived from the same result rather than from a second pass.
+  const matchedByEntry = entries.map(entry => terms.filter(term => entry.haystack.includes(term)));
+  // A term carried by most of the history separates nothing, and including it makes every message
+  // a match. Which terms those are depends on the conversation rather than on the language, so they
+  // are found by counting rather than by a stop list — and only when another term can carry the
+  // query on its own.
+  const frequency = new Map<string, number>();
+  for (const matched of matchedByEntry) {
+    for (const term of matched) frequency.set(term, (frequency.get(term) ?? 0) + 1);
+  }
+  const selective = terms.filter(term => (frequency.get(term) ?? 0) * 2 <= entries.length);
+  const scoringTerms = terms.length > 1 && selective.length > 0 ? selective : terms;
+  const scoring = new Set(scoringTerms);
+  const ranked = entries.flatMap((entry, position) => {
+    const matchedTerms = matchedByEntry[position]!.filter(term => scoring.has(term));
+    const exactPhrase = entry.haystack.includes(query);
+    if (!exactPhrase && matchedTerms.length === 0) return [];
+    // Whole-phrase matches stay ahead of term matches, in their original order, so a query that
+    // already worked returns exactly what it returned before with the weaker matches behind it.
+    return [{ entry, exactPhrase, matchedTerms, score: (exactPhrase ? terms.length + 1 : 0) + matchedTerms.length }];
+  }).sort((left, right) => right.score - left.score || left.entry.index - right.entry.index);
+
+  if (ranked.length === 0) {
+    return {
+      messages: [],
+      total: 0,
+      next_offset: null,
+      query_terms: scoringTerms,
+      // An empty result reads like an empty history, and a model that believes the history is empty
+      // stops asking it: the turn this answers searched once, matched nothing, and went through the
+      // filesystem for a book the stored conversation named eighty times. The tail of the history is
+      // returned labelled as what it is, so a missed query is a bad query rather than a dead end.
+      no_match: {
+        reason: "No canonical record contained the query or any of its terms.",
+        recent_messages: entries
+          .slice(-CONTEXT_SEARCH_NO_MATCH_MESSAGES)
+          .map(entry => contextSearchResult(entry, CONTEXT_SEARCH_NO_MATCH_PREVIEW_CHARS)),
+      },
+    };
+  }
+
+  const window = ranked.slice(offset, offset + limit);
   return {
-    messages: page,
-    total: matches.length,
-    next_offset: offset + page.length < matches.length ? offset + page.length : null,
+    messages: window.map(match => ({
+      ...contextSearchResult(match.entry, CONTEXT_SEARCH_PREVIEW_CHARS),
+      matched_terms: match.matchedTerms,
+      ...(match.exactPhrase ? { exact_phrase: true } : {}),
+    })),
+    total: ranked.length,
+    next_offset: offset + window.length < ranked.length ? offset + window.length : null,
+    query_terms: scoringTerms,
   };
 }
 
@@ -1060,8 +1171,17 @@ export class TurnBroker implements TurnBrokerOwner {
       console.info(
         `[chatgpt-web] broker trace=${channel.traceId} context_${request.contextAction ?? "invalid"}`,
       );
-      if (request.contextAction === "search") return contextSearch(channel.context, arguments_);
-      if (request.contextAction === "read") return contextRead(channel.context, arguments_);
+      if (request.contextAction === "search") {
+        // Recorded after the search rather than before it, because how many records it matched is
+        // the part that says whether retrieval worked.
+        const found = contextSearch(channel.context, arguments_);
+        recordChatGptContextRetrieval(channel.traceId, "search", found.total);
+        return found;
+      }
+      if (request.contextAction === "read") {
+        recordChatGptContextRetrieval(channel.traceId, "read");
+        return contextRead(channel.context, arguments_);
+      }
       throw new Error("Codex context retrieval action is invalid");
     }
     if (request.method === "owner_status") {
@@ -1207,6 +1327,9 @@ export class TurnBroker implements TurnBrokerOwner {
       if (activeChannel.completedActivities.has(activityId)) {
         throw new Error("turn activity was already completed before this claim settled");
       }
+      if (typeof request.toolName === "string") {
+        recordChatGptCapabilityCall(activeChannel.traceId, request.toolName);
+      }
       if (!activeChannel.activities.has(activityId)) {
         activeChannel.activities.add(activityId);
         activeChannel.activityRevision += 1;
@@ -1290,6 +1413,10 @@ export class TurnBroker implements TurnBrokerOwner {
 
     const wireName = request.wireName?.trim();
     if (!wireName) throw new Error("wire tool name is required");
+    // An outer command run to answer "what tools exist" is indistinguishable from one run to do the
+    // work, once it is in the delivery log. Separating them here is what makes the cost of
+    // discovery countable.
+    if (request.purpose === "tool_inventory") recordChatGptToolInventoryGatewayExec();
     const callId = opaqueId("call");
     const toolRequest: BrokerToolRequest = {
       callId,

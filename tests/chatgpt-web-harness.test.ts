@@ -5,10 +5,12 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Page, Locator } from "playwright-core";
 import { buildResponseJSON } from "../src/bridge";
 import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, throwIfChatGptTerminalErrorAlert, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { chatGptCapabilityTelemetrySnapshot } from "../src/adapters/chatgpt-web/capability-telemetry";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
@@ -2839,6 +2841,8 @@ describe("ChatGPT outer-native harness v4", () => {
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
+        "codex_context_read",
+        "codex_context_search",
         "codex_exec",
         "codex_tool_call",
         "codex_tool_inventory",
@@ -2855,8 +2859,11 @@ describe("ChatGPT outer-native harness v4", () => {
       }));
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
+      // Changed when codex_context_search and codex_context_read became registered tools instead of
+      // names dispatched inside codex_tool_call, so their schemas reach the model without a lookup.
+      // A conversation on a connector that predates them keeps the codex_tool_call path.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("5cb59b378c7d1939e260a2b4a60f58e22da31208fe09c2cc17a2cf31eb5ff3ad");
+        .toBe("3aa6036d43d910ba12160a831625af359636a24ce7f9a1637c8143dcba92dae7");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -2899,6 +2906,17 @@ describe("ChatGPT outer-native harness v4", () => {
         idempotentHint: false,
         openWorldHint: true,
       });
+      // Reading this task's own canonical history is the one bridge capability that has no external
+      // effect. Declaring that is the point of attaching them: through codex_tool_call they were
+      // indistinguishable from a command that changes the user's computer.
+      for (const name of ["codex_context_search", "codex_context_read"]) {
+        expect(listed.tools.find(tool => tool.name === name)?.annotations).toMatchObject({
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        });
+      }
 
       const firstExec = call("codex_exec", {
         turn_token: token,
@@ -2956,6 +2974,10 @@ describe("ChatGPT outer-native harness v4", () => {
       expect((await firstExec).structuredContent).toEqual({ output: tempRoot, exit_code: 0 });
       expect((await secondExec).structuredContent).toEqual({ output: "clean", exit_code: 0 });
 
+      // Every gateway inventory is an outer command execution spent on the question of what tools
+      // exist, and in the delivery log it is the same line as a command run to do the work. The
+      // baseline below is what makes the two separable.
+      const capabilityBaseline = chatGptCapabilityTelemetrySnapshot();
       const inventoryThroughGateway = async (
         query: string,
         includeSchema: boolean,
@@ -3105,6 +3127,14 @@ describe("ChatGPT outer-native harness v4", () => {
         }],
       });
 
+      const capabilityAfterInventory = chatGptCapabilityTelemetrySnapshot();
+      // Five inventory calls, five outer executions. The raw codex_tool_call gateway work between
+      // them ran through the same exec tool and is not counted here, which is the distinction: this
+      // number is what a native Codex turn, handed its registry with the request, never spends.
+      expect(capabilityAfterInventory.tool_inventory_gateway_execs - capabilityBaseline.tool_inventory_gateway_execs).toBe(5);
+      expect((capabilityAfterInventory.calls.codex_tool_inventory ?? 0) - (capabilityBaseline.calls.codex_tool_inventory ?? 0)).toBe(5);
+      expect(capabilityAfterInventory.max_tool_inventory_calls_in_a_turn).toBeGreaterThanOrEqual(5);
+
       const nestedWeb = call("codex_tool_call", {
         turn_token: token,
         wire_name: "web__run",
@@ -3239,10 +3269,10 @@ describe("ChatGPT outer-native harness v4", () => {
         ],
       });
 
-      const search = await call("codex_tool_call", {
+      const search = await call("codex_context_search", {
         turn_token: token,
-        wire_name: "codex_context_search",
-        arguments: { query: "historical", limit: 10 },
+        query: "historical",
+        limit: 10,
       });
       expect(search.structuredContent).toMatchObject({
         total: 2,
@@ -3253,10 +3283,19 @@ describe("ChatGPT outer-native harness v4", () => {
       });
       expect(JSON.stringify(search)).not.toContain("turn_old_123456789012345678901234");
 
-      const read = await call("codex_tool_call", {
+      // The pre-registration path stays live: a ChatGPT conversation holding the cached connector
+      // schema from before these were attached still reaches the same Runtime retrieval.
+      const compatibilitySearch = await call("codex_tool_call", {
         turn_token: token,
-        wire_name: "codex_context_read",
-        arguments: { message_indices: [0, 1], include_system: true },
+        wire_name: "codex_context_search",
+        arguments: { query: "historical", limit: 10 },
+      });
+      expect(compatibilitySearch.structuredContent).toEqual(search.structuredContent!);
+
+      const read = await call("codex_context_read", {
+        turn_token: token,
+        message_indices: [0, 1],
+        include_system: true,
       });
       expect(read.structuredContent).toMatchObject({
         system: ["Canonical system instruction"],
@@ -3637,6 +3676,75 @@ describe("ChatGPT outer-native harness v4", () => {
       if (timedOutToken) broker.revoke(timedOutToken);
       if (replacementToken) broker.revoke(replacementToken);
       await broker.close();
+    }
+  }, 10_000);
+
+  test("a terminal first assistant observation cannot emit a pending native tool", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-terminal-first-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://terminal-first-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, ...toolCapabilities },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    const hidden = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
+    const visible = { last() { return this; }, isVisible: async () => true };
+    const failedAssistant = { getByText: () => visible, getByTestId: () => hidden };
+    const page = {
+      isClosed: () => false,
+      locator: (selector: string) => selector.startsWith("[data-turn-id=") ? failedAssistant : hidden,
+    } as unknown as Page;
+    const observer = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      submissionDomState: async () => ({ turnIdentities: ["current"], userIdentities: [], responseIdentities: ["current"] }),
+      responseDomSnapshot: async () => ({ visibleText: "Something went wrong. Please see help.openai.com." }),
+    }) as {
+      waitForNewAssistantTurn(...args: unknown[]): Promise<{ locator: Locator }>;
+    };
+    let invocationOutcome: Promise<unknown> | undefined;
+    let finished!: () => void;
+    const browserFinished = new Promise<void>(resolve => { finished = resolve; });
+    worker.run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("missing test turn token");
+        turn.onSubmitted?.();
+        const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+        invocationOutcome = callTurnBroker(socketPath, {
+          method: "invoke", bindingId: claimed.bindingId, wireName: "exec_command",
+          arguments: { cmd: "must not run after terminal observation" },
+        }, null).catch(error => error);
+        const progress = turn.externalProgress!;
+        let snapshot = progress.snapshot();
+        while (snapshot.lastToolBatchRevision === 0) snapshot = await progress.waitForChange(snapshot.revision);
+        const binding = await observer.waitForNewAssistantTurn(
+          page, { initialTurnIdentities: [], domCache: {} }, undefined, undefined,
+          progress, 60_000, new ChatGptCompletionTracker(),
+        );
+        // Diagnostic capture yields between acquiring the assistant and the main loop's check.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        await throwIfChatGptTerminalErrorAlert(binding.locator);
+        throw new Error("terminal response was accepted");
+      } finally {
+        prepared.release();
+        finished();
+      }
+    };
+    const events: AdapterEvent[] = [];
+    try {
+      await createChatGptWebAdapter(provider, { broker }).runTurn!(
+        rawWireRequest(environmentXml), { headers: new Headers() }, event => events.push(event),
+      );
+      await browserFinished;
+      expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "upstream_server_error" });
+    } finally {
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
+      await broker.close();
+      await invocationOutcome;
     }
   }, 10_000);
 

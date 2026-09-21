@@ -125,8 +125,10 @@ handoff, cookie import, CDP login port, or temporary session-transfer directory.
 Automatic Full-mode first turns and normal cache misses receive a compact
 `<codex_bootstrap_context_json>` envelope containing the current task message. The omitted canonical
 system/developer/history records remain in the Runtime broker and are retrieved on demand through
-`codex_context_search` and `codex_context_read`, exposed via the existing
-`codex_tool_inventory`/`codex_tool_call` ABI. A retained continuation instead receives
+`codex_context_search` and `codex_context_read`, which are registered connector tools declared
+read-only. The `codex_tool_call` dispatch that carried them before remains as a compatibility path,
+because ChatGPT caches a connector's tool list under its identity and a conversation on the earlier
+schema cannot see a newly attached tool. A retained continuation instead receives
 `<codex_resume_context_json>`, carrying only the canonical suffix after its last assistant reply
 and omitting the system bootstrap that conversation already holds. Browser-only turns and
 compaction/new-epoch requests still receive the complete `<codex_context_json>` bootstrap because
@@ -137,6 +139,18 @@ attached natively with stable references; earlier images remain addressable in t
 Chat, so a resume does not resend them. The runtime does not create a context JSONL file, upload a
 synthetic context document, include prompt hashes, or silently truncate the envelope. Attachment
 acceptance and send readiness are verified before the turn begins.
+
+`codex_context_search` scores records rather than requiring one of them to contain the query as a
+string. A whole-phrase match still ranks first and in its original order, so a query that worked
+before returns what it returned before; behind it come records carrying some of the query's terms,
+ranked by how many. CJK runs contribute character bigrams, having no word separators to split on. A
+term carried by more than half the history is dropped when another term can carry the query, which
+finds the conversation's own filler words without a stop list. A query that matches nothing returns
+no matches and says so, with the tail of the history labelled as orientation rather than as results:
+an empty result is otherwise indistinguishable from an empty history, and a model that believes the
+history is empty stops asking it. Whether retrieval is working is measured, not assumed — `/healthz`
+reports `search_zero_matches` and `search_without_followup_read` next to the call counts, because
+having called search is not the same as having found anything.
 
 Retention is measured rather than assumed. Every turn that expected a retained conversation records
 a hit, or a miss naming each key component that rotated — and `conversation_lost` when nothing
@@ -207,6 +221,46 @@ every later tool action in the same turn continues to present the current turn c
 ChatGPT status rows become reasoning summaries, while stable prose between rows becomes native
 Codex commentary.
 
+## Wire observation
+
+Turn decisions are read from the rendered DOM: whether a submission was accepted, which reply is
+this turn's, whether generation is still running, whether a block is reasoning or the answer,
+whether the turn ended. Each of those is an inference over a private, unversioned presentation
+layer, and each fails silently — a classification error returns an empty answer and raises nothing.
+Measured over this repository's history, the three files holding that logic account for 119 of the
+changes made by fix commits, against 5 for the Zero Risk path, which reads no DOM at all.
+
+ChatGPT's own client does not infer any of it. It streams each turn over `fetch`, and the facts the
+DOM path derives are fields in that stream. A page-side observer reads the same bytes:
+
+- **Nothing is forged.** The page's client builds and sends every request, so anti-automation
+  tokens, headers, and TLS characteristics remain exactly what ChatGPT produced. This observes
+  traffic; it never synthesises it.
+- **Nothing is perturbed.** The response passes through a `TransformStream` rather than being
+  `clone()`d or `tee()`d. There is no second consumer and therefore no added backpressure:
+  observation happens on the page's own read. A body the page never reads is never observed, which
+  is correct, because those are bytes the user never saw either.
+- **Nothing propagates.** Every observation path is guarded, and the host refuses any record that
+  does not match the expected shape — the binding is an entry point from a remote origin.
+
+Framing is decoded to the WHATWG event-stream rules, which are public and therefore implemented
+exactly. The payload schema above it is private, so it is written to *recognise* rather than to
+assume: a frame matching no known shape becomes an explicit `unrecognized` event naming its keys,
+and a patch the fold cannot apply is counted rather than approximated. `/healthz` reports both
+tallies under `wire_observation`; their target is zero, and a non-zero value names the shape still
+to be understood instead of leaving a wrong answer to be discovered by a user.
+
+The observer currently holds no authority. Every turn is still decided by the DOM path, and the two
+conclusions are compared per turn so the disagreement rate is measured before anything depends on
+it. The comparison is shaped around the failure that motivated it: `dom_empty` — the DOM found
+nothing while the stream carried a reply — is its own outcome rather than part of a generic
+mismatch, because that is the signature of the silent failure. Comparisons record lengths, not text.
+
+Raw transcripts are what turn a live failure into an offline regression test, and are also verbatim
+copies of a conversation. They are therefore written only when `CODEX_CHATGPT_WEB_WIRE_TRANSCRIPTS`
+is set, into an owner-only directory, pruned to a bounded window. The counters need no content and
+are always on.
+
 ## Memory plane
 
 Codex Runtime is the only control plane for long-term memory. The browser never opens its own
@@ -222,6 +276,11 @@ model along two Runtime-owned paths:
   is told so explicitly, because silence would leave an empty search looking like an empty memory.
   Deeper capabilities remain discoverable through `codex_tool_inventory` and invocable by exact name
   with `codex_tool_call`, instead of requiring all such context to be preloaded into the prompt.
+  Discovery is not free: an inventory call that reaches the nested registry runs a program through
+  the outer `exec` gateway, which is a real command execution in the Codex task spent on the question
+  of what tools exist. `/healthz` reports those executions under `capability_traffic` separately from
+  the calls that did work, alongside the most inventory calls any one turn made — the number that
+  says whether caching the registry per turn would hit anything.
 
 Recalled memory carries explicit provenance — `kind=memory`, `source=openviking`,
 `trust=reference_data`, `instruction_authority=none` — and the shared contract states that
@@ -302,6 +361,16 @@ Browser-only mode uses the configured Chrome executable for backend-owned sign-i
 without a tunnel. Full mode separately downloads the official pinned
 `openai/tunnel-client` build for the current OS/architecture and verifies it against the release
 SHA-256 manifest.
+
+A build says which source produced it. The runtime manifest records the commit, whether that tree
+had uncommitted changes, and when the build ran; `/healthz`, `codex-chatgpt-web --build`, `doctor`,
+and the Launcher's first log record of each session all report it. Because a daemon keeps serving
+the build it started with, reinstalling a runtime changes nothing until that process restarts —
+both sides report the bundle they are running, so `doctor` decides that mismatch rather than
+leaving "the fix does not work" indistinguishable from "the fix is not running". The identity lives
+in the manifest rather than inside the bundle, because `bundleId` hashes the bundle's own files and
+an embedded timestamp would change that hash on every build; the manifest is excluded from the
+hash, so a build stays reproducible while still naming itself.
 
 On first launch, the embedded runtime is checked against a deterministic manifest covering every
 file path, size, and SHA-256 before any launcher port or window opens. The source, transactional

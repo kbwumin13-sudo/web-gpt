@@ -183,6 +183,32 @@ function validateRuntimeBundle(runtimeRoot, identity) {
   return inspectRuntimeBundle(runtimeRoot, identity).runtimeRoot;
 }
 
+/**
+ * Build identity of the installed runtime, which is also the Launcher's own. `prepare-runtime.cjs`
+ * builds the embedded bundle from the same working tree that produces the app bundle, in the same
+ * packaging run, so one identity describes both and the two cannot disagree. Provenance is
+ * diagnostic: an absent or malformed manifest yields null rather than blocking startup.
+ */
+function installedBuildProvenance(runtimeRoot) {
+  if (typeof runtimeRoot !== "string" || runtimeRoot.length === 0) return null;
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(runtimeRoot, "manifest.json"), "utf8"));
+  } catch {
+    return null;
+  }
+  const build = manifest?.build && typeof manifest.build === "object" && !Array.isArray(manifest.build)
+    ? manifest.build
+    : {};
+  const provenance = {
+    ...(typeof build.commit === "string" ? { commit: build.commit } : {}),
+    ...(typeof build.dirty === "boolean" ? { dirty: build.dirty } : {}),
+    ...(typeof build.builtAt === "string" ? { builtAt: build.builtAt } : {}),
+    ...(typeof manifest?.bundleId === "string" ? { bundleId: manifest.bundleId } : {}),
+  };
+  return Object.keys(provenance).length > 0 ? provenance : null;
+}
+
 async function waitForPackagedRuntimeSource({
   app,
   resourcesPath,
@@ -290,6 +316,7 @@ function ensurePackagedRuntime({ app, coreHome, resourcesPath }) {
 
 module.exports = {
   ensurePackagedRuntime,
+  installedBuildProvenance,
   validateRuntimeBundle,
   waitForPackagedRuntimeSource,
 };

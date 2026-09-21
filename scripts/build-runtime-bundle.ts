@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readWorkingTreeIdentity } from "../src/build-provenance";
 import { VERSION } from "../src/version";
 
 const root = resolve(import.meta.dir, "..");
@@ -197,10 +198,14 @@ function bundleIdFor(files: RuntimeManifestFile[]): string {
 
 const playwrightPackage = join(appDir, "node_modules", "playwright-core", "package.json");
 const files = runtimeManifestFiles();
+// Recorded outside the hashed file set on purpose: the timestamp would otherwise rotate `bundleId`
+// on every build, and `bundleId` is what tells an installed version directory apart from a rebuild
+// of the same source. See `src/build-provenance.ts`.
 writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
   schemaVersion: 2,
   appVersion: VERSION,
   bundleId: bundleIdFor(files),
+  build: readWorkingTreeIdentity(root),
   bunVersion: Bun.version,
   platform: process.platform,
   arch: process.arch,

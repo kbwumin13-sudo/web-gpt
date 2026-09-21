@@ -1,9 +1,9 @@
 {
   "name": "codex-web-gpt-launcher",
-  "version": "5.0.7",
+  "version": "5.0.7-local.25",
   "private": true,
   "description": "Desktop control center for Codex ChatGPT Web",
-  "author": "miuuyy",
+  "author": "codex-chatgpt-web contributors",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -57,6 +57,9 @@
       "dist/**",
       "electron/**",
       "assets/icon.png",
+      "assets/icon.icns",
+      "assets/icon.ico",
+      "assets/icon.svg",
       "assets/linux-appimage-runner.sh",
       "package.json"
     ],
@@ -68,7 +71,7 @@
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "icon": "assets/icon.png",
+      "icon": "assets/icon.icns",
       "minimumSystemVersion": "13.0",
       "hardenedRuntime": true,
       "signIgnore": [

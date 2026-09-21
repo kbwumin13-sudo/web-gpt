@@ -8,6 +8,13 @@ export const CHATGPT_COMPOSER_SELECTOR = [
   '[contenteditable="true"][data-lexical-editor="true"]',
   '[contenteditable="true"][role="textbox"]',
   'textarea[role="textbox"]',
+  // ChatGPT degrades to a plain textarea when its rich editor does not load, and that element
+  // carries none of the attributes above — no id, no data-testid, no role, no lexical marker.
+  // Measured live on 2026-09-18: all four selectors above matched zero elements while the page
+  // showed a working composer, so every turn failed at preparation with "login is expired".
+  // The class is a CSS-module name whose hash prefix changes; the readable suffix comes from the
+  // source and is the stable half.
+  'textarea[class*="fallbackTextarea"]',
 ].join(", ");
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
