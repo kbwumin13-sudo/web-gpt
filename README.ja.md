@@ -1,8 +1,5 @@
-<h1 align="center">Codex 用 ChatGPT Web</h1>
-
 <p align="center">
-  <strong>ChatGPT Web（Pro を含む）を Codex のネイティブモデルとして使用。</strong><br>
-  モデルの利用枠を切り替えて、いつものワークフローを維持できます。
+  <img src="docs/assets/readme-hero.svg" alt="ChatGPT Web for Codex — ChatGPT Web models in the native Codex workflow" width="100%">
 </p>
 
 <p align="center">
@@ -10,25 +7,42 @@
 </p>
 
 <p align="center">
-  <a href="TROUBLESHOOTING.md">トラブルシューティング</a> · <a href="SECURITY.md">セキュリティ</a> · <a href="CONTRIBUTING.md">コントリビューション</a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><img src="https://img.shields.io/github/v/release/kbwumin13-sudo/web-gpt?display_name=tag&amp;sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT ライセンス"></a>
+  <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 および x64">
 </p>
 
 <p align="center">
-  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT ライセンス"></a>
-  <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 および x64">
-  <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="API 料金なしの AI">
+  <a href="#クイックスタート"><strong>クイックスタート</strong></a> ·
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>最新リリース</strong></a> ·
+  <a href="docs/architecture.md"><strong>アーキテクチャ</strong></a> ·
+  <a href="TROUBLESHOOTING.md"><strong>トラブルシューティング</strong></a> ·
+  <a href="SECURITY.md"><strong>セキュリティ</strong></a>
 </p>
+
+> アカウントで利用できる ChatGPT Web モデルを Codex に持ち込みながら、ネイティブのタスク UI、
+> コンテキスト管理、ストリーミング、コンパクション、ツールハーネスを維持します。
+
+<table>
+  <tr>
+    <td width="33%"><strong>Native model picker</strong><br><sub>Codex から ChatGPT Web のモデル階層を直接選び、同じタスクで作業を続けられます。</sub></td>
+    <td width="33%"><strong>Full Codex harness</strong><br><sub>MCP 経由で現在のタスクのファイル、Shell、画像、承認、ツール、アプリに接続します。</sub></td>
+    <td width="33%"><strong>Task-bound sessions</strong><br><sub>連続ターンを同じセッションに保ち、境界では Codex のネイティブ compaction に引き継ぎます。</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/assets/codex-model-picker.png" alt="Codex のネイティブモデル選択画面に表示された ChatGPT Web モデル" width="520">
+</p>
+
+<p align="center"><sub>実際の Codex モデル選択画面。ChatGPT Web — Medium、High、Extra High、Pro、Instant がネイティブ Codex モデルと並んで表示されています。</sub></p>
 
 Free および Go アカウントでは、Codex のネイティブモデル選択画面に
 **ChatGPT Web — Luna** が追加されます。reasoning セレクターが表示されるアカウントでは、
 サブスクリプションで利用可能な **Instant**、**Medium**、**High**、**Extra High**、**Pro** を使用できます。
 ブリッジは、コンパイル済みの現在の Codex タスクコンテキストを新しい ChatGPT 一時チャットへ送り、
 画像を添付し、表示される reasoning、ツールアクティビティ、Markdown を同じ Codex タスクへストリーミングします。
-
-<p align="center">
-  <img src="assets/demo.gif" alt="ネイティブ Codex ハーネスを使用する ChatGPT Web ターン" width="960">
-</p>
 
 ```text
 Codex タスク ──Responses + SSE──▶ ヘッドレス Backend ──管理対象 Chrome──▶ ChatGPT
@@ -39,12 +53,6 @@ Codex タスク ──Responses + SSE──▶ ヘッドレス Backend ──管
 Codex はネイティブのタスク、コンテキストライフサイクル、UI、ツールハーネスを維持します。
 ローカル Responses ブリッジは、選択されたモデルのタスクだけをタスクに紐付いた ChatGPT 一時チャットへルーティングします。
 Full モードでは、次のコンパクション境界まで、MCP が ChatGPT を同じ Codex タスクのツールへ接続します。
-
-> [!TIP]
-> **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)** も開発しています。
-> ChatGPT/Codex の音声をローカル環境でほぼリアルタイムに変換するアプリです。
-> アカウント、ブラウザーセッション、ChatGPT リクエストには一切触れないため、
-> 使用によってアカウントがブロックされるリスクはありません。気に入っていただけたら、ぜひお試しください。
 
 ## 主な特長
 

@@ -1,8 +1,5 @@
-<h1 align="center">ChatGPT Web for Codex</h1>
-
 <p align="center">
-  <strong>将 ChatGPT Web（包括 Pro）作为 Codex 原生模型使用。</strong><br>
-  切换模型档位，保留原有工作流。
+  <img src="docs/assets/readme-hero.svg" alt="ChatGPT Web for Codex — 将 ChatGPT Web 接入 Codex 原生工作流" width="100%">
 </p>
 
 <p align="center">
@@ -10,24 +7,41 @@
 </p>
 
 <p align="center">
-  <a href="TROUBLESHOOTING.md">故障排除</a> · <a href="SECURITY.md">安全</a> · <a href="CONTRIBUTING.md">贡献</a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><img src="https://img.shields.io/github/v/release/kbwumin13-sudo/web-gpt?display_name=tag&amp;sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
 </p>
 
 <p align="center">
-  <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
-  <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="Free AI with no API fees">
+  <a href="#快速开始"><strong>快速开始</strong></a> ·
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>最新版本</strong></a> ·
+  <a href="docs/architecture.md"><strong>架构</strong></a> ·
+  <a href="TROUBLESHOOTING.md"><strong>故障排除</strong></a> ·
+  <a href="SECURITY.md"><strong>安全</strong></a>
 </p>
+
+> 把当前 ChatGPT 账户可用的 Web 模型带进 Codex，同时保留原生任务界面、上下文生命周期、
+> 流式输出、上下文压缩以及完整工具链。
+
+<table>
+  <tr>
+    <td width="33%"><strong>原生模型选择器</strong><br><sub>直接在 Codex 中选择 ChatGPT Web 档位，并继续使用同一个任务。</sub></td>
+    <td width="33%"><strong>完整 Codex Harness</strong><br><sub>通过 MCP 接入当前任务的文件、Shell、图片、审批、工具和应用。</sub></td>
+    <td width="33%"><strong>任务绑定会话</strong><br><sub>连续消息保持在同一会话中，并在边界处交回 Codex 原生上下文压缩。</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/assets/codex-model-picker.png" alt="Codex 原生模型选择器中的 ChatGPT Web 模型" width="520">
+</p>
+
+<p align="center"><sub>真实 Codex 模型选择器：ChatGPT Web — Medium、High、Extra High、Pro、Instant 与原生 Codex 模型并列显示。</sub></p>
 
 Free 和 Go 账户会在 Codex 原生模型选择器中看到 **ChatGPT Web — Luna**。具有推理选择器的
 账户仍会按订阅权限看到 **Instant**、**Medium**、**High**、**Extra High** 和 **Pro**。
 桥接程序会把当前编译后的 Codex 任务上下文发送到一个全新的 ChatGPT 临时聊天，附加图片，
 并将可见的推理过程、工具活动和 Markdown 流式传回同一个 Codex 任务。
-
-<p align="center">
-  <img src="assets/demo.gif" alt="ChatGPT Web 实时轮次正在使用原生 Codex harness" width="960">
-</p>
 
 ```text
 Codex task ──Responses + SSE──▶ 无头 Backend ──托管 Chrome──▶ ChatGPT
@@ -38,11 +52,6 @@ Codex task ──Responses + SSE──▶ 无头 Backend ──托管 Chrome─�
 Codex 会保留原生任务、上下文生命周期、界面和工具 harness。本地 Responses 桥接程序只会将
 所选模型的任务转发到与该任务绑定的 ChatGPT 临时聊天；在完整模式下，MCP 会把 ChatGPT 连接回
 同一个 Codex 任务的工具，直到下一次上下文压缩边界。
-
-> [!TIP]
-> 我还开发了 **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)**：一款
-> 能够近实时改变 ChatGPT/Codex 声音的本地应用。它不会接触你的账户、浏览器会话或 ChatGPT
-> 请求，因此不会带来账户封禁风险。如果你喜欢我的作品，欢迎试用。
 
 ## 亮点
 
