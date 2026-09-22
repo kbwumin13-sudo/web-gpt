@@ -21,27 +21,28 @@
   <a href="SECURITY.md"><strong>安全</strong></a>
 </p>
 
-> 把当前 ChatGPT 账户可用的 Web 模型带进 Codex，同时保留原生任务界面、上下文生命周期、
-> 流式输出、上下文压缩以及完整工具链。
+> **一个 Codex 任务，更多模型选择。** 把当前 ChatGPT 账户已经能用的 Web 模型直接带进
+> Codex 原生模型选择器，项目、上下文和工具都留在原来的任务里。
 
 <table>
   <tr>
-    <td width="33%"><strong>原生模型选择器</strong><br><sub>直接在 Codex 中选择 ChatGPT Web 档位，并继续使用同一个任务。</sub></td>
-    <td width="33%"><strong>完整 Codex Harness</strong><br><sub>通过 MCP 接入当前任务的文件、Shell、图片、审批、工具和应用。</sub></td>
-    <td width="33%"><strong>任务绑定会话</strong><br><sub>连续消息保持在同一会话中，并在边界处交回 Codex 原生上下文压缩。</sub></td>
+    <td width="33%"><strong>像原生模型一样选择</strong><br><sub>ChatGPT Web 档位直接与 Codex 模型并列显示，具体范围跟随当前账户权限。</sub></td>
+    <td width="33%"><strong>任务始终留在 Codex</strong><br><sub>原来的界面、上下文、图片、流式输出、追踪和压缩流程都继续使用。</sub></td>
+    <td width="33%"><strong>让 Web 模型真正接上工具</strong><br><sub>完整 harness 通过 MCP 接回文件、Shell、审批、工具和应用。</sub></td>
   </tr>
 </table>
+
+<p align="center"><strong>安装 → 登录 → 安装模型 → 选择 ChatGPT Web</strong><br><sub>无需模型 API Key，无需系统 Node/Bun，随时可以切回原生 Codex 模型。</sub></p>
 
 <p align="center">
   <img src="docs/assets/codex-model-picker.png" alt="Codex 原生模型选择器中的 ChatGPT Web 模型" width="520">
 </p>
 
-<p align="center"><sub>真实 Codex 模型选择器：ChatGPT Web — Medium、High、Extra High、Pro、Instant 与原生 Codex 模型并列显示。</sub></p>
+<p align="center"><sub>真实的 Codex 模型选择器——ChatGPT Web 模型直接与原生 Codex 模型并列显示，具体档位取决于当前账户权限。</sub></p>
 
-Free 和 Go 账户会在 Codex 原生模型选择器中看到 **ChatGPT Web — Luna**。具有推理选择器的
-账户仍会按订阅权限看到 **Instant**、**Medium**、**High**、**Extra High** 和 **Pro**。
-桥接程序会把当前编译后的 Codex 任务上下文发送到一个全新的 ChatGPT 临时聊天，附加图片，
-并将可见的推理过程、工具活动和 Markdown 流式传回同一个 Codex 任务。
+选择一个 Web 模型后照常发送任务即可。桥接会把当前编译后的 Codex 上下文与图片送入与该任务
+绑定的 ChatGPT 临时聊天，再把可见推理、工具活动和 Markdown 流式传回同一个任务。完整 harness
+模式下，MCP 还会把该 Web 模型重新接回当前任务的文件、Shell、审批、工具和应用。
 
 ```text
 Codex task ──Responses + SSE──▶ 无头 Backend ──托管 Chrome──▶ ChatGPT

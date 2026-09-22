@@ -21,28 +21,29 @@
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
-> Bring the ChatGPT Web models available to your account into Codex while keeping the native task
-> UI, context lifecycle, streaming, compaction, and tool harness.
+> **One Codex task. More model choice.** Bring the ChatGPT Web models already available to your
+> account into Codex's native model picker, then keep working exactly where your project already lives.
 
 <table>
   <tr>
-    <td width="33%"><strong>Native model picker</strong><br><sub>Choose ChatGPT Web tiers directly from Codex and keep working in the same task.</sub></td>
-    <td width="33%"><strong>Full Codex harness</strong><br><sub>Connect the active task's filesystem, shell, images, approvals, tools, and apps through MCP.</sub></td>
-    <td width="33%"><strong>Task-bound sessions</strong><br><sub>Keep sequential turns together and hand context back to native Codex compaction at the boundary.</sub></td>
+    <td width="33%"><strong>Pick it like a native model</strong><br><sub>ChatGPT Web tiers appear beside Codex models, using the access your account already exposes.</sub></td>
+    <td width="33%"><strong>Keep the task in Codex</strong><br><sub>The same UI, context, images, streaming, tracing, and compaction stay in place.</sub></td>
+    <td width="33%"><strong>Give it the full workspace</strong><br><sub>Full harness reconnects files, shell, approvals, tools, and apps through MCP.</sub></td>
   </tr>
 </table>
+
+<p align="center"><strong>Install → Sign in → Install models → Pick ChatGPT Web</strong><br><sub>No model API key. No system Node/Bun. Switch back to native Codex models at any time.</sub></p>
 
 <p align="center">
   <img src="docs/assets/codex-model-picker.png" alt="ChatGPT Web models in the native Codex model picker" width="520">
 </p>
 
-<p align="center"><sub>Real Codex model picker with ChatGPT Web — Medium, High, Extra High, Pro, and Instant available alongside native Codex models.</sub></p>
+<p align="center"><sub>The real Codex model picker — ChatGPT Web models sit beside native Codex models, with tiers based on what your account exposes.</sub></p>
 
-Free and Go accounts get **ChatGPT Web — Luna** in Codex's native model picker. Accounts that
-expose the reasoning selector keep **Instant**, **Medium**, **High**, **Extra High**, and **Pro** as
-their subscription allows. The bridge sends the current compiled Codex task context to a fresh
-ChatGPT Temporary Chat, attaches images, and streams visible reasoning, tool activity, and Markdown
-back into the same Codex task.
+Select a Web model and send the task as usual. The bridge forwards the compiled Codex context and
+images to a task-bound ChatGPT Temporary Chat, then streams visible reasoning, tool activity, and
+Markdown back into the same task. In Full harness mode, MCP reconnects that Web model to the task's
+files, shell, approvals, tools, and apps.
 
 ```text
 Codex task ──Responses + SSE──▶ Native Gateway ──native requests──▶ OpenAI Codex

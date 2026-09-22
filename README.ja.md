@@ -21,28 +21,29 @@
   <a href="SECURITY.md"><strong>セキュリティ</strong></a>
 </p>
 
-> アカウントで利用できる ChatGPT Web モデルを Codex に持ち込みながら、ネイティブのタスク UI、
-> コンテキスト管理、ストリーミング、コンパクション、ツールハーネスを維持します。
+> **1 つの Codex タスクで、より多くのモデルを。** 現在の ChatGPT アカウントで使える Web モデルを
+> Codex のネイティブモデル選択画面へ追加し、プロジェクトもコンテキストもツールも同じタスクに保ちます。
 
 <table>
   <tr>
-    <td width="33%"><strong>Native model picker</strong><br><sub>Codex から ChatGPT Web のモデル階層を直接選び、同じタスクで作業を続けられます。</sub></td>
-    <td width="33%"><strong>Full Codex harness</strong><br><sub>MCP 経由で現在のタスクのファイル、Shell、画像、承認、ツール、アプリに接続します。</sub></td>
-    <td width="33%"><strong>Task-bound sessions</strong><br><sub>連続ターンを同じセッションに保ち、境界では Codex のネイティブ compaction に引き継ぎます。</sub></td>
+    <td width="33%"><strong>ネイティブモデルのように選ぶ</strong><br><sub>ChatGPT Web の各ティアが Codex モデルの隣に並び、利用範囲は現在のアカウント権限に従います。</sub></td>
+    <td width="33%"><strong>タスクは Codex に残す</strong><br><sub>UI、コンテキスト、画像、ストリーミング、トレース、compaction をそのまま使えます。</sub></td>
+    <td width="33%"><strong>Web モデルにワークスペースを渡す</strong><br><sub>Full harness が MCP 経由でファイル、Shell、承認、ツール、アプリへ再接続します。</sub></td>
   </tr>
 </table>
+
+<p align="center"><strong>インストール → サインイン → モデルをインストール → ChatGPT Web を選択</strong><br><sub>モデル API Key もシステム Node/Bun も不要。いつでもネイティブ Codex モデルへ戻せます。</sub></p>
 
 <p align="center">
   <img src="docs/assets/codex-model-picker.png" alt="Codex のネイティブモデル選択画面に表示された ChatGPT Web モデル" width="520">
 </p>
 
-<p align="center"><sub>実際の Codex モデル選択画面。ChatGPT Web — Medium、High、Extra High、Pro、Instant がネイティブ Codex モデルと並んで表示されています。</sub></p>
+<p align="center"><sub>実際の Codex モデル選択画面。ChatGPT Web モデルがネイティブ Codex モデルの隣に並び、表示ティアは現在のアカウント権限に従います。</sub></p>
 
-Free および Go アカウントでは、Codex のネイティブモデル選択画面に
-**ChatGPT Web — Luna** が追加されます。reasoning セレクターが表示されるアカウントでは、
-サブスクリプションで利用可能な **Instant**、**Medium**、**High**、**Extra High**、**Pro** を使用できます。
-ブリッジは、コンパイル済みの現在の Codex タスクコンテキストを新しい ChatGPT 一時チャットへ送り、
-画像を添付し、表示される reasoning、ツールアクティビティ、Markdown を同じ Codex タスクへストリーミングします。
+Web モデルを選んだら、いつも通りタスクを送るだけです。ブリッジがコンパイル済みの Codex
+コンテキストと画像をタスクに紐付いた ChatGPT 一時チャットへ送り、表示される reasoning、
+ツールアクティビティ、Markdown を同じタスクへストリーミングします。Full harness モードでは、
+MCP がその Web モデルを現在のタスクのファイル、Shell、承認、ツール、アプリへ再接続します。
 
 ```text
 Codex タスク ──Responses + SSE──▶ ヘッドレス Backend ──管理対象 Chrome──▶ ChatGPT
