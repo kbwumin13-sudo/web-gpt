@@ -31,6 +31,19 @@ export interface ChatGptCompactionTelemetrySnapshot {
   failed: number;
   /** Longest round observed, in milliseconds. A caller's patience is finite and this is what it faces. */
   longest_ms: number;
+  /**
+   * Fresh rounds whose history did not fit one ChatGPT message and were summarised per segment.
+   *
+   * These four are the plan's cost and its losses, and they are the numbers that say whether the
+   * segment budgets are set anywhere near right. `leaves` over `hierarchical_rounds` is how many
+   * temporary chats an average recovery opens — the quantity that risks a Cloudflare challenge.
+   * `dropped_messages` and `elided_records` are history the checkpoint never saw; both should stay
+   * at zero for ordinary tasks, and a rising count means a budget is too small for real workloads.
+   */
+  hierarchical_rounds: number;
+  hierarchical_leaves: number;
+  hierarchical_dropped_messages: number;
+  hierarchical_elided_records: number;
 }
 
 let rounds = 0;
@@ -39,6 +52,10 @@ let delivered = 0;
 let abandoned = 0;
 let failed = 0;
 let longestMs = 0;
+let hierarchicalRounds = 0;
+let hierarchicalLeaves = 0;
+let hierarchicalDroppedMessages = 0;
+let hierarchicalElidedRecords = 0;
 const freshReasons = new Map<string, number>();
 
 /** Rounds in flight, bounded so a round that never settles cannot accumulate forever. */
@@ -54,6 +71,10 @@ export function chatGptCompactionTelemetrySnapshot(): ChatGptCompactionTelemetry
     abandoned,
     failed,
     longest_ms: longestMs,
+    hierarchical_rounds: hierarchicalRounds,
+    hierarchical_leaves: hierarchicalLeaves,
+    hierarchical_dropped_messages: hierarchicalDroppedMessages,
+    hierarchical_elided_records: hierarchicalElidedRecords,
   };
 }
 
@@ -65,8 +86,28 @@ export function resetChatGptCompactionTelemetry(): void {
   abandoned = 0;
   failed = 0;
   longestMs = 0;
+  hierarchicalRounds = 0;
+  hierarchicalLeaves = 0;
+  hierarchicalDroppedMessages = 0;
+  hierarchicalElidedRecords = 0;
   freshReasons.clear();
   openRounds.clear();
+}
+
+/**
+ * A fresh round that had to split its history. Recorded when the plan is made, not when it
+ * finishes, so a recovery that dies mid-plan is still visible as one that was attempted.
+ */
+export function recordChatGptCompactionHierarchy(
+  leaves: number,
+  droppedMessages: number,
+  elidedRecords: number,
+): string {
+  hierarchicalRounds += 1;
+  hierarchicalLeaves += leaves;
+  hierarchicalDroppedMessages += droppedMessages;
+  hierarchicalElidedRecords += elidedRecords;
+  return `[chatgpt-web] compaction hierarchy leaves=${leaves} droppedMessages=${droppedMessages} elidedRecords=${elidedRecords}`;
 }
 
 export function recordChatGptCompactionStarted(key: string, mode: ChatGptCompactionMode, now = Date.now()): void {

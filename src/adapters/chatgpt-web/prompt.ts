@@ -55,6 +55,15 @@ export interface CompileChatGptWebPromptOptions {
    * reads or mutates ChatGPT's DOM. Completion is accepted only through the bound Zero Risk MCP tools.
    */
   manualControl?: true;
+  /**
+   * JSON-byte ceiling for the compaction fit-recovery loop, replacing
+   * {@link CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET} for this compile.
+   *
+   * A hierarchical compaction leaf is sized by its planner against the limits the browser actually
+   * enforces, so the legacy single-message budget would trim history the leaf was built to carry.
+   * Only that planner supplies this; every other compaction keeps the legacy budget.
+   */
+  compactionPromptJsonByteBudget?: number;
 }
 
 export const CHATGPT_BIGGER_CONTEXT_PARTS = 3 as const;
@@ -353,11 +362,21 @@ export function bootstrapContractMessages(
   // be made conditional on the model remembering to search before its first command. The caller has
   // already removed superseded generated blocks, so these are the effective developer records.
   const instructions = messages.filter(message => message.role === "developer");
+  // A checkpoint is the only surviving task state after compaction. It must not depend on
+  // retrieval succeeding before a vague "continue" can be understood.
+  const checkpoint = messages.findLast(message => message.role === "user"
+    && isReadableCompactionSummaryText(typeof message.content === "string" ? message.content
+      : message.content.map(part => "text" in part ? part.text : "").join("")));
+  const withCheckpoint = (selected: CodexMessage[]): CodexMessage[] => {
+    if (!checkpoint || selected.includes(checkpoint)) return selected;
+    const included = new Set([...selected, checkpoint]);
+    return messages.filter(message => included.has(message));
+  };
   const latestTask = messages.findLastIndex(message => message.role === "user" || message.role === "agentMessage");
   if (latestTask < 0) return instructions.length > 0 ? instructions : messages.length > 0 ? [messages.at(-1)!] : [];
   // Zero Risk drives a chat a person is looking at, and the launcher may reuse it; the previous
   // reply is already on their screen, so carrying it again would only duplicate it.
-  if (maxRecentChars <= 0) return [...instructions, messages[latestTask]!];
+  if (maxRecentChars <= 0) return withCheckpoint([...instructions, messages[latestTask]!]);
   const previous: CodexMessage[] = [];
   let budget = maxRecentChars;
   // The reply that the follow-up is about, then the request that produced it. Tool records in
@@ -371,7 +390,7 @@ export function bootstrapContractMessages(
     );
     if (request >= 0 && messageChars(messages[request]!) <= budget) previous.unshift(messages[request]!);
   }
-  return [...instructions, ...previous, messages[latestTask]!];
+  return withCheckpoint([...instructions, ...previous, messages[latestTask]!]);
 }
 
 function messageEnvelope(
@@ -849,15 +868,24 @@ export function compileChatGptWebPrompt(
   let compiled = build(sourceMessages);
   if (!parsed._compactionRequest) return compiled;
 
-  // The 110k edge budget was measured for the old single-message compaction envelope. Bigger
-  // Context stages are governed by the same model-specific per-message token and composer limits
-  // as ordinary multipart turns in browser-worker. Applying the legacy byte cap here silently
-  // discarded context that the staged transport can carry; preserve it and let browser preflight
-  // fail explicitly if any atomic record is genuinely too large for one stage.
-  if (compiled.multipart) return compiled;
+  // A checkpoint is never staged. Staging requires the model to answer every part but the last with
+  // an exact CODEX_MULTIPART_ACK echo, and a fresh compaction is the case that pushes one part past
+  // the size where that echo still arrives: a 298k-token history staged a ~102k-token part, ChatGPT
+  // accepted the submission, and the round then died at its stage deadline having produced nothing.
+  // Fresh compaction is summarized per segment instead (hierarchical-compaction.ts), and every
+  // segment fits one message, so reaching here means a caller asked for a transport that cannot
+  // complete rather than one that is merely large.
+  if (compiled.multipart) {
+    throw new ChatGptWebAdapterError(
+      "A ChatGPT compaction checkpoint cannot be staged across Bigger Context parts, because staging depends on an exact acknowledgement that a checkpoint-sized part does not reliably receive. Summarize the history per segment instead.",
+      { status: 400, errorType: "invalid_request_error", code: "compaction_multipart_unsupported", retryable: false },
+    );
+  }
 
+  const compactionByteBudget = options?.compactionPromptJsonByteBudget
+    ?? CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET;
   const exceedsCompactionBudget = (): boolean => (
-    chatGptPromptJsonBytes(compiled.text) > CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET
+    chatGptPromptJsonBytes(compiled.text) > compactionByteBudget
   );
 
   // Match native Codex compaction recovery: discard oldest history items one at a time until the

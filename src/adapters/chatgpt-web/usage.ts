@@ -59,9 +59,16 @@ export function estimateChatGptWebInputTokens(
 }
 
 /**
- * The compaction threshold chooses the initial part count. Whole records and composer limits
- * can require more parts even when the total token estimate is small. Plan before submission;
- * compaction always receives all three parts without passing through the legacy inline budget.
+ * The token threshold chooses the initial part count. Whole records and composer limits can require
+ * more parts even when the total token estimate is small, so plan before submission.
+ *
+ * Compaction never stages. Multipart's contract requires the model to reply with an exact
+ * `CODEX_MULTIPART_ACK` echo for every part but the last, and a fresh compaction is precisely the
+ * case that pushes one part past the size where ChatGPT still produces that echo: a 298k-token
+ * history staged a ~102k-token part that was accepted and then never acknowledged, and the round
+ * died at its stage deadline with no summary. Fresh compaction now splits into per-segment
+ * summarization turns instead (see hierarchical-compaction.ts), each of which fits one message, so
+ * it has nothing to stage.
  */
 export function resolveBiggerContextMultipartParts(
   parsed: CodexParsedRequest,
@@ -73,8 +80,8 @@ export function resolveBiggerContextMultipartParts(
   if (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error("Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget");
   }
+  if (parsed._compactionRequest) return undefined;
   const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
-  if (parsed._compactionRequest) return CHATGPT_BIGGER_CONTEXT_PARTS;
   const { contextWindow, autoCompactTokenLimit } = resolveChatGptWebContextLimits(
     CHATGPT_WEB_BACKEND_MODEL,
     mode.effort,
@@ -86,7 +93,7 @@ export function resolveBiggerContextMultipartParts(
   );
   const inline = compile();
   const inputTokens = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
-  const initialParts = biggerContextPartCount(inputTokens, autoCompactTokenLimit, false);
+  const initialParts = biggerContextPartCount(inputTokens, autoCompactTokenLimit);
   if (initialParts === CHATGPT_BIGGER_CONTEXT_PARTS) return initialParts;
 
   const fits = (compiled: CompiledChatGptWebPrompt): boolean => {
@@ -113,9 +120,7 @@ export function resolveBiggerContextMultipartParts(
 export function biggerContextPartCount(
   inputTokens: number,
   onePartLimit: number,
-  compaction: boolean,
 ): ChatGptWebMultipartPartCount | undefined {
-  if (compaction) return CHATGPT_BIGGER_CONTEXT_PARTS;
   if (inputTokens < onePartLimit) return undefined;
   if (inputTokens < onePartLimit * 2) return 2;
   return CHATGPT_BIGGER_CONTEXT_PARTS;

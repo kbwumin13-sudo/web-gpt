@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
 import { COMPACT_PROMPT, SUMMARY_PREFIX, decodeCompactionSummary, encodeCompactionSummary } from "../src/responses/compaction";
+import { rememberResponseState } from "../src/responses/state";
 import { compactRequest, responseRequest as respond } from "../src/server";
 import type { CodexProviderConfig } from "../src/types";
 import { extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
@@ -96,6 +97,103 @@ test("compacts a Pro task with Pro effort", async () => {
   }));
 
   expect(response.status).toBe(200);
+});
+
+test("rejects official opaque compaction before Web routing, accepts ocx1, and preserves native passthrough", async () => {
+  const officialCheckpoint = {
+    type: "compaction",
+    encrypted_content: "gAAAAABofficial-encrypted-checkpoint",
+  };
+  let adapterStarts = 0;
+  const adapterFactory = (): ProviderAdapter => ({
+    name: "ocx1-compatibility-check",
+    async runTurn(parsed, _incoming, emit) {
+      adapterStarts += 1;
+      expect(parsed.context.messages).toContainEqual(expect.objectContaining({
+        role: "user",
+        content: `${SUMMARY_PREFIX}\n\nRecovered bridge checkpoint`,
+      }));
+      emit({ type: "text_delta", text: "Bridge checkpoint recovered", phase: "final_answer" });
+      emit({ type: "done", stopReason: "stop", endTurn: true });
+    },
+  });
+
+  const rejected = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      input: [officialCheckpoint, { type: "message", role: "user", content: "Continue" }],
+    }),
+  }), defaultConfig("browser-only"), adapterFactory);
+
+  expect(rejected.status).toBe(400);
+  expect(adapterStarts).toBe(0);
+  expect((await rejected.json() as { error: { message: string } }).error.message)
+    .toContain("official encrypted compaction checkpoint");
+
+  const compatible = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      input: [{ ...officialCheckpoint, encrypted_content: encodeCompactionSummary("Recovered bridge checkpoint") },
+        { type: "message", role: "user", content: "Continue" }],
+    }),
+  }), defaultConfig("browser-only"), adapterFactory);
+
+  expect(compatible.status).toBe(200);
+  expect(adapterStarts).toBe(1);
+
+  const nativeBody = { model: "gpt-5.6-sol", stream: false, input: [officialCheckpoint] };
+  let forwarded: unknown;
+  const native = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { authorization: "Bearer codex-oauth-token", "content-type": "application/json" },
+    body: JSON.stringify(nativeBody),
+  }), defaultConfig("browser-only"), undefined, {
+    fetchUpstream: async request => {
+      forwarded = await request.json();
+      return Response.json({ ok: true });
+    },
+  });
+
+  expect(native.status).toBe(200);
+  expect(forwarded).toEqual(nativeBody);
+});
+
+test("rejects an official opaque checkpoint restored through previous_response_id before Web routing", async () => {
+  const previousResponseId = `resp_opaque_compaction_${crypto.randomUUID()}`;
+  rememberResponseState({
+    model,
+    input: [{ type: "compaction", encrypted_content: "gAAAAABrestored-official-checkpoint" }],
+  }, {
+    id: previousResponseId,
+    output: [],
+    status: "completed",
+  });
+  let adapterStarted = false;
+
+  const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      previous_response_id: previousResponseId,
+      input: "Continue",
+    }),
+  }), defaultConfig("browser-only"), () => {
+    adapterStarted = true;
+    throw new Error("opaque restored history must not open a Web turn");
+  });
+
+  expect(response.status).toBe(400);
+  expect(adapterStarted).toBeFalse();
+  expect((await response.json() as { error: { message: string } }).error.message)
+    .toContain("official encrypted compaction checkpoint");
 });
 
 test("preserves canonical Codex turn metadata from the compact endpoint header", async () => {

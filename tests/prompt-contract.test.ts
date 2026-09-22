@@ -275,12 +275,11 @@ test("Bigger Context sends three semantic record envelopes and starts work from 
   expect(commit.match(new RegExp(token, "g"))).toHaveLength(1);
 });
 
-test("Bigger Context uses the minimum transport and reserves three stages for compaction", () => {
-  expect(biggerContextPartCount(94_999, 95_000, false)).toBeUndefined();
-  expect(biggerContextPartCount(95_000, 95_000, false)).toBe(2);
-  expect(biggerContextPartCount(189_999, 95_000, false)).toBe(2);
-  expect(biggerContextPartCount(190_000, 95_000, false)).toBe(3);
-  expect(biggerContextPartCount(1, 95_000, true)).toBe(3);
+test("Bigger Context uses the minimum transport that fits the estimated input", () => {
+  expect(biggerContextPartCount(94_999, 95_000)).toBeUndefined();
+  expect(biggerContextPartCount(95_000, 95_000)).toBe(2);
+  expect(biggerContextPartCount(189_999, 95_000)).toBe(2);
+  expect(biggerContextPartCount(190_000, 95_000)).toBe(3);
 
   const compiled = compileChatGptWebPrompt(
     request("high"),
@@ -373,39 +372,34 @@ test("Web compaction trims only the oldest history until the browser request fit
   expect(untrimmed.trimmedCompactionMessages).toBeUndefined();
 });
 
-test("Bigger Context compaction preserves history above the retired inline byte budget", () => {
-  const compact = request("high");
-  compact._compactionRequest = true;
-  compact.context.systemPrompt = [];
-  compact.context.messages = Array.from({ length: 6 }, (_unused, index) => ({
-    role: "user" as const,
-    content: `multipart-history-${index + 1}-${String.fromCharCode(97 + index).repeat(160_000)}`,
-    timestamp: index + 1,
-  }));
-
-  const multipart = compileChatGptWebPrompt(
-    compact,
-    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
-    undefined,
-    { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
-  );
-
-  expect(multipart.trimmedCompactionMessages).toBeUndefined();
-  expect(multipart.multipart?.parts).toHaveLength(3);
-  const transactionId = `ctx_${"0".repeat(32)}`;
-  const stageBytes = multipart.multipart!.parts.map((payload, index) => chatGptPromptJsonBytes(
-    formatChatGptWebMultipartStage(payload, transactionId, index + 1).text,
-  ));
-  expect(Math.max(...stageBytes)).toBeGreaterThan(CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET);
-  const staged = multipart.multipart!.parts.join("\n");
-  for (let index = 1; index <= 6; index += 1) {
-    expect(staged).toContain(`multipart-history-${index}-`);
+test("a compaction checkpoint refuses to be staged, at any size", () => {
+  // Staging needs an exact CODEX_MULTIPART_ACK echo for every part but the last. A checkpoint-sized
+  // part is where that echo stopped arriving, so this is not a budget the caller can raise: fresh
+  // compaction is summarized per segment instead (hierarchical-compaction.ts). Nothing in the
+  // production path asks for this — the guard is what keeps it from being reintroduced.
+  for (const contentChars of [400, 160_000]) {
+    const compact = request("high");
+    compact._compactionRequest = true;
+    compact.context.systemPrompt = [];
+    compact.context.messages = Array.from({ length: 6 }, (_unused, index) => ({
+      role: "user" as const,
+      content: `multipart-history-${index + 1}-${String.fromCharCode(97 + index).repeat(contentChars)}`,
+      timestamp: index + 1,
+    }));
+    expect(() => compileChatGptWebPrompt(
+      compact,
+      { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+      undefined,
+      { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
+    )).toThrow("cannot be staged across Bigger Context parts");
+    expect(compact.context.messages).toHaveLength(6);
   }
 });
 
 test("Bigger Context minimizes the largest ordered stage instead of overfilling a middle part", () => {
+  // An ordinary large task, not a checkpoint: partitioning is what is under test, and a checkpoint
+  // is no longer allowed to stage at all.
   const compact = request("high");
-  compact._compactionRequest = true;
   compact.context.systemPrompt = ["system".repeat(1_000)];
   compact.context.messages = [
     ...Array.from({ length: 3 }, (_unused, index) => ({

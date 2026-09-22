@@ -1,10 +1,16 @@
 import {
   recordChatGptCompactionFreshReason,
+  recordChatGptCompactionHierarchy,
   recordChatGptCompactionSettled,
   recordChatGptCompactionStarted,
 } from "./compaction-telemetry";
+import {
+  CHATGPT_COMPACTION_LEAF_JSON_BYTE_BUDGET,
+  MAX_CHATGPT_COMPACTION_LEAVES,
+  planHierarchicalCompaction,
+} from "./hierarchical-compaction";
 import { createHash, randomBytes } from "node:crypto";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
 import {
@@ -41,6 +47,11 @@ import {
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
 import { ChatGptExternalTurnProgress } from "./turn-progress";
+import {
+  chatGptTurnResultJournal,
+  configureChatGptTurnResultJournal,
+  TurnResultJournalPersistenceError,
+} from "./turn-result-journal";
 import {
   canonicalizeCompactionHandoff,
   compactionGenerationTimeoutMs,
@@ -236,10 +247,12 @@ export type StructuredCompactionMode = "retained" | "fresh" | "unavailable";
 export function structuredCompactionMode(options: {
   manualRequest: boolean;
   hasRetainedLauncher: boolean;
+  hasRetainedConversationHost?: boolean;
   hasStructuredBroker: boolean;
 }): StructuredCompactionMode {
-  if (options.manualRequest) return options.hasRetainedLauncher ? "retained" : "unavailable";
-  if (options.hasRetainedLauncher) return "retained";
+  const hasRetainedConversationHost = options.hasRetainedConversationHost ?? options.hasRetainedLauncher;
+  if (options.manualRequest) return hasRetainedConversationHost ? "retained" : "unavailable";
+  if (hasRetainedConversationHost) return "retained";
   return options.hasStructuredBroker ? "fresh" : "unavailable";
 }
 
@@ -412,11 +425,13 @@ export function createChatGptWebAdapter(
       throw new Error("ChatGPT Zero Risk requires the Launcher browser host");
     }
   }
-  const environmentStore = new ChatGptThreadEnvironmentStore(
-    provider.chatgptWeb?.threadEnvironmentStatePath
-      ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
-      : undefined,
-  );
+  const threadEnvironmentStatePath = provider.chatgptWeb?.threadEnvironmentStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
+    : undefined;
+  if (threadEnvironmentStatePath) {
+    configureChatGptTurnResultJournal(join(dirname(threadEnvironmentStatePath), "turn-results.json"));
+  }
+  const environmentStore = new ChatGptThreadEnvironmentStore(threadEnvironmentStatePath);
   const lunaCheckpointStore = new ChatGptLunaCheckpointStore(
     provider.chatgptWeb?.lunaCheckpointStatePath
       ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
@@ -503,6 +518,13 @@ export function createChatGptWebAdapter(
         : undefined;
       return {
         captureLunaCheckpoint,
+        // A fresh compaction is sized by planHierarchicalCompaction against the limits the browser
+        // enforces, so the legacy single-message byte budget would trim history the plan was built
+        // to carry — the silent loss the plan exists to remove. Zero Risk keeps the legacy budget:
+        // there the transport is a person pasting one prompt, which the planner does not split.
+        ...(input._compactionRequest && !manualRequest
+          ? { compactionPromptJsonByteBudget: CHATGPT_COMPACTION_LEAF_JSON_BYTE_BUDGET }
+          : {}),
         ...(retainedResume ? { retainedResume: true as const } : {}),
         ...(mode.localTools && !retainedResume && !input._compactionRequest
           ? (() => {
@@ -995,6 +1017,7 @@ export function createChatGptWebAdapter(
           const compactionMode = structuredCompactionMode({
             manualRequest,
             hasRetainedLauncher: retainedLauncherDescriptor !== undefined,
+            hasRetainedConversationHost: retainedConversationHostAvailable,
             hasStructuredBroker: structuredBroker !== undefined,
           });
           if (structuredCompactionRequired && compactionMode === "unavailable") {
@@ -1035,6 +1058,14 @@ export function createChatGptWebAdapter(
                     compactionTraceId,
                     handoffTraceId,
                     `${handoffTraceId}_fallback`,
+                    // A hierarchical fresh recovery runs one browser turn per segment plus a
+                    // merge. Cancelling the round has to reach whichever of them is live, so the
+                    // bounded set of traces it can use is registered up front.
+                    `${handoffTraceId}_merge`,
+                    ...Array.from(
+                      { length: MAX_CHATGPT_COMPACTION_LEAVES },
+                      (_leaf, index) => `${handoffTraceId}_segment${index + 1}`,
+                    ),
                   ],
                   ...(compactionNativeIdentity.threadId
                     ? { nativeThreadId: compactionNativeIdentity.threadId }
@@ -1081,6 +1112,41 @@ export function createChatGptWebAdapter(
                   armTransportDeadline();
                   const operationSignal = AbortSignal.any([operatorSignal, handoffDeadline.signal]);
                   const sourceConversationKey = chatGptConversationKey(parsed, executionNamespace);
+                  // One isolated summarization turn, run to its answer. Every fresh compaction is
+                  // built from these: a small history is one of them, a large history is several
+                  // segment turns plus a merge.
+                  const runFreshCompactionTurn = async (
+                    input: CodexParsedRequest,
+                    traceSuffix: string,
+                  ): Promise<string> => {
+                    // Transport keeps the short liveness budget. Once ChatGPT accepts the prompt,
+                    // generation gets its own longer inactivity budget and visible progress renews
+                    // only that generation budget. Re-armed per turn, so a plan's later segments
+                    // are not charged for the time its earlier ones already spent.
+                    armTransportDeadline();
+                    const runtime = startRuntime(
+                      input,
+                      manualRequest ? environment : undefined,
+                      `${handoffTraceId}_${traceSuffix}`,
+                      turnCapabilities,
+                      {
+                        onCompactionTransportProgress: armTransportDeadline,
+                        onCompactionGenerationStarted: armGenerationDeadline,
+                        onCompactionGenerationProgress: armGenerationDeadline,
+                      },
+                    );
+                    retainOwnershipUntil(runtime.physicalSettlement);
+                    try {
+                      const answer = await withAbort(runtime.browser, operationSignal);
+                      await withAbort(runtime.physicalSettlement, operationSignal);
+                      return answer;
+                    } catch (error) {
+                      runtime.cancel(error instanceof Error ? error : new Error(String(error)));
+                      // The shared owner retains physical settlement independently of this error.
+                      // Neither a timeout nor operator cancellation can open a competing trace.
+                      throw error;
+                    }
+                  };
                   const runFreshCompactionFallback = async (reason: string): Promise<string> => {
                     console.warn(`[chatgpt-web] retained compaction fallback=${reason}`);
                     recordChatGptCompactionFreshReason(reason);
@@ -1095,32 +1161,29 @@ export function createChatGptWebAdapter(
                           options: { ...parsed.options, reasoning: "high" },
                         }
                       : parsed;
-                    // Multipart transport keeps the short liveness budget. Once ChatGPT accepts
-                    // the final compact prompt, Pro generation gets its own longer inactivity
-                    // budget and visible progress renews only that generation budget.
-                    armTransportDeadline();
-                    const fallbackRuntime = startRuntime(
-                      fallbackInput,
-                      manualRequest ? environment : undefined,
-                      `${handoffTraceId}_fallback`,
-                      turnCapabilities,
-                      {
-                        onCompactionTransportProgress: armTransportDeadline,
-                        onCompactionGenerationStarted: armGenerationDeadline,
-                        onCompactionGenerationProgress: armGenerationDeadline,
-                      },
-                    );
-                    retainOwnershipUntil(fallbackRuntime.physicalSettlement);
-                    try {
-                      const rawSummary = await withAbort(fallbackRuntime.browser, operationSignal);
-                      await withAbort(fallbackRuntime.physicalSettlement, operationSignal);
-                      return canonicalizeCompactionHandoff(parsed, rawSummary);
-                    } catch (error) {
-                      fallbackRuntime.cancel(error instanceof Error ? error : new Error(String(error)));
-                      // The shared owner retains physical settlement independently of this error.
-                      // Neither a timeout nor operator cancellation can open a competing trace.
-                      throw error;
+                    // A history that fits one ChatGPT message keeps the single-turn path. Only one
+                    // that does not is split, because each segment costs its own temporary chat.
+                    const plan = planHierarchicalCompaction(fallbackInput, turnCapabilities);
+                    if (!plan) {
+                      return canonicalizeCompactionHandoff(
+                        parsed,
+                        await runFreshCompactionTurn(fallbackInput, "fallback"),
+                      );
                     }
+                    console.warn(recordChatGptCompactionHierarchy(
+                      plan.leaves.length, plan.droppedMessages, plan.elidedRecords,
+                    ));
+                    const summaries: string[] = [];
+                    // Sequential: the segments share one native thread's browser surface, and
+                    // opening temporary chats in parallel is what draws an interactive challenge
+                    // that no automated turn can clear.
+                    for (const leaf of plan.leaves) {
+                      summaries.push(await runFreshCompactionTurn(leaf.request, `segment${leaf.index}`));
+                    }
+                    return canonicalizeCompactionHandoff(
+                      parsed,
+                      await runFreshCompactionTurn(plan.merge(summaries), "merge"),
+                    );
                   };
                   let source: ChatGptTurnSession | undefined;
                   let preserveFinalResponse = false;
@@ -1305,10 +1368,11 @@ export function createChatGptWebAdapter(
               if (failedLine) console.warn(failedLine);
               emit({
                 type: "error",
-                message: "ChatGPT did not complete the context handoff. Retry the task.",
-                status: 409,
-                errorType: "invalid_request_error",
-                code: "compaction_handoff_failed",
+                message: handoffError instanceof ChatGptWebAdapterError
+                  ? handoffError.message : "ChatGPT did not complete the context handoff. Retry the task.",
+                status: handoffError instanceof ChatGptWebAdapterError ? handoffError.status : 409,
+                errorType: handoffError instanceof ChatGptWebAdapterError ? handoffError.errorType : "invalid_request_error",
+                code: handoffError instanceof ChatGptWebAdapterError ? handoffError.code : "compaction_handoff_failed",
                 retryable: false,
               });
               return;
@@ -1409,6 +1473,12 @@ export function createChatGptWebAdapter(
               const reasoning = session.roundReasoning(roundKey);
               session.setFinalReasoning(reasoning);
               session.setFinalEvents(session.roundEvents(roundKey));
+              chatGptTurnResultJournal.record(
+                executionKey,
+                settled.answer,
+                session.eventsForFinalReplay(),
+                session.reasoningForFinalReplay(),
+              );
               emitRoundBatch(buffer => emitBrowserCompletion(
                 settled,
                 estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities, experimentalBiggerContext),
@@ -1528,6 +1598,12 @@ export function createChatGptWebAdapter(
                 if (bufferStructuredOutput) {
                   emitRoundBatch(buffer => emitTextDeltas([completedOutcome.answer], buffer));
                 }
+                chatGptTurnResultJournal.record(
+                  executionKey,
+                  completedOutcome.answer,
+                  session.eventsForFinalReplay(),
+                  session.reasoningForFinalReplay(),
+                );
                 emitRoundBatch(buffer => emitBrowserCompletion(
                   completedOutcome,
                   estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities, experimentalBiggerContext),
@@ -1609,6 +1685,13 @@ export function createChatGptWebAdapter(
             }
             // Automatic browser turns keep their exact execution and journal for reconnect. Their
             // owned DOM observer can continue proving the same accepted ChatGPT submission.
+            throw error;
+          }
+          if (error instanceof TurnResultJournalPersistenceError) {
+            // The browser already completed and its exact session still owns the published result.
+            // Do not retire it for a local disk failure: a same-key retry can persist and replay the
+            // existing final without resubmitting browser work. The error remains visible so this
+            // path never claims durable recovery before the snapshot write succeeds.
             throw error;
           }
           const turnError = submittedTurnFailure(session, error);
