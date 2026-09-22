@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
+import { COMPACT_PROMPT } from "../src/responses/compaction";
 import { mock } from "node:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
@@ -49,7 +50,7 @@ import {
   structuredCompactionHandoffInstruction,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
-import { TurnResultJournal } from "../src/adapters/chatgpt-web/turn-result-journal";
+import { chatGptTurnResultJournal, configureChatGptTurnResultJournal, TurnResultJournal } from "../src/adapters/chatgpt-web/turn-result-journal";
 
 /**
  * These fixtures hand the turn broker a Unix socket under their temp root. macOS puts TMPDIR at
@@ -1170,14 +1171,248 @@ test("turn result journal treats identical results as idempotent and preserves c
   expect(journal.get("k")?.answer).toBe("summary");
 });
 
-test("adapter compact returns one same-agent handoff and preserves a pre-existing ordinary final", async () => {
+test("persistent turn result journal restores exact final replay records without reasoning", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-turn-result-journal-"));
+  const statePath = join(root, "runtime", "turn-results.json");
+  try {
+    const first = new TurnResultJournal(30 * 60_000, 256, { statePath });
+    first.record("execution_exact", "Published final", [
+      { type: "text_delta", text: "Published " },
+      { type: "thinking_delta", thinking: "must not persist" },
+      { type: "assistant_boundary" },
+    ], ["hidden reasoning"]);
+
+    expect(existsSync(statePath)).toBeTrue();
+    expect(statSync(statePath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(statePath, "utf8")).not.toContain("hidden reasoning");
+    expect(readFileSync(statePath, "utf8")).not.toContain("must not persist");
+    expect(readFileSync(statePath, "utf8")).not.toContain("assistant_boundary");
+
+    const rebuilt = new TurnResultJournal(30 * 60_000, 256, { statePath });
+    expect(rebuilt.get("execution_exact")).toMatchObject({
+      answer: "Published final",
+      events: [{ type: "text_delta", text: "Published " }],
+      reasoning: [],
+    });
+    expect(rebuilt.get("execution_other")).toBeUndefined();
+    expect(rebuilt.record("execution_exact", "Published final", [
+      { type: "text_delta", text: "Published " },
+      { type: "assistant_boundary" },
+    ], ["different hidden reasoning"]).kind)
+      .toBe("duplicate");
+    expect(rebuilt.record("execution_exact", "Different final").kind).toBe("conflict");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persistent turn result journal retains the prior record when a snapshot write fails", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-turn-result-write-failure-"));
+  const statePath = join(root, "turn-results.json");
+  let failWrites = false;
+  const writeSnapshot = (path: string, data: string): void => {
+    if (failWrites) throw new Error("simulated snapshot failure");
+    writeFileSync(path, data, { mode: 0o600 });
+  };
+  const originalNow = Date.now;
+  let now = 1;
+  Date.now = () => now;
+  try {
+    const journal = new TurnResultJournal(30 * 60_000, 256, { statePath, writeSnapshot });
+    const old = journal.record("execution_old", "Old final");
+    expect(old.kind).toBe("recorded");
+    if (old.kind !== "recorded") throw new Error("expected initial turn result record");
+    const originalCreatedAt = old.record.createdAt;
+    failWrites = true;
+    now = 2;
+    expect(() => journal.record("execution_old", "Old final")).toThrow("Turn result journal persistence failed");
+    expect(old.record.createdAt).toBe(originalCreatedAt);
+    expect(journal.get("execution_old")?.answer).toBe("Old final");
+    expect(journal.get("execution_new")).toBeUndefined();
+  } finally {
+    Date.now = originalNow;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("corrupt persistent turn result journal fails closed", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-turn-result-corrupt-"));
+  const statePath = join(root, "turn-results.json");
+  try {
+    writeFileSync(statePath, "{ not valid json", { mode: 0o600 });
+    expect(() => new TurnResultJournal(30 * 60_000, 256, { statePath })).toThrow("invalid");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persistent turn result journal rejects snapshots above its configured bound", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-turn-result-overflow-"));
+  const statePath = join(root, "turn-results.json");
+  try {
+    writeFileSync(statePath, JSON.stringify({
+      version: 1,
+      records: ["first", "second"].map(executionKey => ({
+        executionKey,
+        answer: "Published final",
+        events: [],
+        createdAt: Date.now(),
+      })),
+    }), { mode: 0o600 });
+    expect(() => new TurnResultJournal(30 * 60_000, 1, { statePath })).toThrow("invalid");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary final results are journaled under their exact execution key", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-ordinary-result-journal-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://ordinary-result-journal-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "managed-chrome",
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: false,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const ordinary = request(false);
+  const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(ordinary)}`;
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    const prepared = await turn.prepare();
+    prepared.release();
+    turn.onTextDelta("Ordinary published final");
+    return "Ordinary published final";
+  };
+  try {
+    await createChatGptWebAdapter(provider).runTurn!(ordinary, { headers: new Headers() }, () => {});
+    expect(chatGptTurnResultJournal.get(executionKey)).toMatchObject({
+      answer: "Ordinary published final",
+    });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnResultJournal.delete(executionKey);
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persistent final replay restores an adapter session without restarting the browser", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-persistent-final-replay-"));
+  const threadEnvironmentStatePath = join(root, "runtime", "thread-environments.json");
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://persistent-final-replay-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "managed-chrome",
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      threadEnvironmentStatePath,
+      localToolsEnabled: false,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const ordinary = request(false);
+  const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(ordinary)}`;
+  const statePath = join(root, "runtime", "turn-results.json");
+  new TurnResultJournal(30 * 60_000, 256, { statePath }).record(
+    executionKey,
+    "Persistent published final",
+    [{ type: "text_delta", text: "Persistent published final" }],
+  );
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  let browserStarts = 0;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => {
+    browserStarts += 1;
+    throw new Error("persistent final replay must not start a browser");
+  };
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(provider).runTurn!(ordinary, { headers: new Headers() }, event => events.push(event));
+    expect(browserStarts).toBe(0);
+    expect(events.filter(event => event.type === "text_delta" && event.text === "Persistent published final"))
+      .toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    configureChatGptTurnResultJournal(undefined);
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a journal write failure keeps the completed adapter session for one exact retry", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-journal-write-retry-"));
+  const threadEnvironmentStatePath = join(root, "runtime", "thread-environments.json");
+  const statePath = join(root, "runtime", "turn-results.json");
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://journal-write-retry-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "managed-chrome",
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      threadEnvironmentStatePath,
+      localToolsEnabled: false,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const ordinary = request(false);
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  let browserStarts = 0;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    browserStarts += 1;
+    const prepared = await turn.prepare();
+    prepared.release();
+    turn.onTextDelta("Recovered after journal repair");
+    return "Recovered after journal repair";
+  };
+  let storageFixed = false;
+  const writeSnapshot = (path: string, data: string): void => {
+    if (!storageFixed) throw new Error("simulated journal disk failure");
+    mkdirSync(join(root, "runtime"), { recursive: true });
+    writeFileSync(path, data, { mode: 0o600 });
+  };
+  const adapter = createChatGptWebAdapter(provider);
+  configureChatGptTurnResultJournal(statePath, { writeSnapshot });
+  const firstEvents: AdapterEvent[] = [];
+  const retryEvents: AdapterEvent[] = [];
+  try {
+    await expect(adapter.runTurn!(ordinary, { headers: new Headers() }, event => firstEvents.push(event)))
+      .rejects.toThrow("Turn result journal persistence failed");
+    expect(browserStarts).toBe(1);
+
+    storageFixed = true;
+    await adapter.runTurn!(ordinary, { headers: new Headers() }, event => retryEvents.push(event));
+    expect(browserStarts).toBe(1);
+    expect(retryEvents.filter(event => event.type === "text_delta" && event.text === "Recovered after journal repair"))
+      .toHaveLength(1);
+    expect(retryEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    configureChatGptTurnResultJournal(undefined);
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(["launcher", "managed-chrome"] as const)("adapter compact returns one same-agent handoff and preserves a pre-existing ordinary final (%s)", async browserHost => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-adapter-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://retained-compact-${Date.now()}`,
     chatgptWeb: {
-      browserHost: "launcher",
-      browserHostDescriptorPath: join(root, "launcher.json"),
+      browserHost,
+      ...(browserHost === "launcher" ? { browserHostDescriptorPath: join(root, "launcher.json") } : {}),
       brokerSocketPath: defaultBrokerEndpoint(root),
       appName: "Codex Native DEV",
       localToolsEnabled: true,
@@ -1362,15 +1597,14 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
   }
 });
 
-test.each([false, true])("structured compact rebuilds canonical context when its retained source is absent (Bigger Context=%s)", async experimentalBiggerContext => {
+test.each([false, true])("managed Chrome compact rebuilds canonical context when its retained source is absent (Bigger Context=%s)", async experimentalBiggerContext => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-missing-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://missing-retained-${Date.now()}`,
     chatgptWeb: {
       experimentalBiggerContext,
-      browserHost: "launcher",
-      browserHostDescriptorPath: join(root, "launcher.json"),
+      browserHost: "managed-chrome",
       brokerSocketPath: defaultBrokerEndpoint(root),
       localToolsEnabled: true,
       solAvailable: true,
@@ -1386,21 +1620,20 @@ test.each([false, true])("structured compact rebuilds canonical context when its
     expect(turn.conversationKey).toBeUndefined();
     expect(turn.compaction).toBeTrue();
     const prepared = await turn.prepare();
-    const contextText = prepared.multipart?.parts.join("\n") ?? prepared.text;
-    expect(contextText).toContain("Original task");
-    expect(contextText).toContain("Continue with the next step");
-    if (experimentalBiggerContext) {
-      expect(prepared.multipart!.parts).toHaveLength(3);
-      expect(prepared.trimmedCompactionMessages).toBeUndefined();
-      const lastRecord = prepared.multipart!.parts.flatMap(part => JSON.parse(part).records).at(-1);
-      expect(lastRecord.message.content).toBe(compact.context.messages.at(-1)!.content);
-    }
+    // A checkpoint is never staged, with or without Bigger Context: staging needs an exact
+    // acknowledgement that a checkpoint-sized part does not reliably return.
+    expect(prepared.multipart).toBeUndefined();
+    // Nor is it trimmed. A history this size fits one message under the budget a fresh compaction
+    // is sized against, so every record reaches the model that has to summarize it.
+    expect(prepared.trimmedCompactionMessages).toBeUndefined();
+    expect(prepared.text).toContain("Original task");
+    expect(prepared.text).toContain("Continue with the next step");
     prepared.release();
     return "Fallback checkpoint from canonical Codex context";
   };
   const compact = request(true);
   const events: AdapterEvent[] = [];
-  if (experimentalBiggerContext) compact.context.messages.at(-1)!.content += "x".repeat(160_000);
+  if (experimentalBiggerContext) compact.context.messages.at(-1)!.content += "x".repeat(80_000);
   try {
     await createChatGptWebAdapter(provider).runTurn!(
       compact,
@@ -1420,14 +1653,81 @@ test.each([false, true])("structured compact rebuilds canonical context when its
   }
 });
 
-test("structured compact rebuilds canonical context when retained ChatGPT stops during handoff", async () => {
+test("a fresh compaction too large for one message is summarized per segment and then merged", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-segmented-compact-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://segmented-compact-${Date.now()}`,
+    chatgptWeb: {
+      experimentalBiggerContext: true,
+      browserHost: "managed-chrome",
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: true,
+      solAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const prompts: string[] = [];
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    const prepared = await turn.prepare();
+    // Every turn of the plan is an ordinary message. Nothing waits on an acknowledgement, which is
+    // what the 298k-token round died on, and nothing silently drops history to fit.
+    expect(prepared.multipart).toBeUndefined();
+    expect(prepared.trimmedCompactionMessages).toBeUndefined();
+    prompts.push(prepared.text);
+    prepared.release();
+    const segment = prepared.text.match(/SEGMENT (\d+) OF \d+/);
+    return segment ? `summary of segment ${segment[1]}` : "merged checkpoint";
+  };
+  const compact = request(true);
+  compact.context.messages = Array.from({ length: 12 }, (_unused, index) => ({
+    role: "user" as const,
+    content: `history record ${index} ${"word ".repeat(12_000)}`,
+    timestamp: index + 1,
+  }));
+  compact.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: 100 });
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(provider).runTurn!(
+      compact,
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+    const segments = prompts.filter(prompt => prompt.includes("SEGMENT "));
+    expect(segments.length).toBeGreaterThan(1);
+    // Each segment is told where it sits, so its summary is not written as if it were the whole task.
+    for (const [index, prompt] of segments.entries()) {
+      expect(prompt).toContain(`SEGMENT ${index + 1} OF ${segments.length}`);
+    }
+    // The merge runs last and sees every segment summary in order, plus the real checkpoint prompt.
+    const merge = prompts.at(-1)!;
+    expect(merge).not.toContain("SEGMENT 1 OF");
+    // The context travels as JSON, so assert on a line of the checkpoint prompt rather than the
+    // multi-line constant, whose newlines are escaped by the time they reach the composer.
+    expect(merge).toContain("CONTEXT CHECKPOINT COMPACTION");
+    for (const [index] of segments.entries()) expect(merge).toContain(`summary of segment ${index + 1}`);
+    // The checkpoint Codex receives is the merge turn's answer, not any single segment's.
+    const answer = events.filter(event => event.type === "text_delta")
+      .map(event => (event as Extract<AdapterEvent, { type: "text_delta" }>).text).join("");
+    expect(answer).toContain("merged checkpoint");
+    expect(answer).toContain("CODEX_LATEST_USER_PROMPT_JSON");
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test("managed Chrome compaction preserves a completed final when its retained handoff fails", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stopped-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://stopped-retained-${Date.now()}`,
     chatgptWeb: {
-      browserHost: "launcher",
-      browserHostDescriptorPath: join(root, "launcher.json"),
+      browserHost: "managed-chrome",
       brokerSocketPath: defaultBrokerEndpoint(root),
       localToolsEnabled: true,
       solAvailable: true,
@@ -1439,6 +1739,7 @@ test("structured compact rebuilds canonical context when retained ChatGPT stops 
   const sourceRequest = request(false);
   const namespace = chatGptWebExecutionNamespace(provider);
   const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
+  let releases = 0;
   chatGptTurnSessions.getOrCreate(sourceKey, () => ({
     mode: "read-only",
     browser: Promise.resolve("source complete"),
@@ -1447,9 +1748,12 @@ test("structured compact rebuilds canonical context when retained ChatGPT stops 
     text: new ChatGptTextFeed(),
     usageInput: sourceRequest,
     conversationKey: chatGptConversationKey(sourceRequest, namespace)!,
+    releaseRetainedConversation: async () => { releases += 1; },
     cancel() {},
   }));
   await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
+  const compact = request(true);
+  const compactedSourceKey = `${namespace}:${chatGptCompactionSourceExecutionKey(compact)}`;
 
   let browserStarts = 0;
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
@@ -1463,11 +1767,13 @@ test("structured compact rebuilds canonical context when retained ChatGPT stops 
   const events: AdapterEvent[] = [];
   try {
     await createChatGptWebAdapter(provider).runTurn!(
-      request(true),
+      compact,
       { headers: new Headers() },
       event => events.push(event),
     );
     expect(browserStarts).toBe(2);
+    expect(releases).toBe(1);
+    expect(chatGptTurnSessions.find(compactedSourceKey)).toBeDefined();
     expect(events.some(event => event.type === "text_delta"
       && event.text.includes("Fallback checkpoint after retained ChatGPT stopped"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
@@ -1812,9 +2118,9 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     expect(browserStarts).toBe(2);
     expect(events.at(-1)).toMatchObject({
       type: "error",
-      code: "compaction_handoff_failed",
+      code: "compaction_handoff_timeout",
       retryable: false,
-      message: "ChatGPT did not complete the context handoff. Retry the task.",
+      message: "ChatGPT compaction transport did not progress within 25ms",
     });
   } finally {
     releaseBrowser?.();

@@ -1,8 +1,5 @@
-<h1 align="center">Codex 用 ChatGPT Web</h1>
-
 <p align="center">
-  <strong>ChatGPT Web（Pro を含む）を Codex のネイティブモデルとして使用。</strong><br>
-  モデルの利用枠を切り替えて、いつものワークフローを維持できます。
+  <img src="docs/assets/readme-hero.svg" alt="ChatGPT Web for Codex — ChatGPT Web models in the native Codex workflow" width="100%">
 </p>
 
 <p align="center">
@@ -10,14 +7,36 @@
 </p>
 
 <p align="center">
-  <a href="TROUBLESHOOTING.md">トラブルシューティング</a> · <a href="SECURITY.md">セキュリティ</a> · <a href="CONTRIBUTING.md">コントリビューション</a>
-</p>
-
-<p align="center">
   <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><img src="https://img.shields.io/github/v/release/kbwumin13-sudo/web-gpt?display_name=tag&amp;sort=semver" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT ライセンス"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 および x64">
 </p>
+
+<p align="center">
+  <a href="#quick-start"><strong>クイックスタート</strong></a> ·
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>最新リリース</strong></a> ·
+  <a href="docs/architecture.md"><strong>アーキテクチャ</strong></a> ·
+  <a href="TROUBLESHOOTING.md"><strong>トラブルシューティング</strong></a> ·
+  <a href="SECURITY.md"><strong>セキュリティ</strong></a>
+</p>
+
+> アカウントで利用できる ChatGPT Web モデルを Codex に持ち込みながら、ネイティブのタスク UI、
+> コンテキスト管理、ストリーミング、コンパクション、ツールハーネスを維持します。
+
+<table>
+  <tr>
+    <td width="33%"><strong>Native model picker</strong><br><sub>Codex から ChatGPT Web のモデル階層を直接選び、同じタスクで作業を続けられます。</sub></td>
+    <td width="33%"><strong>Full Codex harness</strong><br><sub>MCP 経由で現在のタスクのファイル、Shell、画像、承認、ツール、アプリに接続します。</sub></td>
+    <td width="33%"><strong>Task-bound sessions</strong><br><sub>連続ターンを同じセッションに保ち、境界では Codex のネイティブ compaction に引き継ぎます。</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/assets/codex-model-picker.png" alt="Codex のネイティブモデル選択画面に表示された ChatGPT Web モデル" width="520">
+</p>
+
+<p align="center"><sub>実際の Codex モデル選択画面。ChatGPT Web — Medium、High、Extra High、Pro、Instant がネイティブ Codex モデルと並んで表示されています。</sub></p>
 
 Free および Go アカウントでは、Codex のネイティブモデル選択画面に
 **ChatGPT Web — Luna** が追加されます。reasoning セレクターが表示されるアカウントでは、
@@ -55,6 +74,8 @@ Full モードでは、次のコンパクション境界まで、MCP が ChatGPT
 プロンプトは引き続き OpenAI によって処理され、アカウント設定および OpenAI の
 [一時チャットポリシー](https://help.openai.com/en/articles/8914046-temporary-chat-faq)が適用されます。
 このプロジェクトは非公式です。適用される OpenAI の利用規約とワークスペースポリシーを守る責任は利用者にあります。
+
+<a id="quick-start"></a>
 
 ## クイックスタート
 

@@ -96,3 +96,18 @@ test("a conversation with no task message still yields its last record", () => {
   const selected = bootstrapContractMessages([text("assistant", "orphan")]);
   expect(bodies(selected)).toEqual(["orphan"]);
 });
+
+test("a post-compaction bootstrap carries the readable checkpoint before a vague continuation", async () => {
+  const { SUMMARY_PREFIX } = await import("../src/responses/compaction");
+  const checkpoint = `${SUMMARY_PREFIX}\nVerified phase one; next inspect the repository API.`;
+  const messages = [text("user", "Review production readiness"), text("user", checkpoint), text("user", "Continue")];
+  expect(bodies(bootstrapContractMessages(messages))).toEqual([checkpoint, "Continue"]);
+  expect(bodies(bootstrapContractMessages(messages, 0))).toEqual([checkpoint, "Continue"]);
+});
+
+test("bootstrap carries only the latest checkpoint and never duplicates it", async () => {
+  const { SUMMARY_PREFIX } = await import("../src/responses/compaction");
+  const old = `${SUMMARY_PREFIX}\nold`;
+  const current = `${SUMMARY_PREFIX}\ncurrent`;
+  expect(bodies(bootstrapContractMessages([text("user", old), text("user", current)]))).toEqual([current]);
+});

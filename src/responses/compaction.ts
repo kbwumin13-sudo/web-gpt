@@ -52,6 +52,21 @@ export function decodeCompactionSummary(encryptedContent: string): string | null
   }
 }
 
+/**
+ * Official compaction checkpoints are encrypted for the native Codex backend. A routed Web model
+ * cannot recover their history, while `ocx1:` is the bridge-owned plaintext-compatible envelope.
+ */
+export function containsOpaqueCompactionEncryptedContent(input: unknown): boolean {
+  if (!Array.isArray(input)) return false;
+  return input.some(item => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const record = item as { type?: unknown; encrypted_content?: unknown };
+    return (record.type === "compaction" || record.type === "compaction_summary" || record.type === "context_compaction")
+      && typeof record.encrypted_content === "string"
+      && !record.encrypted_content.startsWith(BRIDGE_COMPACTION_PREFIX);
+  });
+}
+
 /** Render a replayed compaction item as plain user-visible text for a routed model. */
 export function compactionItemToText(encryptedContent: string | undefined): string {
   const decoded = typeof encryptedContent === "string" ? decodeCompactionSummary(encryptedContent) : null;

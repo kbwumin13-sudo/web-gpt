@@ -1,8 +1,5 @@
-<h1 align="center">ChatGPT Web for Codex</h1>
-
 <p align="center">
-  <strong>将 ChatGPT Web（包括 Pro）作为 Codex 原生模型使用。</strong><br>
-  切换模型档位，保留原有工作流。
+  <img src="docs/assets/readme-hero.svg" alt="ChatGPT Web for Codex — 将 ChatGPT Web 接入 Codex 原生工作流" width="100%">
 </p>
 
 <p align="center">
@@ -10,14 +7,36 @@
 </p>
 
 <p align="center">
-  <a href="TROUBLESHOOTING.md">故障排除</a> · <a href="SECURITY.md">安全</a> · <a href="CONTRIBUTING.md">贡献</a>
-</p>
-
-<p align="center">
   <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><img src="https://img.shields.io/github/v/release/kbwumin13-sudo/web-gpt?display_name=tag&amp;sort=semver" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
 </p>
+
+<p align="center">
+  <a href="#quick-start"><strong>快速开始</strong></a> ·
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>最新版本</strong></a> ·
+  <a href="docs/architecture.md"><strong>架构</strong></a> ·
+  <a href="TROUBLESHOOTING.md"><strong>故障排除</strong></a> ·
+  <a href="SECURITY.md"><strong>安全</strong></a>
+</p>
+
+> 把当前 ChatGPT 账户可用的 Web 模型带进 Codex，同时保留原生任务界面、上下文生命周期、
+> 流式输出、上下文压缩以及完整工具链。
+
+<table>
+  <tr>
+    <td width="33%"><strong>原生模型选择器</strong><br><sub>直接在 Codex 中选择 ChatGPT Web 档位，并继续使用同一个任务。</sub></td>
+    <td width="33%"><strong>完整 Codex Harness</strong><br><sub>通过 MCP 接入当前任务的文件、Shell、图片、审批、工具和应用。</sub></td>
+    <td width="33%"><strong>任务绑定会话</strong><br><sub>连续消息保持在同一会话中，并在边界处交回 Codex 原生上下文压缩。</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/assets/codex-model-picker.png" alt="Codex 原生模型选择器中的 ChatGPT Web 模型" width="520">
+</p>
+
+<p align="center"><sub>真实 Codex 模型选择器：ChatGPT Web — Medium、High、Extra High、Pro、Instant 与原生 Codex 模型并列显示。</sub></p>
 
 Free 和 Go 账户会在 Codex 原生模型选择器中看到 **ChatGPT Web — Luna**。具有推理选择器的
 账户仍会按订阅权限看到 **Instant**、**Medium**、**High**、**Extra High** 和 **Pro**。
@@ -51,6 +70,8 @@ Codex 会保留原生任务、上下文生命周期、界面和工具 harness。
 临时聊天是 ChatGPT 的隐私模式，并不代表匿名或仅在本地推理：提示仍会由 OpenAI 处理，并受账户
 设置及 OpenAI [临时聊天政策](https://help.openai.com/en/articles/8914046-temporary-chat-faq)
 约束。本项目为非官方项目；用户仍需自行遵守适用的 OpenAI 条款和工作区政策。
+
+<a id="quick-start"></a>
 
 ## 快速开始
 

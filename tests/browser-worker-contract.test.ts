@@ -3027,7 +3027,6 @@ test("Bigger Context fits mixed-density whole records within both token and comp
       modelId: CHATGPT_WEB_MODEL_ID,
       stream: true,
       options: { reasoning: "high" },
-      _compactionRequest: true,
       context: {
         systemPrompt: [],
         messages: contents.map((content, index) => ({ role: "user", content, timestamp: index + 1 })),

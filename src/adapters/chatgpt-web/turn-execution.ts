@@ -333,7 +333,9 @@ export class ChatGptTurnSession {
 
   static fromResult(record: TurnResultRecord): ChatGptTurnSession {
     const text = new ChatGptTextFeed();
-    if (record.events.length === 0) text.push(record.answer);
+    // Stored events are replay metadata only. Restore the final browser Markdown separately so
+    // the terminal-answer consistency check succeeds without replaying partial text twice.
+    text.push(record.answer);
     const runtime: ChatGptTurnRuntime = {
       mode: "read-only",
       browser: Promise.resolve(record.answer),

@@ -1,8 +1,5 @@
-<h1 align="center">ChatGPT Web for Codex</h1>
-
 <p align="center">
-  <strong>Use ChatGPT Web (including Pro) as native Codex models.</strong><br>
-  Change the model tier, save your workflow.
+  <img src="docs/assets/readme-hero.svg" alt="ChatGPT Web for Codex — native ChatGPT Web bridge for Codex" width="100%">
 </p>
 
 <p align="center">
@@ -10,14 +7,36 @@
 </p>
 
 <p align="center">
-  <a href="TROUBLESHOOTING.md">Troubleshooting</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a>
-</p>
-
-<p align="center">
   <a href="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml"><img src="https://github.com/kbwumin13-sudo/web-gpt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><img src="https://img.shields.io/github/v/release/kbwumin13-sudo/web-gpt?display_name=tag&amp;sort=semver" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
 </p>
+
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="https://github.com/kbwumin13-sudo/web-gpt/releases/latest"><strong>Latest release</strong></a> ·
+  <a href="docs/architecture.md"><strong>Architecture</strong></a> ·
+  <a href="TROUBLESHOOTING.md"><strong>Troubleshooting</strong></a> ·
+  <a href="SECURITY.md"><strong>Security</strong></a>
+</p>
+
+> Bring the ChatGPT Web models available to your account into Codex while keeping the native task
+> UI, context lifecycle, streaming, compaction, and tool harness.
+
+<table>
+  <tr>
+    <td width="33%"><strong>Native model picker</strong><br><sub>Choose ChatGPT Web tiers directly from Codex and keep working in the same task.</sub></td>
+    <td width="33%"><strong>Full Codex harness</strong><br><sub>Connect the active task's filesystem, shell, images, approvals, tools, and apps through MCP.</sub></td>
+    <td width="33%"><strong>Task-bound sessions</strong><br><sub>Keep sequential turns together and hand context back to native Codex compaction at the boundary.</sub></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/assets/codex-model-picker.png" alt="ChatGPT Web models in the native Codex model picker" width="520">
+</p>
+
+<p align="center"><sub>Real Codex model picker with ChatGPT Web — Medium, High, Extra High, Pro, and Instant available alongside native Codex models.</sub></p>
 
 Free and Go accounts get **ChatGPT Web — Luna** in Codex's native model picker. Accounts that
 expose the reasoning selector keep **Instant**, **Medium**, **High**, **Extra High**, and **Pro** as

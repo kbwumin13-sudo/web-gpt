@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { estimateChatGptWebInputTokens, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
+import { CHATGPT_COMPACTION_LEAF_JSON_BYTE_BUDGET } from "../src/adapters/chatgpt-web/hierarchical-compaction";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
 import { estimateTokens } from "../src/lib/token-estimate";
@@ -43,15 +44,21 @@ test("multipart selection accounts for whole-record and composer fit before subm
   }
 }, 60_000);
 
-test("Bigger Context compaction selects three parts before the legacy inline byte budget", () => {
-  const parsed = request("x".repeat(160_000));
-  parsed._compactionRequest = true;
-  const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
-  expect(parts).toBe(3);
-  const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: parts });
-  expect(compiled.trimmedCompactionMessages).toBeUndefined();
-  expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
-    .toEqual([parsed.context.messages[0]!.content]);
+test("compaction never stages, because a staged part has to be acknowledged before the next one", () => {
+  // Staging asks the model to echo CODEX_MULTIPART_ACK exactly. A fresh compaction is the case that
+  // pushed one part past the size where that echo still arrives, and the round then died waiting for
+  // it. Compaction is split into per-segment summarization turns instead; see
+  // hierarchical-compaction.ts. Nothing about that path can reintroduce a stage.
+  for (const size of [80_000, 250_000]) {
+    const parsed = request("x".repeat(size));
+    parsed._compactionRequest = true;
+    expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBeUndefined();
+    // Compiled at the budget a fresh compaction is actually sent under, which is what the planner
+    // sizes against; the legacy inline budget still governs the Zero Risk paste path.
+    expect(compileChatGptWebPrompt(parsed, capabilities, undefined, {
+      compactionPromptJsonByteBudget: CHATGPT_COMPACTION_LEAF_JSON_BYTE_BUDGET,
+    }).multipart).toBeUndefined();
+  }
 });
 
 test("multipart planning leaves room for final attachments and execution instructions without losing history", () => {

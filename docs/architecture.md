@@ -122,13 +122,39 @@ After the provider returns to ChatGPT, the active host requires both a server-au
 and the Temporary Chat composer, then closes the temporary auth view. There is no browser-profile
 handoff, cookie import, CDP login port, or temporary session-transfer directory.
 
+Automatic managed Chrome and Launcher compaction both prefer the exact retained conversation, where
+the checkpoint request is a short instruction to a chat that already holds the task.
+
+A missing retained source rebuilds from canonical history, and that history is never staged. Staging
+requires the model to answer every part but the last with an exact `CODEX_MULTIPART_ACK` echo, and a
+checkpoint-sized part is where that echo stops arriving: a 298k-token history staged a ~102k-token
+part, ChatGPT accepted the submission, and the round died at its stage deadline having produced
+nothing — reproducibly, because each retry re-sent the same part. A fresh compaction that does not
+fit one message is instead cut at record boundaries into ordered segments, each summarised by an
+ordinary turn in its own Temporary Chat, and one small merge turn folds the segment summaries into
+the checkpoint. Every turn asks for a normal answer, and a segment that fails is the only work that
+repeats. Segment sizing, the eight-segment ceiling, and what happens beyond it are documented in
+`src/adapters/chatgpt-web/hierarchical-compaction.ts`; the counters are under `compaction` in
+`/healthz`. Zero Risk keeps the single-prompt contract, because there the transport is a person.
+
+Completed ordinary replies and finals preserved across compaction are stored in the private
+`runtime/turn-results.json` journal before terminal completion is emitted. Production retains up
+to 256 results for seven days. Atomic snapshots contain the answer and visible text events, not
+reasoning, and recovery requires the exact provider-scoped execution key. A saved result is not
+proof that Codex received it; this cache does not infer a client acknowledgement or inject answers
+into a different turn. It cannot recover Web content the bridge never observed.
+
 Automatic Full-mode first turns and normal cache misses receive a compact
 `<codex_bootstrap_context_json>` envelope containing the current task message. The omitted canonical
 system/developer/history records remain in the Runtime broker and are retrieved on demand through
 `codex_context_search` and `codex_context_read`, which are registered connector tools declared
 read-only. The `codex_tool_call` dispatch that carried them before remains as a compatibility path,
 because ChatGPT caches a connector's tool list under its identity and a conversation on the earlier
-schema cannot see a newly attached tool. A retained continuation instead receives
+schema cannot see a newly attached tool. A new bootstrap also carries the latest readable
+compaction summary in full, so a request such as "continue" does not depend on history retrieval
+to recover its checkpoint. Official encrypted checkpoints are rejected before starting a Web
+turn; continue on the official model or supply a readable summary in a new Web task. Native
+passthrough preserves those encrypted checkpoints unchanged. A retained continuation receives
 `<codex_resume_context_json>`, carrying only the canonical suffix after its last assistant reply
 and omitting the system bootstrap that conversation already holds. Browser-only turns and
 compaction/new-epoch requests still receive the complete `<codex_context_json>` bootstrap because
@@ -203,7 +229,8 @@ Bigger Context partitions complete ordered records against each message's availa
 composer budgets. Inert stages carry text; the final message also carries all retained attachments,
 the execution contract and any output schema. Their reserves are deducted before partitioning,
 then preflight checks the actual compiled messages and total transaction. The selected execution
-effort, attachment references and three-part maximum remain unchanged.
+effort, attachment references and three-part maximum remain unchanged. It serves ordinary large
+tasks only: a compaction checkpoint never stages, and compiling one with stages is refused outright.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
@@ -212,8 +239,9 @@ Bigger Context multipart transport. At that boundary its active ChatGPT response
 checkpoint instruction as an MCP result, returns the compacted context through its bound completion
 control, and ends. The old manual chat is retired; the next compacted Codex request owns a fresh
 Temporary Chat and its locally compiled prompt is copied to the clipboard. A missing Automatic
-retained source falls back to a dedicated read-only Temporary Chat built from canonical Codex
-history; a missing Zero Risk source uses the same explicit manual checkpoint contract. An invalid or
+retained source falls back to dedicated read-only Temporary Chats built from canonical Codex
+history — one when it fits a single message, otherwise one per segment plus a merge; a missing Zero
+Risk source uses the same explicit manual checkpoint contract, unsegmented. An invalid or
 ambiguous handoff still fails explicitly. Browser-only mode
 uses the same read-only summarization path, then returns the native replacement-history shape expected
 by Codex. A prompt-level checkpoint marker is translated into a visible Codex trace item;

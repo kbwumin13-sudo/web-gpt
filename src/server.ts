@@ -46,6 +46,7 @@ import { catalogMatchesExpected, expectedWebModelEfforts, expectedWebModels, pub
 import {
   buildCompactV1Output,
   COMPACT_PROMPT,
+  containsOpaqueCompactionEncryptedContent,
   decodeCompactionSummary,
   extractCompactUserMessages,
 } from "./responses/compaction";
@@ -369,6 +370,8 @@ export class HttpTurnCounter {
 type ChatGptWebAdapterFactory = (provider: CodexProviderConfig) => ProviderAdapter;
 
 export interface ResponseRequestOptions {
+  /** Test and server callers can preserve the native passthrough transport without using global fetch. */
+  fetchUpstream?: NativeFetch;
   /** DEV and other in-process harnesses can keep continuation state in their own canonical store. */
   rememberState?: boolean;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
@@ -489,7 +492,7 @@ export async function responseRequest(
   }
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
     try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
+      return await forwardNativeCodexRequest(nativeRequest, "responses", options.fetchUpstream, raw);
     } catch (error) {
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
@@ -498,6 +501,14 @@ export async function responseRequest(
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
   const expanded = expandPreviousResponseInput(raw);
+  if (expanded && typeof expanded === "object" && !Array.isArray(expanded)
+    && containsOpaqueCompactionEncryptedContent((expanded as { input?: unknown }).input)) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "ChatGPT Web cannot read this official encrypted compaction checkpoint. Continue with the original official model, or start a new ChatGPT Web task with a plaintext summary.",
+    );
+  }
   let parsed: CodexParsedRequest;
   let route: ChatGptWebModelRoute;
   try {
@@ -1101,7 +1112,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, fetchUpstream: dependencies.fetchUpstream },
           ),
           req.signal,
           process.platform,
