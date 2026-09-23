@@ -28,7 +28,7 @@
  * This module is pure: it plans requests and never touches a browser. The caller runs the leaves.
  */
 
-import { COMPACT_PROMPT } from "../../responses/compaction";
+import { COMPACT_PROMPT, isOnePixelPngDataUrl } from "../../responses/compaction";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   isChatGptWebZeroRiskBackendModel,
@@ -40,6 +40,7 @@ import type { CodexContentPart, CodexMessage, CodexParsedRequest } from "../../t
 import { estimateChatGptWebImageTokens } from "./input-tokens";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import {
+  CHATGPT_MAX_INPUT_IMAGES,
   chatGptPromptJsonBytes,
   compileChatGptWebPrompt,
   type CompiledChatGptWebPrompt,
@@ -179,10 +180,32 @@ export function elideCodexMessageText(message: CodexMessage, keepChars: number):
   return { ...message, content };
 }
 
-/** Cheap stand-in for a record's compiled weight; the real compile confirms each closed leaf. */
+/**
+ * Cheap stand-in for a record's compiled weight; the real compile confirms each closed leaf.
+ *
+ * An image never reaches the prompt text. `compileChatGptWebPrompt` lifts it into an attachment and
+ * leaves behind `{"type":"image_attachment","attachment_ref":"codex-input-image-N"}` — about sixty
+ * characters. Weighing the record with its `data:` URL therefore charged a ~1 MB screenshot as
+ * ~1.4 million bytes of prompt it does not occupy. Observed live: every image-bearing record was
+ * judged to fill a whole segment on its own, each segment then carried almost nothing, the plan hit
+ * its segment ceiling, and 571 records were dropped from a checkpoint that reported itself complete.
+ * An image's real costs — the attachment limit and its token reserve — are counted separately.
+ */
 function recordWeight(message: CodexMessage, modelId: string): { bytes: number; tokens: number } {
-  const serialized = JSON.stringify(message);
+  const serialized = JSON.stringify(message, (key, value) => (
+    key === "imageUrl" && typeof value === "string"
+      ? `{"type":"image_attachment","attachment_ref":"codex-input-image-000"}`
+      : value
+  ));
   return { bytes: chatGptPromptJsonBytes(serialized), tokens: estimateTokens(serialized, modelId) };
+}
+
+/** Attachments a record will claim against one message's {@link CHATGPT_MAX_INPUT_IMAGES} slots. */
+function recordImages(message: CodexMessage): number {
+  if (message.role === "assistant" || typeof message.content === "string") return 0;
+  return message.content.filter(part => (
+    part.type === "image" && !isOnePixelPngDataUrl(part.imageUrl)
+  )).length;
 }
 
 function leafRequest(
@@ -335,29 +358,45 @@ export function planHierarchicalCompaction(
   let current: CodexMessage[] = [];
   let bytes = 0;
   let tokens = 0;
+  let images = 0;
   for (const message of history) {
     let record = message;
     let weight = recordWeight(record, parsed.modelId);
     if (weight.bytes > byteRoom || weight.tokens > tokenRoom) {
       // One record larger than a whole leaf. Native Codex drops such an item outright; shortening it
-      // keeps the fact that it happened, and what it was about, inside the summary.
-      const keepChars = Math.max(Math.floor(textOf(record).length * Math.min(
-        byteRoom / Math.max(weight.bytes, 1),
-        tokenRoom / Math.max(weight.tokens, 1),
-      ) * 0.8), 2_000);
-      record = elideCodexMessageText(record, keepChars);
-      weight = recordWeight(record, parsed.modelId);
-      elidedRecords += 1;
+      // keeps the fact that it happened, and what it was about, inside the summary. Only shorten
+      // when there is text to shorten: a record that is heavy for some other reason would otherwise
+      // be counted as elided while nothing changed, which reports a loss that did not happen.
+      const text = textOf(record).length;
+      if (text > 0) {
+        record = elideCodexMessageText(record, Math.max(Math.floor(text * Math.min(
+          byteRoom / Math.max(weight.bytes, 1),
+          tokenRoom / Math.max(weight.tokens, 1),
+        ) * 0.8), MIN_ELIDED_RECORD_CHARS));
+        const shortened = recordWeight(record, parsed.modelId);
+        if (shortened.bytes < weight.bytes) elidedRecords += 1;
+        weight = shortened;
+      }
     }
-    if (current.length > 0 && (bytes + weight.bytes > byteRoom || tokens + weight.tokens > tokenRoom)) {
+    // ChatGPT accepts at most CHATGPT_MAX_INPUT_IMAGES attachments on one message, and the compiler
+    // drops the oldest overflow silently. Closing the leaf first keeps every image the segment was
+    // given, at the cost of a shorter segment.
+    const claims = recordImages(record);
+    if (current.length > 0 && (
+      bytes + weight.bytes > byteRoom
+      || tokens + weight.tokens > tokenRoom
+      || images + claims > CHATGPT_MAX_INPUT_IMAGES
+    )) {
       groups.push(current);
       current = [];
       bytes = 0;
       tokens = 0;
+      images = 0;
     }
     current.push(record);
     bytes += weight.bytes;
     tokens += weight.tokens;
+    images += claims;
   }
   if (current.length > 0) groups.push(current);
 

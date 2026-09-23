@@ -7,7 +7,7 @@ import {
   elideCodexMessageText,
   planHierarchicalCompaction,
 } from "../src/adapters/chatgpt-web/hierarchical-compaction";
-import { chatGptPromptJsonBytes, compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
+import { CHATGPT_MAX_INPUT_IMAGES, chatGptPromptJsonBytes, compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { COMPACT_PROMPT } from "../src/responses/compaction";
 import { estimateTokens } from "../src/lib/token-estimate";
 import type { CodexMessage, CodexParsedRequest } from "../src/types";
@@ -174,3 +174,73 @@ test("eliding preserves images and shortens assistant thinking alongside its tex
   expect(parts[0]!.thinking!.length).toBeLessThan(40_000);
   expect(parts[1]!.text!.length).toBeLessThan(40_000);
 });
+
+test("an image is weighed as the attachment reference it becomes, not as its data URL", () => {
+  // compileChatGptWebPrompt lifts an image into an attachment and leaves ~60 characters of
+  // reference behind. Weighing the record with its data: URL charged a 1 MB screenshot as 1.4
+  // million bytes of prompt it never occupies, so every image-bearing record was judged to fill a
+  // segment alone. Observed live: segments carried ~4,000 characters each, the plan hit its ceiling,
+  // and 571 records were dropped from a checkpoint that did not know they were missing.
+  const screenshot = `data:image/png;base64,${"A".repeat(1_400_000)}`;
+  const history: CodexMessage[] = [];
+  for (let index = 0; index < 400; index += 1) {
+    history.push({ role: "user", content: `step ${index} ${"word ".repeat(400)}`, timestamp: index * 2 + 1 });
+    if (index % 8 === 0) {
+      history.push({
+        role: "user",
+        content: [{ type: "text", text: `screenshot ${index}` }, { type: "image", imageUrl: screenshot }],
+        timestamp: index * 2 + 2,
+      });
+    }
+  }
+  const plan = planHierarchicalCompaction(compactionRequest(history), capabilities);
+  expect(plan).toBeDefined();
+  expect(plan!.droppedMessages).toBe(0);
+  expect(plan!.elidedRecords).toBe(0);
+  // Every segment carries real history rather than one screenshot and nothing else.
+  for (const leaf of plan!.leaves.slice(0, -1)) expect(leaf.messageCount).toBeGreaterThan(20);
+  const carried = plan!.leaves.flatMap(leaf => leaf.request.context.messages.slice(0, -1));
+  expect(carried.map(message => message.timestamp)).toEqual(history.map(message => message.timestamp));
+}, 120_000);
+
+test("no segment claims more attachment slots than one ChatGPT message accepts", () => {
+  // The compiler drops attachment overflow from the oldest end without failing, so a segment that
+  // over-claims loses images silently.
+  const screenshot = `data:image/png;base64,${"B".repeat(40_000)}`;
+  const history: CodexMessage[] = Array.from({ length: 160 }, (_record, index) => ({
+    role: "user" as const,
+    content: [
+      { type: "text" as const, text: `frame ${index} ${"word ".repeat(900)}` },
+      { type: "image" as const, imageUrl: screenshot },
+    ],
+    timestamp: index + 1,
+  }));
+  const plan = planHierarchicalCompaction(compactionRequest(history), capabilities);
+  expect(plan).toBeDefined();
+  for (const leaf of plan!.leaves) {
+    const compiled = compileChatGptWebPrompt(leaf.request, capabilities, undefined, {
+      compactionPromptJsonByteBudget: CHATGPT_COMPACTION_LEAF_JSON_BYTE_BUDGET,
+    });
+    expect(compiled.images.length).toBeLessThanOrEqual(CHATGPT_MAX_INPUT_IMAGES);
+    // Dropping an attachment leaves this note in place of the image it could not carry.
+    expect(compiled.text).not.toContain("older image not attached");
+  }
+}, 120_000);
+
+test("a record counts as elided only when shortening actually removed something", () => {
+  // An assistant record can be heavy with no text to shorten. Counting it as elided reported a loss
+  // that never happened and hid the real reason the segment was full.
+  const history: CodexMessage[] = Array.from({ length: 120 }, (_record, index) => ({
+    role: "assistant" as const,
+    content: [{
+      type: "toolCall" as const,
+      id: `call_${index}`,
+      name: "exec_command",
+      arguments: { script: "x".repeat(200_000) },
+    }],
+    timestamp: index + 1,
+  }));
+  const plan = planHierarchicalCompaction(compactionRequest(history), capabilities);
+  expect(plan).toBeDefined();
+  expect(plan!.elidedRecords).toBe(0);
+}, 120_000);
