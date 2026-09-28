@@ -3,7 +3,7 @@ import type { AppConfig } from "./config";
 import { getConfigDir, getConfigPath, loadConfig } from "./config";
 import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
-import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
+import { browserLoginStateExists, loginVerificationMarkerPath, managedProfileIsVerified } from "./browser-login";
 import { getGatewayServiceStatus, getServiceStatus } from "./service";
 import { tunnelStatus, type TunnelRuntimeStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
@@ -249,12 +249,18 @@ export async function runDoctor(): Promise<DoctorReport> {
     }
     if (!browserLoginStateExists(config)) {
       checks.push({ id: "login", status: "error", message: "ChatGPT login state is missing or unverified; run `codex-chatgpt-web login`" });
+    } else if (config.managedProfilePath) {
+      checks.push({
+        id: "login",
+        status: managedProfileIsVerified(config.managedProfilePath) ? "ok" : "error",
+        message: "Dedicated Chrome profile has private login evidence; current Web usability is checked separately",
+      });
     } else if (!secureFile(config.storageStatePath)) {
       checks.push({ id: "login", status: "error", message: `ChatGPT login state is readable by other users: ${config.storageStatePath}` });
     } else if (!secureFile(loginVerificationMarkerPath(config.storageStatePath))) {
       checks.push({ id: "login", status: "error", message: "ChatGPT login verification marker is readable by other users" });
     } else {
-      checks.push({ id: "login", status: "ok", message: "ChatGPT login state has authenticated browser evidence" });
+      checks.push({ id: "login", status: "ok", message: "ChatGPT login snapshot has historical browser evidence; current Web usability is checked separately" });
     }
   }
 
@@ -295,6 +301,23 @@ export async function runDoctor(): Promise<DoctorReport> {
   const proxy = await proxyCheck(config);
   checks.push(proxy.check);
   checks.push(await catalogCheck(config));
+  if (config.browserInteractionMode === "automatic" && config.browserHost === "managed-chrome") {
+    try {
+      const response = await fetch(`http://${config.host}:${config.port}/healthz`, { signal: AbortSignal.timeout(2_000) });
+      const health = response.ok ? await response.json() as { web_readiness?: { status?: string; evidence_code?: string; checked_at?: string | null } } : undefined;
+      const readiness = health?.web_readiness;
+      checks.push(readiness?.status === "ready"
+        ? { id: "web-readiness", status: "ok", message: `A Web turn completed in the current browser session (${readiness.checked_at})` }
+        : {
+            id: "web-readiness",
+            status: "error",
+            message: `Web runtime has not proved a completed turn (${readiness?.status ?? "backend unavailable"})`,
+            detail: readiness?.evidence_code,
+          });
+    } catch {
+      checks.push({ id: "web-readiness", status: "error", message: "Web backend is unavailable; no current turn evidence exists" });
+    }
+  }
 
   if (config.mode === "full") {
     const settings = config.tunnel!;

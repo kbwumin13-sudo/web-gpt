@@ -14,7 +14,7 @@ import { augmentNativeModelCatalog } from "../src/model-catalog";
 import { startGateway, type GatewayServer } from "../src/gateway";
 import { startServer } from "../src/server";
 
-const codex = resolve(process.argv[2] ?? "/Applications/ChatGPT.app/Contents/Resources/codex");
+const codex = resolve(process.argv[2] ?? Bun.which("codex") ?? "/Applications/ChatGPT.app/Contents/Resources/codex");
 if (!existsSync(codex)) throw new Error(`Codex executable is missing: ${codex}`);
 
 const bundled = spawnSync(codex, ["debug", "models", "--bundled"], {

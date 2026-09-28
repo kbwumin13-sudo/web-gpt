@@ -92,6 +92,17 @@ test("a leaf states its own position so its summary is not written as the whole 
   }
 }, 60_000);
 
+test("the newest record's exact identifier remains visible near the end of a noisy segment", () => {
+  const history = userTurns(60, 6_000);
+  history[59] = { role: "user", content: `FINAL_FACT AZURE-731 ${"word ".repeat(1_180)}`, timestamp: 60 };
+  const plan = planHierarchicalCompaction(compactionRequest(history), capabilities)!;
+  const last = compiledLeafText(plan.leaves.at(-1)!.request);
+  const indexStart = last.lastIndexOf("<codex_compaction_record_index>");
+  expect(indexStart).toBeGreaterThan(0);
+  expect(last.slice(indexStart)).toContain("AZURE-731");
+  expect(last.slice(indexStart).length).toBeLessThan(4_000);
+}, 60_000);
+
 test("the merge turn receives the segment summaries in order and asks for the real checkpoint", () => {
   const plan = planHierarchicalCompaction(compactionRequest(userTurns(60, 6_000)), capabilities);
   const summaries = plan!.leaves.map(leaf => `summary of segment ${leaf.index}`);

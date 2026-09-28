@@ -6,7 +6,7 @@ import type {
 } from "../../types";
 import { extractChatGptCompactionSourceRevision } from "./environment";
 import type { ChatGptBrowserWorker } from "./browser-worker";
-import { ChatGptCompactionHandoffAccepted } from "./adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompactionTransactionHandle } from "./compaction-transaction";
 import type { ChatGptWebCapabilities } from "./model";
 import {
@@ -384,7 +384,10 @@ export async function requestRetainedCompactionHandoff(
       onTextDelta: () => {},
     });
     const browserFailure = browser.then<never>(
-      () => new Promise<never>(() => {}),
+      () => { throw new ChatGptWebAdapterError(
+        "ChatGPT completed the retained checkpoint response without submitting its one-shot control handoff",
+        { status: 409, errorType: "invalid_request_error", code: "compaction_handoff_missing", retryable: false },
+      ); },
       error => { throw error; },
     );
     const handoff = broker.waitForCompactionHandoff(transaction.token, operationSignal);
@@ -401,7 +404,8 @@ export async function requestRetainedCompactionHandoff(
       const accepted = broker.acceptedCompactionHandoff?.(transaction.token);
       if (accepted !== undefined) {
         summary = accepted;
-      } else if (!isChatGptCompactionHandoffRaceCandidate(error)) {
+      } else if (!isChatGptCompactionHandoffRaceCandidate(error)
+        && !(error instanceof ChatGptWebAdapterError && error.code === "compaction_handoff_missing")) {
         throw error;
       } else {
         const late = await withCompactionAbort(

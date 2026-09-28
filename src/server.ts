@@ -3,6 +3,7 @@ import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worke
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { chatGptRetainedTelemetrySnapshot } from "./adapters/chatgpt-web/retained-telemetry";
 import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow-observer";
+import { cloudflareRetryPauseActive, webReadinessSnapshot } from "./web-readiness";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
 import { chatGptCapabilityTelemetrySnapshot } from "./adapters/chatgpt-web/capability-telemetry";
 import { chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
@@ -613,6 +614,16 @@ export async function responseRequest(
       headers: { "content-type": "application/json" },
     });
   }
+  if (cloudflareRetryPauseActive()) {
+    // The first challenged browser response was already an SSE stream. Codex retries unknown
+    // streamed failures even when retryable=false; an immediate HTTP 400 is terminal in Codex.
+    // Stop the automatic replay before it opens another Temporary Chat into the same challenge.
+    return new Response(JSON.stringify({ error: {
+      type: "invalid_request_error",
+      code: "cloudflare_challenge",
+      message: "Cloudflare challenged the previous ChatGPT Web request. This immediate retry was stopped before opening another browser tab. Wait at least 90 seconds, then check the browser session before sending a new Web turn.",
+    } }), { status: 400, headers: { "content-type": "application/json" } });
+  }
   const abort = new AbortController();
   if (req.signal.aborted) abort.abort();
   else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
@@ -867,6 +878,7 @@ export function startServer(
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
           accepting_turns: !draining,
+          web_readiness: webReadinessSnapshot(),
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
           expected_web_models: expectedWebModels(config),

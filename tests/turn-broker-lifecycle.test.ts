@@ -4,8 +4,46 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, unlinkSync } from
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { callTurnBroker, TurnBroker, uniquelyRecoverTurnToken } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
+
+test("automatic turn token repair requires exactly one live one-character match", () => {
+  const original = `turn_${"A".repeat(32)}`;
+  const alternate = `turn_${"A".repeat(31)}B`;
+  expect(uniquelyRecoverTurnToken(original.slice(0, -1), [original])).toBe(original);
+  expect(uniquelyRecoverTurnToken(alternate, [original])).toBe(original);
+  expect(uniquelyRecoverTurnToken(original.slice(0, -2), [original])).toBeUndefined();
+  expect(uniquelyRecoverTurnToken(original.slice(0, -1), [original, alternate])).toBeUndefined();
+  expect(uniquelyRecoverTurnToken(` ${original}`, [original])).toBeUndefined();
+  expect(uniquelyRecoverTurnToken(original.replace("turn_", "request_"), [original])).toBeUndefined();
+});
+
+test("broker binds one corrected automatic token to its canonical active turn", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-token-repair-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    const token = await broker.register({
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" }, tools: [],
+    }, 60_000, "corrected-turn");
+    const claimed = await callTurnBroker<{ turnToken: string; bindingId: string; activityId: string }>(
+      socketPath, { method: "claim", token: token.slice(0, -1), contract: "native" },
+    );
+    expect(claimed.turnToken).toBe(token);
+    expect(claimed.bindingId).toStartWith("binding_");
+    await expect(callTurnBroker(socketPath, {
+      method: "activity_complete", token: claimed.turnToken, activityId: claimed.activityId,
+    })).resolves.toMatchObject({ completed: true });
+    broker.revoke(token);
+    await expect(callTurnBroker(socketPath, {
+      method: "claim", token: token.slice(0, -1), contract: "native",
+    })).rejects.toThrow("invalid, expired, or revoked");
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("explicit browser-turn cancellation aborts and removes every registered session", async () => {
   const sessions = new ChatGptTurnSessions();

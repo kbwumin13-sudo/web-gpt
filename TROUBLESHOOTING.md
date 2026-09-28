@@ -168,6 +168,26 @@ max_concurrent_threads_per_session = 1
 If the table already exists, add or change only the key; do not create a second `[agents]` table.
 Bigger Context can make one turn larger and longer, but does not increase safe account concurrency.
 
+## Cloudflare shows `verify you are human`
+
+Cloudflare checks every browser that opens ChatGPT, and it checks more often behind shared VPN or
+data-center exits. The bridge's Chrome does not identify itself as automated and does not modify
+ChatGPT's page, so Cloudflare's routine check normally clears by itself within seconds; a turn
+waits for it before starting.
+
+A turn that fails with `cloudflare_challenge` means Cloudflare wanted more than that: a click, or a
+pause because many Temporary Chats opened close together. Do not retry right away, and do not run
+`login` again; it cannot clear the check.
+
+1. Run `codex-chatgpt-web clear-challenge`.
+2. Pass the check in the ordinary Chrome window that opens and confirm that ChatGPT loads.
+3. Quit that Chrome completely (Command-Q). The command then verifies the page and model controls
+   in the same browser the turns use.
+
+Do not open the dedicated ChatGPT profile with `--remote-debugging-port` or attach other automation
+to it. Measured on Chrome 153, a browser started that way failed Cloudflare's check even when a
+person clicked it. If checks keep returning, try a steadier proxy exit.
+
 ## Images from earlier turns are attached again
 
 Codex includes prior task images in the canonical conversation context. The bridge follows that

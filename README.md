@@ -24,6 +24,16 @@
 > Bring the ChatGPT Web models available to your account into Codex while keeping the native task
 > UI, context lifecycle, streaming, compaction, and tool harness.
 
+ChatGPT Web for Codex is a local bridge that lets Codex use the ChatGPT models already available
+to your account through the native Codex workflow. It keeps the task editor, filesystem access,
+MCP tools, streaming events, and context management in Codex while routing selected model turns
+through a managed ChatGPT Web session.
+
+The project focuses on three layers: a native model integration layer, a task-bound ChatGPT Web
+backend, and a desktop setup experience for managing sign-in, diagnostics, and MCP connectivity.
+It is designed for users who want the flexibility of ChatGPT Web subscriptions inside their
+existing Codex development workflow.
+
 <table>
   <tr>
     <td width="33%"><strong>Native model picker</strong><br><sub>Choose ChatGPT Web tiers directly from Codex and keep working in the same task.</sub></td>

@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, hasCurrentChatGptEnvironmentContext, hasOnlyHistoricalAbortedEnvironmentContext } from "../src/adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
@@ -564,6 +564,44 @@ describe("permission_profile sandbox detection (Codex CLI 0.146+)", () => {
 });
 
 describe("trusted Codex task environment continuity", () => {
+  test("an interrupted first turn keeps its prior envelope historical and resumes only its cached authority", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-aborted-environment-"));
+    temporaryRoots.push(stateRoot);
+    const store = new ChatGptThreadEnvironmentStore(join(stateRoot, "thread-environments.json"));
+    store.resolve(currentWire());
+    const next = currentWire();
+    const nextTools: CodexTool[] = [{ name: "follow_up_tool", description: "current", parameters: { type: "object" } }];
+    next.context.tools = nextTools;
+    next._rawBody = {
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_current", turn_id: "turn_next" }) },
+      input: [
+        { type: "message", id: "msg_old_environment", role: "user", content: [{ type: "input_text", text: environmentXml }] },
+        { type: "message", id: "msg_old_prompt", role: "user", internal_chat_message_metadata_passthrough: { turn_id: "turn_current" }, content: [{ type: "input_text", text: "Earlier task" }] },
+        { type: "message", id: "msg_abort", role: "user", internal_chat_message_metadata_passthrough: { turn_id: "turn_current" }, content: [{ type: "input_text", text: "<turn_aborted>The prior turn was interrupted.</turn_aborted>" }] },
+        { type: "message", id: "msg_next", role: "user", internal_chat_message_metadata_passthrough: { turn_id: "turn_next" }, content: [{ type: "input_text", text: "Continue this task" }] },
+      ],
+    };
+    expect(hasCurrentChatGptEnvironmentContext(next)).toBe(false);
+    expect(hasOnlyHistoricalAbortedEnvironmentContext(next)).toBe(true);
+    expect(store.resolve(next)).toEqual({
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" }, tools: nextTools,
+    });
+    const foreign = structuredClone(next);
+    (foreign._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"] =
+      JSON.stringify({ thread_id: "thread_foreign", turn_id: "turn_next" });
+    expect(() => store.resolve(foreign)).toThrow("missing cwd");
+    const updatedCurrent = structuredClone(next);
+    const input = (updatedCurrent._rawBody as { input: Array<Record<string, unknown>> }).input;
+    input.splice(-1, 0, {
+      type: "message", id: "msg_current_environment", role: "user",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn_next" },
+      content: [{ type: "input_text", text: environmentXml.replaceAll(root, resolve(root, "outside")) }],
+    });
+    expect(hasOnlyHistoricalAbortedEnvironmentContext(updatedCurrent)).toBe(false);
+    expect(store.resolve(updatedCurrent).cwd).toBe(resolve(root, "outside"));
+  });
+
   test("persists the trusted first-turn authority and refreshes tools from every follow-up", () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-thread-environment-"));
     temporaryRoots.push(stateRoot);

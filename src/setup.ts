@@ -40,6 +40,8 @@ import {
   installService,
   removeLegacyRuntimeArtifacts,
   restartService,
+  startService,
+  stopService,
   stopGatewayService,
   uninstallService,
   gatewayServiceDefinitionMatches,
@@ -552,17 +554,25 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       );
     }
     if (beforeService.loaded && (loginRequired || capabilityProbeRequired) && existing) await assertServiceIdle(existing);
-    if (loginRequired) {
-      const login = await loginToChatGpt(config);
-      solAvailable = login.solAvailable;
-      extraHighAvailable = login.extraHighAvailable;
-      proAvailable = login.proAvailable;
-      loginCreated = true;
-    } else if (capabilityProbeRequired) {
-      const inspected = await inspectBrowserLoginCapabilities(config);
-      solAvailable = inspected.solAvailable;
-      extraHighAvailable = inspected.extraHighAvailable;
-      proAvailable = inspected.proAvailable;
+    const stopForProfile = Boolean(beforeService.loaded && existing?.managedProfilePath
+      && existing.managedProfilePath === config.managedProfilePath
+      && (loginRequired || capabilityProbeRequired));
+    if (stopForProfile) await stopService(existing!);
+    try {
+      if (loginRequired) {
+        const login = await loginToChatGpt(config);
+        solAvailable = login.solAvailable;
+        extraHighAvailable = login.extraHighAvailable;
+        proAvailable = login.proAvailable;
+        loginCreated = true;
+      } else if (capabilityProbeRequired) {
+        const inspected = await inspectBrowserLoginCapabilities(config);
+        solAvailable = inspected.solAvailable;
+        extraHighAvailable = inspected.extraHighAvailable;
+        proAvailable = inspected.proAvailable;
+      }
+    } finally {
+      if (stopForProfile) startService();
     }
   }
   config.solAvailable = solAvailable === true;

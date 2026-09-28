@@ -2,7 +2,7 @@ import type { Page } from "playwright-core";
 import { observeWireStream, type ChatGptWireObservation } from "./turn-observation";
 import { buildWireTranscript, wireTranscriptsEnabled, writeWireTranscript } from "./transcript-store";
 import { ChatGptWireCollector, type ChatGptWireStream } from "./wire-collector";
-import { attachChatGptWireTap } from "./wire-tap-host";
+import { attachChatGptWireTap } from "./cdp-wire-tap";
 import { resumedConversationStream, STREAM_HANDOFF } from "./handoff";
 import { decodeSseStream } from "./sse-frames";
 import { parseConversationFrame } from "./conversation-events";
@@ -53,7 +53,7 @@ export interface ChatGptWireTelemetrySnapshot {
   unapplied_deltas: number;
   /** Taps that could not be installed. A refusal degrades to no observation, never to a failed turn. */
   attach_failures: number;
-  /** Records the page sent that this host refused as malformed. */
+  /** Records refused because a page passed the per-page record cap. */
   rejected_records: number;
   /**
    * Backend-API paths observed during turns, without query strings. Naming the conversation
@@ -213,7 +213,8 @@ export function requestPath(url: string): string {
 }
 
 export function conversationPath(url: string): boolean {
-  return requestPath(url).includes("/conversation");
+  const path = requestPath(url);
+  return path === "/backend-api/f/conversation" || path === "/backend-api/conversation";
 }
 
 /** Compare the two observations of one turn. Lengths only: the texts themselves are conversation content. */
@@ -280,19 +281,20 @@ function completeEnoughToRescue(wire: ChatGptWireObservation): boolean {
 export class ChatGptWireShadowSession {
   private readonly collector = new ChatGptWireCollector();
   private attached = false;
-  private rejected: (() => { malformed: number; overflowed: number }) | undefined;
+  private overflowed: (() => number) | undefined;
 
   constructor(
     private readonly traceId: string,
     private readonly transcriptRoot: string,
+    private readonly attachTap: typeof attachChatGptWireTap = attachChatGptWireTap,
   ) {}
 
   /** Install the observer. Never throws: shadow observation must not be able to fail a turn. */
   async attach(page: Page, onFault?: (message: string) => void): Promise<boolean> {
     try {
-      const attachment = await attachChatGptWireTap(page, this.collector, onFault);
+      const attachment = await this.attachTap(page, this.collector, onFault);
       this.attached = attachment.attached;
-      this.rejected = attachment.rejected;
+      this.overflowed = attachment.overflowed;
       if (!attachment.attached) attachFailures += 1;
       else turnsObserved += 1;
       return attachment.attached;
@@ -306,21 +308,24 @@ export class ChatGptWireShadowSession {
   /**
    * The conversation stream this turn produced, if one was observed.
    *
-   * The tap watches the whole backend API, so the turn's stream has to be picked out of ordinary
-   * page traffic. A path naming a conversation is preferred; otherwise the last stream that
-   * actually carried event-stream frames is used, which identifies it by what it did rather than
-   * by a path that can be renamed. Last one wins either way: a turn can retry its request, and the
-   * final attempt is the one that answered.
+   * The tap watches the whole backend API. A submitted conversation is a POST to its known
+   * endpoint, or a POST whose frames contain an actual conversation message/control. Merely having
+   * SSE frames is not evidence: usage and notification streams can have frames and even 403s.
+   * When several attributed requests exist, the final attempt is the one that answered.
    */
   private conversationStream(): ChatGptWireStream | undefined {
-    const streams = this.collector.snapshot();
-    // Carrying event-stream frames comes first. Selecting by path name instead picked
-    // `/f/conversation/prepare` — a small JSON handshake that decodes to no frames — over the
-    // request that actually carried the turn, and reported the turn as unobserved while its data
-    // sat in the collector. What a request did is the stronger signal than what it is called.
-    const streaming = streams.filter(stream => stream.frames.length > 0);
-    if (streaming.length > 0) return streaming.at(-1);
-    return streams.filter(stream => conversationPath(stream.url)).at(-1);
+    const streams = this.collector.snapshot().filter(stream => stream.method.toUpperCase() === "POST");
+    const attributed = streams.filter(stream => {
+      if (conversationPath(stream.url)) return true;
+      if (stream.frames.length === 0) return false;
+      const observation = observeWireStream(stream);
+      return observation.endedTurn
+        || observation.messageIds.length > 0
+        || observation.toolCallCount > 0
+        || observation.conversationId !== undefined
+        || observation.counts.controlTypes.includes(STREAM_HANDOFF);
+    });
+    return attributed.at(-1);
   }
 
   /**
@@ -363,13 +368,33 @@ export class ChatGptWireShadowSession {
       recordComparison(this.traceId, "not_observed");
       return { comparison: "not_observed", wireChars: 0, domChars: dom.answer.length };
     }
-    const counts = this.rejected?.();
-    if (counts) rejectedRecords += counts.malformed + counts.overflowed;
+    rejectedRecords += this.overflowed?.() ?? 0;
     evictedWithFrames += this.collector.counts().evictedWithFrames;
     for (const seen of this.collector.snapshot()) {
       const path = requestPath(seen.url);
       if (observedPaths.size < MAX_TRACKED_PATHS) observedPaths.add(path);
       if (seen.frames.length > 0 && streamingPaths.size < MAX_TRACKED_PATHS) streamingPaths.add(path);
+    }
+    if (dom.failed) {
+      const attempts = this.collector.snapshot()
+        .filter(candidate => candidate.method.toUpperCase() === "POST" && conversationPath(candidate.url))
+        .map(candidate => {
+          const reading = observeWireStream(candidate);
+          return {
+            status: candidate.status ?? null,
+            closed: candidate.closed,
+            frames: candidate.frames.length,
+            messageCount: reading.messageIds.length,
+            answerChars: reading.answer.length,
+            reasoningChars: reading.reasoning.length,
+            toolCallCount: reading.toolCallCount,
+            endedTurn: reading.endedTurn,
+            sawDone: reading.sawDone,
+            errorReported: reading.error !== undefined,
+            controls: reading.counts.controlTypes,
+          };
+        });
+      console.info(`[chatgpt-web] wire attempt summary trace=${this.traceId} ${JSON.stringify(attempts)}`);
     }
     const stream = this.conversationStream();
     const direct = stream ? observeWireStream(stream) : undefined;

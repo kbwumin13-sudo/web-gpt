@@ -3,10 +3,11 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
+import { clearCloudflareChallenge } from "./cloudflare-challenge";
+import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, saveConfig } from "./config";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -45,6 +46,7 @@ Usage:
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
   codex-chatgpt-web logout
+  codex-chatgpt-web clear-challenge
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web subagents <status|compatibility-v1|native>
@@ -236,6 +238,7 @@ function launcherLoginContinuation(): { promise: Promise<void>; close: () => voi
 
 async function loginCommand(args: string[]): Promise<void> {
   const launcherControl = takeFlag(args, "--launcher-control");
+  const persistentRequested = takeFlag(args, "--persistent-profile");
   if (!launcherControl) {
     const chromeExecutablePath = takeOption(args, "--chrome");
     const storageStatePath = takeOption(args, "--storage-state");
@@ -243,20 +246,51 @@ async function loginCommand(args: string[]): Promise<void> {
     if (Boolean(chromeExecutablePath) !== Boolean(storageStatePath)) {
       throw new Error("`--chrome` and `--storage-state` must be provided together");
     }
-    const config = chromeExecutablePath && storageStatePath
+    const current = chromeExecutablePath && storageStatePath
       ? {
           ...defaultConfig("browser-only"),
           chromeExecutablePath,
           storageStatePath,
+          managedProfilePath: undefined,
         }
       : loadConfig();
-    if (config.browserHost === "launcher") {
+    if (current.browserHost === "launcher") {
       throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
     }
-    const result = await loginToChatGpt(config);
-    stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
+    const config = persistentRequested
+      ? { ...current, managedProfilePath: join(dirname(current.storageStatePath), "managed-profile") }
+      : current;
+    const restartBackend = process.platform === "darwin" && !chromeExecutablePath && getServiceStatus().loaded;
+    if (restartBackend) await stopService(current);
+    let promoted = false;
+    try {
+      const result = await loginToChatGpt(config);
+      if (!chromeExecutablePath) {
+        saveConfig({
+          ...config,
+          solAvailable: result.solAvailable,
+          extraHighAvailable: result.extraHighAvailable,
+          proAvailable: result.proAvailable,
+        });
+        promoted = true;
+      }
+      if (restartBackend) {
+        startService();
+        await waitForBackendReady(config);
+      }
+      stdout.write(`ChatGPT login stored at ${result.profilePath ?? result.storageStatePath}\n`);
+    } catch (error) {
+      if (promoted) saveConfig(current);
+      if (restartBackend) {
+        startService();
+        await waitForBackendReady(current);
+      }
+      throw error;
+    }
     return;
   }
+
+  if (persistentRequested) throw new Error("Launcher passkey capture does not use a managed Chrome profile");
 
   const chromeExecutablePath = takeOption(args, "--chrome");
   const storageStatePath = takeOption(args, "--storage-state");
@@ -293,10 +327,35 @@ async function logoutCommand(args: string[]): Promise<void> {
   try {
     rmSync(config.storageStatePath, { force: true });
     rmSync(`${config.storageStatePath}.verified.json`, { force: true });
+    if (config.managedProfilePath) rmSync(config.managedProfilePath, { recursive: true, force: true });
   } finally {
     if (restartBackend) startService();
   }
   stdout.write("Backend-managed ChatGPT login state removed.\n");
+}
+
+async function clearChallengeCommand(args: string[]): Promise<void> {
+  assertNoArgs(args);
+  const config = loadConfig();
+  const restartBackend = Boolean(config.managedProfilePath && process.platform === "darwin" && getServiceStatus().loaded);
+  if (restartBackend) await stopService(config);
+  try {
+    const result = await clearCloudflareChallenge(config, { log: message => stdout.write(`${message}\n`) });
+    if (result.cleared) {
+      stdout.write("ChatGPT composer and model controls are ready in the dedicated browser. Verify a real Web turn before declaring recovery.\n");
+    } else if (result.apiChallengedPath) {
+      stdout.write(`ChatGPT's ${result.apiChallengedPath} request was challenged; this API response has no checkbox in the page.\n`);
+    } else if (result.challengeWasPresent) {
+      stdout.write("The visible challenge was not passed before the timeout.\n");
+    } else {
+      stdout.write("The page opened but its model controls did not become ready.\n");
+    }
+    stdout.write(`cf_clearance domains: ${result.clearanceDomains.join(", ") || "(none)"}\n`);
+    if (result.backupPath) stdout.write(`Previous state backed up at ${result.backupPath}\n`);
+    if (!result.cleared) process.exitCode = 1;
+  } finally {
+    if (restartBackend) startService();
+  }
 }
 
 async function setupCommand(args: string[]): Promise<void> {
@@ -771,6 +830,7 @@ async function main(): Promise<void> {
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") await loginCommand(args);
   else if (command === "logout") await logoutCommand(args);
+  else if (command === "clear-challenge") await clearChallengeCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "route") await routeCommand(args);
   else if (command === "subagents") await subagentsCommand(args);

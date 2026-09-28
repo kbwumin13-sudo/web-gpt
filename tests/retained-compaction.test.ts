@@ -472,6 +472,37 @@ test("completed retained compaction never treats ordinary assistant text as a ha
   )).rejects.toThrow("structured handoff missing");
 });
 
+test("a completed retained response with no control call fails after the handoff grace", async () => {
+  const sourceRequest = request(false);
+  const source = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    usageInput: sourceRequest,
+    conversationKey: chatGptConversationKey(sourceRequest, "provider")!,
+    cancel() {},
+  });
+  const broker = {
+    beginCompactionTransaction: async () => ({
+      token: "control_11111111111111111111111111111111",
+      handoffId: "handoff_22222222222222222222222222222222",
+    }),
+    waitForCompactionHandoff: () => new Promise<string>(() => {}),
+    acceptedCompactionHandoff: () => undefined,
+    abortCompactionTransaction() {},
+  } as unknown as TurnBroker;
+  const startedAt = Date.now();
+  await expect(requestRetainedCompactionHandoff(
+    { run: async () => "ordinary summary without a control call" } as never,
+    request(true), source, broker,
+    { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    "trace_missing_control_handoff",
+  )).rejects.toMatchObject({ code: "compaction_handoff_missing", retryable: false });
+  expect(Date.now() - startedAt).toBeLessThan(3_000);
+});
+
 test("retained compaction deadline bounds browser settlement after the control handoff succeeds", async () => {
   const sourceRequest = request(false);
   const source = new ChatGptTurnSession({

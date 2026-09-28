@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { ChatGptWireCollector } from "../src/adapters/chatgpt-web/wire/wire-collector";
-import type { ChatGptWireRecord } from "../src/adapters/chatgpt-web/wire/page-tap";
+import type { ChatGptWireRecord } from "../src/adapters/chatgpt-web/wire/wire-record";
 import type { SseFrame } from "../src/adapters/chatgpt-web/wire/sse-frames";
 
 const CONVERSATION_URL = "https://chatgpt.com/backend-api/f/conversation";

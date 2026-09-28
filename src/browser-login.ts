@@ -1,20 +1,23 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { chromium, type BrowserContext, type BrowserContextOptions, type Page } from "playwright-core";
 import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
+import { automatedChromeLaunchOptions, chromeProxyArguments } from "./chrome-launch";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
   CHATGPT_TEMPORARY_CHAT_URL,
   CHATGPT_COMPOSER_SELECTOR,
+  ChatGptCloudflareApiChallengeWatch,
   detectChatGptAccountCapabilities,
 } from "./chatgpt-session";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
 
 export interface BrowserLoginResult {
   storageStatePath: string;
+  profilePath?: string;
   accountSurfaceUrl: string;
   solAvailable: boolean;
   extraHighAvailable: boolean;
@@ -140,18 +143,31 @@ export function loginVerificationMarkerPath(storageStatePath: string): string {
   return `${storageStatePath}.verified.json`;
 }
 
-export function chromeProxyArguments(environment: NodeJS.ProcessEnv = process.env): string[] {
-  const raw = [environment.HTTPS_PROXY, environment.https_proxy, environment.HTTP_PROXY, environment.http_proxy]
-    .find(value => typeof value === "string" && value.trim())?.trim();
-  if (!raw) return [];
+export function managedProfileVerificationMarkerPath(profilePath: string): string {
+  return join(profilePath, ".codex-verified.json");
+}
+
+export function managedProfileIsVerified(profilePath: string): boolean {
   try {
-    const proxy = new URL(raw);
-    if (!["http:", "https:", "socks4:", "socks5:"].includes(proxy.protocol)
-      || proxy.username || proxy.password || proxy.pathname !== "/" || proxy.search || proxy.hash) return [];
-    return [`--proxy-server=${proxy.protocol}//${proxy.host}`];
+    const profile = lstatSync(profilePath);
+    const marker = lstatSync(managedProfileVerificationMarkerPath(profilePath));
+    if (!profile.isDirectory() || profile.isSymbolicLink() || (profile.mode & 0o077) !== 0
+      || !marker.isFile() || marker.isSymbolicLink() || (marker.mode & 0o077) !== 0) return false;
+    const value = JSON.parse(readFileSync(managedProfileVerificationMarkerPath(profilePath), "utf8")) as Partial<LoginVerificationMarker>;
+    return value.version === 1 && value.authenticated === true
+      && typeof value.verifiedAt === "string" && !Number.isNaN(Date.parse(value.verifiedAt));
   } catch {
-    return [];
+    return false;
   }
+}
+
+function writeManagedProfileVerificationMarker(profilePath: string, capabilities: ChatGptWebAccountCapabilities): void {
+  atomicWriteFile(managedProfileVerificationMarkerPath(profilePath), `${JSON.stringify({
+    version: 1,
+    authenticated: true,
+    verifiedAt: new Date().toISOString(),
+    ...capabilities,
+  })}\n`);
 }
 
 function chatGptComposer(page: Page) {
@@ -175,13 +191,7 @@ async function inspectStoredState(
   config: AppConfig,
   storageState: NonNullable<BrowserContextOptions["storageState"]>,
 ): Promise<ChatGptWebAccountCapabilities & { url: string }> {
-  const proxyArgs = chromeProxyArguments();
-  const verifierBrowser = await chromium.launch({
-    executablePath: config.chromeExecutablePath,
-    headless: false,
-    ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-    args: ["--no-first-run", "--no-default-browser-check", ...proxyArgs],
-  });
+  const verifierBrowser = await chromium.launch(automatedChromeLaunchOptions(config));
   try {
     const verifierContext = await verifierBrowser.newContext({ storageState });
     try {
@@ -201,6 +211,32 @@ async function inspectStoredState(
 
 export async function inspectBrowserLoginCapabilities(config: AppConfig): Promise<ChatGptWebAccountCapabilities> {
   if (!browserLoginStateExists(config)) throw new Error("ChatGPT login state is missing or unverified");
+  if (config.managedProfilePath) {
+    const context = await chromium.launchPersistentContext(
+      config.managedProfilePath,
+      automatedChromeLaunchOptions(config),
+    );
+    let inspected: ChatGptWebAccountCapabilities;
+    try {
+      const page = await context.newPage();
+      const challenge = new ChatGptCloudflareApiChallengeWatch();
+      challenge.observe(page);
+      try {
+        await page.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await chatGptComposer(page).waitFor({ state: "visible", timeout: 60_000 });
+        inspected = await detectChatGptAccountCapabilities(page);
+        if (!inspected.solAvailable && challenge.challengedPath) {
+          throw new Error(`ChatGPT model controls could not be verified because ${challenge.challengedPath} was challenged`);
+        }
+      } finally {
+        challenge.dispose();
+      }
+    } finally {
+      await context.close();
+    }
+    writeManagedProfileVerificationMarker(config.managedProfilePath, inspected);
+    return inspected;
+  }
   const inspected = await inspectStoredState(config, config.storageStatePath);
   writeVerificationMarker(config.storageStatePath, inspected);
   return {
@@ -215,7 +251,10 @@ export function storedBrowserLoginCapabilities(
 ): Partial<ChatGptWebAccountCapabilities> {
   if (!browserLoginStateExists(config)) return {};
   try {
-    const marker = JSON.parse(readFileSync(loginVerificationMarkerPath(config.storageStatePath), "utf8")) as Partial<LoginVerificationMarker>;
+    const markerPath = config.managedProfilePath
+      ? managedProfileVerificationMarkerPath(config.managedProfilePath)
+      : loginVerificationMarkerPath(config.storageStatePath);
+    const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Partial<LoginVerificationMarker>;
     return {
       ...(typeof marker.solAvailable === "boolean" ? { solAvailable: marker.solAvailable } : {}),
       ...(typeof marker.extraHighAvailable === "boolean" ? { extraHighAvailable: marker.extraHighAvailable } : {}),
@@ -403,8 +442,13 @@ export async function loginToChatGpt(
   if (!existsSync(config.chromeExecutablePath)) {
     throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
   }
-  const profileDir = join(dirname(config.storageStatePath), "login-profile");
+  const persistent = config.managedProfilePath !== undefined;
+  const profileDir = config.managedProfilePath ?? join(dirname(config.storageStatePath), "login-profile");
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  const profileStat = lstatSync(profileDir);
+  if (!profileStat.isDirectory() || profileStat.isSymbolicLink()) throw new Error("Dedicated Chrome profile must be a real directory");
+  chmodSync(profileDir, 0o700);
+  if (persistent) rmSync(managedProfileVerificationMarkerPath(profileDir), { force: true });
   process.stdout.write(
     "A normal Chrome window is open. Sign in to ChatGPT, confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n",
   );
@@ -427,14 +471,12 @@ export async function loginToChatGpt(
   });
   if (loginExit !== 0) throw new Error(`Normal Chrome login window exited with status ${loginExit}`);
 
-  const context = await chromium.launchPersistentContext(profileDir, {
-    executablePath: config.chromeExecutablePath,
-    headless: false,
-    ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-    args: ["--no-first-run", "--no-default-browser-check", ...proxyArgs],
-  });
+  const context = await chromium.launchPersistentContext(profileDir, automatedChromeLaunchOptions(config));
+  let verifiedManaged: ChatGptWebAccountCapabilities | undefined;
+  const challenge = persistent ? new ChatGptCloudflareApiChallengeWatch() : undefined;
   try {
-    const page = context.pages()[0] ?? await context.newPage();
+    const page = persistent ? await context.newPage() : context.pages()[0] ?? await context.newPage();
+    challenge?.observe(page);
     await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
@@ -447,25 +489,37 @@ export async function loginToChatGpt(
     }
     await assertAuthenticatedChatGptPage(page);
     await assertTemporaryChatPage(page);
-    const state = await context.storageState();
-
-    const inspected = await inspectStoredState(config, state);
-    atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
-    writeVerificationMarker(config.storageStatePath, inspected);
+    const inspected = persistent
+      ? await detectChatGptAccountCapabilities(page)
+      : await inspectStoredState(config, await context.storageState());
+    if (persistent) {
+      if (!inspected.solAvailable && challenge?.challengedPath) {
+        throw new Error(`ChatGPT model controls could not be verified because ${challenge.challengedPath} was challenged`);
+      }
+      verifiedManaged = inspected;
+    } else {
+      atomicWriteFile(config.storageStatePath, `${JSON.stringify(await context.storageState())}\n`);
+      writeVerificationMarker(config.storageStatePath, inspected);
+    }
     return {
       storageStatePath: config.storageStatePath,
+      ...(persistent ? { profilePath: profileDir } : {}),
       accountSurfaceUrl: page.url(),
       solAvailable: inspected.solAvailable,
       extraHighAvailable: inspected.extraHighAvailable === true || inspected.proAvailable === true,
       proAvailable: inspected.proAvailable,
     };
   } finally {
+    challenge?.dispose();
     await context.close();
-    if (browserLoginStateExists(config)) rmSync(profileDir, { recursive: true, force: true });
+    if (persistent) {
+      if (verifiedManaged) writeManagedProfileVerificationMarker(profileDir, verifiedManaged);
+    } else if (browserLoginStateExists(config)) rmSync(profileDir, { recursive: true, force: true });
   }
 }
 
 export function browserLoginStateExists(config: AppConfig): boolean {
+  if (config.managedProfilePath) return managedProfileIsVerified(config.managedProfilePath);
   if (!existsSync(config.storageStatePath)) return false;
   const markerPath = loginVerificationMarkerPath(config.storageStatePath);
   if (!existsSync(markerPath)) return false;

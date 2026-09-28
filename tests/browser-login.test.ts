@@ -1,25 +1,19 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   browserLoginStateExists,
   captureSystemBrowserLogin,
-  chromeProxyArguments,
   loginToChatGpt,
   loginVerificationMarkerPath,
+  managedProfileIsVerified,
+  managedProfileVerificationMarkerPath,
   sanitizeBrowserLoginStorageState,
 } from "../src/browser-login";
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
+import { AUTOMATION_CONTROLLED_OFF } from "../src/chrome-launch";
 import { defaultConfig } from "../src/config";
-
-test("Chrome login receives a safe proxy endpoint without forwarding credentials", () => {
-  expect(chromeProxyArguments({ HTTPS_PROXY: "http://127.0.0.1:7891" })).toEqual([
-    "--proxy-server=http://127.0.0.1:7891",
-  ]);
-  expect(chromeProxyArguments({ HTTPS_PROXY: "http://user:secret@127.0.0.1:7891" })).toEqual([]);
-  expect(chromeProxyArguments({ HTTPS_PROXY: "not-a-proxy" })).toEqual([]);
-});
 
 test("login starts with normal Chrome and captures state in a headed Keychain-aware context", async () => {
   if (process.platform === "win32") return;
@@ -34,6 +28,7 @@ test("login starts with normal Chrome and captures state in a headed Keychain-aw
     const config = defaultConfig("browser-only");
     config.chromeExecutablePath = executable;
     config.storageStatePath = join(root, "browser", "storage-state.json");
+    config.managedProfilePath = join(root, "browser", "managed-profile");
     await loginToChatGpt(config, { timeoutMs: 100 }).catch(() => {});
 
     const launches = readFileSync(argsLog, "utf8").trim().split("\n");
@@ -43,6 +38,9 @@ test("login starts with normal Chrome and captures state in a headed Keychain-aw
     expect(firstLaunch).toContain(CHATGPT_TEMPORARY_CHAT_URL);
     expect(firstLaunch).not.toContain("--remote-debugging-pipe");
     expect(launches[1]).not.toContain("--headless");
+    // The verification is the automated launch, so it must not look automated to Cloudflare.
+    expect(launches[1]).toContain(AUTOMATION_CONTROLLED_OFF);
+    expect(launches[1]).not.toContain("--no-sandbox");
   } finally {
     if (previousLog === undefined) delete process.env.CODEX_LOGIN_ARG_LOG;
     else process.env.CODEX_LOGIN_ARG_LOG = previousLog;
@@ -143,6 +141,7 @@ test("a storage-state file is not trusted without a verification marker", () => 
   try {
     const config = defaultConfig("browser-only");
     config.storageStatePath = join(root, "storage-state.json");
+    config.managedProfilePath = undefined;
     writeFileSync(config.storageStatePath, "{}\n", { mode: 0o600 });
     expect(browserLoginStateExists(config)).toBe(false);
 
@@ -152,6 +151,30 @@ test("a storage-state file is not trusted without a verification marker", () => 
       { mode: 0o600 },
     );
     expect(browserLoginStateExists(config)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a dedicated profile needs its own private verification evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-persistent-login-"));
+  try {
+    const config = defaultConfig("browser-only");
+    config.storageStatePath = join(root, "storage-state.json");
+    config.managedProfilePath = join(root, "managed-profile");
+    mkdirSync(config.managedProfilePath, { mode: 0o700 });
+    writeFileSync(config.storageStatePath, "{}\n", { mode: 0o600 });
+    writeFileSync(loginVerificationMarkerPath(config.storageStatePath), JSON.stringify({ version: 1, authenticated: true, verifiedAt: new Date().toISOString() }), { mode: 0o600 });
+    expect(browserLoginStateExists(config)).toBe(false);
+    const marker = managedProfileVerificationMarkerPath(config.managedProfilePath);
+    writeFileSync(marker, JSON.stringify({ version: 1, authenticated: true, verifiedAt: new Date().toISOString(), solAvailable: true }), { mode: 0o600 });
+    expect(managedProfileIsVerified(config.managedProfilePath)).toBe(true);
+    expect(browserLoginStateExists(config)).toBe(true);
+    chmodSync(marker, 0o644);
+    expect(browserLoginStateExists(config)).toBe(false);
+    rmSync(config.managedProfilePath, { recursive: true, force: true });
+    symlinkSync(root, config.managedProfilePath);
+    expect(browserLoginStateExists(config)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -7,6 +7,7 @@ import { compactRequest, responseRequest as respond } from "../src/server";
 import type { CodexProviderConfig } from "../src/types";
 import { extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
 import { chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
+import { markWebReadiness } from "../src/web-readiness";
 
 const model = "chatgpt-web/high";
 const summary = "The repository was inspected. Continue by implementing the bounded Web context contract.";
@@ -14,6 +15,30 @@ const summary = "The repository was inspected. Continue by implementing the boun
 // These fixtures test checkpoint authorization, not persisted previous_response_id storage.
 const responseRequest: typeof respond = (request, config, factory, options) =>
   respond(request, config, factory, { ...options, rememberState: false });
+
+test("a recent Cloudflare API challenge stops Codex's immediate streamed replay before a browser opens", async () => {
+  const config = defaultConfig("full");
+  let adapterConstructions = 0;
+  markWebReadiness("challenged", "cloudflare_challenge");
+  try {
+    const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "chatgpt-web/high",
+        stream: true,
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Reply OK" }] }],
+      }),
+    }), config, () => {
+      adapterConstructions += 1;
+      throw new Error("challenged replay must not create a browser adapter");
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "cloudflare_challenge", type: "invalid_request_error" } });
+    expect(adapterConstructions).toBe(0);
+  } finally {
+    markWebReadiness("ready", "completed_web_turn");
+  }
+});
 
 function compactionAdapterFactory(
   seenProviders: CodexProviderConfig[] = [],

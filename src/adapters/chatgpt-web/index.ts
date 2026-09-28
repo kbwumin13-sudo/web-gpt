@@ -1339,6 +1339,10 @@ export function createChatGptWebAdapter(
                       && handoffError.code === "chatgpt_stopped_thinking") {
                       return await runFreshCompactionFallback("source_stopped_during_handoff");
                     }
+                    if (handoffError instanceof ChatGptWebAdapterError
+                      && handoffError.code === "compaction_handoff_missing") {
+                      return await runFreshCompactionFallback("retained_completed_without_control_handoff");
+                    }
                     throw handoffError;
                   } finally {
                     if (handoffTimer) clearTimeout(handoffTimer);

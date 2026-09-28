@@ -125,11 +125,36 @@ export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest):
       || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
       laterAssistantOutput = true;
     }
+    if (item.type === "message" && item.role === "user" && isTurnAbortedNotice(item)
+      && itemTurnId(item) !== turnId) laterAssistantOutput = true;
     if (item.type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
     const owner = itemTurnId(item);
     if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
   }
   return false;
+}
+
+/** A prior turn's untagged environment remains history when an exact native abort notice separates it from the current turn. */
+export function hasOnlyHistoricalAbortedEnvironmentContext(parsed: CodexParsedRequest): boolean {
+  const currentTurnId = extractChatGptTurnIdentity(parsed).turnId;
+  if (!currentTurnId) return false;
+  const input = record(parsed._rawBody)?.input;
+  if (!Array.isArray(input)) return false;
+  const abortIndex = input.findLastIndex(value => {
+    const item = record(value);
+    const owner = item ? itemTurnId(item) : undefined;
+    return item?.type === "message" && item.role === "user"
+      && owner !== undefined && owner !== currentTurnId && isTurnAbortedNotice(item);
+  });
+  if (abortIndex < 0) return false;
+  let seenEnvironment = false;
+  for (const [index, value] of input.entries()) {
+    const item = record(value);
+    if (item?.type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
+    if (index >= abortIndex || itemTurnId(item) === currentTurnId) return false;
+    seenEnvironment = true;
+  }
+  return seenEnvironment;
 }
 
 export interface ChatGptUnattributedEnvironmentMessage {

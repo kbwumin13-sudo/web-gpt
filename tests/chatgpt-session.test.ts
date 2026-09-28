@@ -5,6 +5,8 @@ import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+  CHATGPT_SEND_BUTTON_SELECTOR,
+  ChatGptCloudflareApiChallengeWatch,
   activateChatGptEffortMenu,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
@@ -21,6 +23,8 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
     <textarea class="wcDTda_fallbackTextarea" id="composer-fallback"></textarea>
     <button aria-haspopup="menu" data-tone="neutral" id="effort"></button>
     <button aria-haspopup="menu" data-testid="model-switcher-dropdown-button" id="model"></button>
+    <button aria-haspopup="menu" data-composer-navigation-target="reasoning" data-codex-intelligence-trigger="true" id="live-model"></button>
+    <button type="submit" aria-label="发送" id="live-send"></button>
   </form></body>`);
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
   // ChatGPT degrades to a plain textarea when its rich editor does not load. Measured live on
@@ -28,7 +32,19 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
   // selector above missed it and every turn failed at preparation reporting an expired login. The
   // search field stays excluded: the match is on the composer's own class, not on being a textarea.
   expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical", "composer-fallback"]);
-  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model"]);
+  expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model", "live-model"]);
+  expect(matches(CHATGPT_SEND_BUTTON_SELECTOR)).toEqual(["live-send"]);
+});
+
+test("the live reasoning menu exposes a structural slider without the older data attribute", () => {
+  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  const document = createDocument(`<body>
+    <span role="slider" id="unrelated"></span>
+    <div role="menu" id="live-menu"><span role="slider" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0"></span></div>
+    <div data-model-reasoning-effort-slider id="older-menu"><span role="slider"></span></div>
+  </body>`);
+  const matches = Array.from(document.querySelectorAll(CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR)).map(x => x.id);
+  expect(matches).toEqual(["live-menu", "older-menu"]);
 });
 
 test("effort activation binds the owned menu after the control opens", async () => {
@@ -295,3 +311,46 @@ test("Pro selection changes the hidden slider through its visible owner, never t
   expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
   expect(fixture.value()).toBe(4);
 });
+
+test("effort selection stops at a Cloudflare API challenge instead of waiting out the picker", async () => {
+  // 2026-09-25: with ChatGPT's API challenged, the picker never became usable and the turn failed
+  // 70 seconds later as "model controls are unavailable" — retryable, so each retry deepened the block.
+  let listener: ((value: unknown) => void) | undefined;
+  const neverReady = {
+    filter() { return this; }, last() { return this; }, locator() { return this; },
+    isVisible: async () => false,
+    // Honours its timeout at 1/100 scale, so a regression fails in 0.7s instead of waiting 70s.
+    waitFor: ({ timeout, signal }: { timeout: number; signal: AbortSignal }) => new Promise<void>((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`waitFor timed out after ${timeout}ms`)), timeout / 100);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    }),
+  };
+  const composer = { locator: () => neverReady };
+  const page = {
+    locator: () => neverReady,
+    on: (_event: string, handler: (value: unknown) => void) => { listener = handler; },
+    off: () => { listener = undefined; },
+    keyboard: { press: async () => {} },
+  };
+  const watch = new ChatGptCloudflareApiChallengeWatch();
+  watch.observe(page as never);
+  setTimeout(() => listener?.({
+    url: () => "https://chatgpt.com/backend-api/f/conversation/prepare",
+    status: () => 403,
+    headers: () => ({ "cf-mitigated": "challenge" }),
+  }), 20);
+  const select = (ChatGptBrowserWorker.prototype as unknown as {
+    selectModelAndEffort(...args: unknown[]): Promise<unknown>;
+  }).selectModelAndEffort;
+  const started = Date.now();
+  try {
+    await expect(select.call({ activeComposer: async () => composer }, page, "gpt-5.6-sol", "high", { localToolsEnabled: false, solAvailable: true, proAvailable: true }))
+      .rejects.toMatchObject({ code: "cloudflare_challenge", retryable: false });
+  } finally {
+    watch.dispose();
+  }
+  expect(Date.now() - started).toBeLessThan(2_000);
+}, 3_000);

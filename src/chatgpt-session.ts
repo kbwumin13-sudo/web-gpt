@@ -1,4 +1,4 @@
-import type { Locator, Page } from "playwright-core";
+import type { Locator, Page, Response } from "playwright-core";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
@@ -19,15 +19,17 @@ export const CHATGPT_COMPOSER_SELECTOR = [
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
+  'button[aria-haspopup="menu"][data-composer-navigation-target="reasoning"]',
 ].join(", ");
 export const CHATGPT_EFFORT_MENU_SELECTOR = [
   '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
-  '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
+  '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [role="slider"])',
   '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
 ].join(", ");
 export const CHATGPT_EFFORT_ITEM_SELECTOR = '[role="menuitemradio"]';
-export const CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR = '[data-model-reasoning-effort-slider]';
-export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"]';
+export const CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR = '[data-model-reasoning-effort-slider], [role="menu"]:has([role="slider"])';
+export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"], [role="menu"] [role="slider"]';
+export const CHATGPT_SEND_BUTTON_SELECTOR = 'button[data-testid="send-button"], button[type="submit"]';
 export const CHATGPT_EFFORT_SLIDER_MAX_OPTIONS = 5;
 export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"]';
 export const CHATGPT_COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
@@ -35,11 +37,13 @@ export const CHATGPT_ASSISTANT_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="assistant"]',
   '[data-testid^="conversation-turn-"][data-message-author-role="assistant"]',
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])',
+  '[data-chatgpt-search-unit-key$=":assistant"][data-chatgpt-search-message-ids]',
 ].join(", ");
 export const CHATGPT_USER_TURN_SELECTOR = [
   '[data-testid^="conversation-turn-"][data-turn="user"]',
   '[data-testid^="conversation-turn-"][data-message-author-role="user"]',
   '[data-testid^="conversation-turn-"]:has([data-message-author-role="user"])',
+  '[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]',
 ].join(", ");
 
 export interface ChatGptEffortSliderState {
@@ -57,8 +61,8 @@ export interface ChatGptEffortActivation {
 
 export function chatGptEffortSlider(page: Page): { sliderContainer: Locator; slider: Locator } {
   const sliderContainer = page.locator(CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR).filter({ visible: true }).last();
-  // The current picker keeps ARIA values on a zero-width, aria-hidden semantic input.
-  // Its visible container proves the active surface; the input proves the effort range.
+  // ChatGPT has used both a marked container with a hidden semantic input and a visible slider
+  // directly inside the menu. The visible owner proves the active surface in either layout.
   return { sliderContainer, slider: sliderContainer.locator('[role="slider"]') };
 }
 
@@ -166,6 +170,135 @@ async function anyVisible(locator: Locator): Promise<boolean> {
     if (await locator.nth(index).isVisible().catch(() => false)) return true;
   }
   return false;
+}
+
+/**
+ * Cloudflare serves its interactive challenge from this host, inside a frame that is not reachable
+ * as an `<iframe>` element: measured live on 2026-09-23, `document.querySelectorAll("iframe")`
+ * returned nothing while `page.frames()` listed the challenge. So frame URLs are the only reliable
+ * probe. The page title ("请稍候…") and the widget label ("请验证您是真人") are localized and must
+ * never be used as the signal.
+ */
+const CLOUDFLARE_CHALLENGE_FRAME_HOST = "challenges.cloudflare.com";
+
+/**
+ * True when Cloudflare has replaced ChatGPT with its "verify you are human" interstitial.
+ *
+ * This is a whole-document takeover, not an overlay: `document.body.innerText` is empty and no
+ * composer exists, which is indistinguishable from an expired login if you only look at the DOM.
+ * Telling the two apart matters because the remedies are opposite — a challenge is not fixed by
+ * logging in again (measured 2026-09-18: a freshly captured session is still challenged, because
+ * the clearance is bound to the browser fingerprint that solved it, not to the cookie).
+ */
+export function isCloudflareChallengePage(page: Page): boolean {
+  return page.frames().some(frame => {
+    const url = frame.url();
+    if (!url) return false;
+    try {
+      return new URL(url).hostname.endsWith(CLOUDFLARE_CHALLENGE_FRAME_HOST);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Cloudflare marks a response it replaced with a challenge; the value is `challenge`. */
+const CLOUDFLARE_MITIGATED_HEADER = "cf-mitigated";
+
+/**
+ * The ChatGPT API path Cloudflare answered with a challenge, or undefined for any other response.
+ * A challenged background request alone does not prove the turn is blocked; the watcher below
+ * decides whether the path is required by the turn before escalating it.
+ *
+ * This is the quieter form of the block, and `isCloudflareChallengePage` cannot see it: no challenge
+ * frame is drawn and the document keeps working. Measured live on 2026-09-25, the page and
+ * `/backend-api/models` loaded normally while `POST /backend-api/f/conversation/prepare` and
+ * `/backend-api/composer/items/interactions` came back 403 with `cf-mitigated: challenge` and a
+ * Cloudflare HTML body. In the turn that met it, the effort picker opened without its slider and the
+ * turn failed 70 seconds later reporting that the model controls were unavailable.
+ */
+export function cloudflareChallengedChatGptPath(response: Response): string | undefined {
+  if (response.status() !== 403 || response.headers()[CLOUDFLARE_MITIGATED_HEADER] !== "challenge") {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(response.url());
+  } catch {
+    return undefined;
+  }
+  return url.hostname === "chatgpt.com" && url.pathname.startsWith("/backend-api/") ? url.pathname : undefined;
+}
+
+const cloudflareApiChallengeWatches = new WeakMap<Page, ChatGptCloudflareApiChallengeWatch>();
+
+// A challenge on a background recommendation or cache request does not prove the conversation
+// cannot run. Only requests used by model selection or the conversation transport may fail a turn.
+const TURN_REQUIRED_CHATGPT_API_PATHS = new Set([
+  "/backend-api/models",
+  "/backend-api/settings/user",
+  "/backend-api/composer/items/interactions",
+  "/backend-api/f/conversation/prepare",
+  "/backend-api/f/conversation",
+]);
+
+/**
+ * Tracks turn-required API requests currently challenged during one turn. A later successful
+ * response for the same path removes the challenge, so a recovered page can still finish.
+ */
+export class ChatGptCloudflareApiChallengeWatch {
+  private firstPath: string | undefined;
+  private readonly activePaths = new Set<string>();
+  private settle: (path: string) => void = () => {};
+  /** Settles with the first challenged path; never rejects. */
+  readonly challenged = new Promise<string>(resolve => { this.settle = resolve; });
+  private readonly observed = new Set<Page>();
+  private readonly onResponse = (response: Response): void => {
+    let url: URL;
+    try { url = new URL(response.url()); } catch { return; }
+    if (url.hostname !== "chatgpt.com" || !TURN_REQUIRED_CHATGPT_API_PATHS.has(url.pathname)) return;
+    if (cloudflareChallengedChatGptPath(response) === url.pathname) {
+      this.activePaths.add(url.pathname);
+      if (this.firstPath === undefined) {
+        this.firstPath = url.pathname;
+        this.settle(url.pathname);
+      }
+    } else if (response.status() >= 200 && response.status() < 300) {
+      this.activePaths.delete(url.pathname);
+    }
+  };
+
+  get challengedPath(): string | undefined {
+    return this.activePaths.values().next().value;
+  }
+
+  /** Never throws: observation must not be able to fail a turn. */
+  observe(page: Page): void {
+    if (this.observed.has(page)) return;
+    try {
+      page.on("response", this.onResponse);
+    } catch {
+      return;
+    }
+    this.observed.add(page);
+    cloudflareApiChallengeWatches.set(page, this);
+  }
+
+  dispose(): void {
+    for (const page of this.observed) {
+      try {
+        page.off("response", this.onResponse);
+      } catch {
+        // A closed or disconnected page has already stopped emitting.
+      }
+      if (cloudflareApiChallengeWatches.get(page) === this) cloudflareApiChallengeWatches.delete(page);
+    }
+    this.observed.clear();
+  }
+}
+
+export function chatGptCloudflareApiChallengeWatch(page: Page): ChatGptCloudflareApiChallengeWatch | undefined {
+  return cloudflareApiChallengeWatches.get(page);
 }
 
 export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {

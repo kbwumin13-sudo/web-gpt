@@ -178,6 +178,31 @@ function opaqueId(prefix: string): string {
   return `${prefix}_${randomBytes(24).toString("base64url")}`;
 }
 
+function differsByOneEdit(left: string, right: string): boolean {
+  if (Math.abs(left.length - right.length) > 1 || left === right) return false;
+  let first = left;
+  let second = right;
+  if (first.length > second.length) [first, second] = [second, first];
+  let index = 0;
+  let other = 0;
+  let edits = 0;
+  while (index < first.length && other < second.length) {
+    if (first[index] === second[other]) { index += 1; other += 1; continue; }
+    edits += 1;
+    if (edits > 1) return false;
+    if (first.length === second.length) index += 1;
+    other += 1;
+  }
+  return edits + (second.length - other) === 1;
+}
+
+/** Recover one model transcription error only when it names one active automatic capability. */
+export function uniquelyRecoverTurnToken(submitted: string, activeTokens: readonly string[]): string | undefined {
+  if (!/^turn_[A-Za-z0-9_-]{31,33}$/.test(submitted)) return undefined;
+  const matches = activeTokens.filter(candidate => candidate.startsWith("turn_") && differsByOneEdit(candidate, submitted));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 function handleFingerprint(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
@@ -1286,15 +1311,22 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "claim") {
       const contract = request.contract ?? "native";
-      const token = request.token;
-      if (typeof token !== "string" || token.length === 0) {
+      const submittedToken = request.token;
+      if (typeof submittedToken !== "string" || submittedToken.length === 0) {
         throw new Error(contract === "safe" ? "request id is required" : "turn token is required");
+      }
+      let token = submittedToken;
+      if (contract === "native" && !this.channels.has(token) && !this.retiredTokens.has(token)) {
+        const recovered = uniquelyRecoverTurnToken(token, [...this.channels.entries()]
+          .filter(([, candidate]) => !candidate.safe && !candidate.completionCommitted)
+          .map(([candidateToken]) => candidateToken));
+        if (recovered) token = recovered;
       }
       const channel = this.channels.get(token);
       let activeChannel = channel && !channel.completionCommitted ? channel : undefined;
       const retiredTurn = channel?.completionCommitted ? channel.traceId : this.retiredTokens.get(token);
       console.error(
-        `[chatgpt-web] broker claim received (tokenChars=${token.length}, tokenHash=${handleFingerprint(token)}, valid=${Boolean(activeChannel)}`
+        `[chatgpt-web] broker claim received (tokenChars=${submittedToken.length}, tokenHash=${handleFingerprint(submittedToken)}, valid=${Boolean(activeChannel)}, corrected=${token !== submittedToken}`
         + `${activeChannel ? "" : `, retiredTurn=${retiredTurn ?? "unknown"}`})`,
       );
       if (!activeChannel) {
@@ -1340,6 +1372,7 @@ export class TurnBroker implements TurnBrokerOwner {
           throw new Error("turn token binding state is inconsistent");
         }
         return {
+          turnToken: token,
           bindingId: activeChannel.bindingId,
           activityId,
           environment: activeChannel.environment,
@@ -1351,6 +1384,7 @@ export class TurnBroker implements TurnBrokerOwner {
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
       return {
+        turnToken: token,
         bindingId,
         activityId,
         environment: activeChannel.environment,

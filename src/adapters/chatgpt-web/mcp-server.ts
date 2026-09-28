@@ -10,6 +10,7 @@ import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control"
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
 
 interface ClaimedTurn {
+  turnToken: string;
   bindingId: string;
   activityId: string;
   environment: ChatGptTurnEnvironment & { expiresAt?: number };
@@ -640,7 +641,7 @@ export async function runChatGptMcpServer(options: {
       // The broker's terminal fence treats even a fully local inventory lookup as live MCP work.
       // Settle the lease without the request AbortSignal: cancellation must not strand activity
       // and silently prevent every later completion candidate from committing.
-      await settleTurnActivity(turnToken, claimed.activityId);
+      await settleTurnActivity(claimed.turnToken, claimed.activityId);
     }
   };
 
@@ -738,7 +739,7 @@ export async function runChatGptMcpServer(options: {
     }
     const response = await callTurnBroker<Record<string, unknown>>(options.brokerSocketPath, {
       method: "context_read",
-      token: requestId,
+      token: claimed.turnToken,
       contextAction: action,
       arguments: arguments_,
     }, chatGptMcpInvocationTimeout(claimed.environment), signal);

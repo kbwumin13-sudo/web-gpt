@@ -1,8 +1,8 @@
 import { SseFrameDecoder, type SseFrame } from "./sse-frames";
-import { WEBSOCKET_METHOD, type ChatGptWireRecord } from "./page-tap";
+import { WEBSOCKET_METHOD, type ChatGptWireRecord } from "./wire-record";
 
 /**
- * Host-side assembly of the records a tapped page emits.
+ * Host-side assembly of the records the wire observer emits.
  *
  * Deliberately free of any browser dependency: everything here is decided by the record sequence
  * alone, so a recorded transcript replays through exactly this code. That is what makes a live

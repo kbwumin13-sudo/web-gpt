@@ -120,6 +120,13 @@ export function startGateway(
           backend_port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
           backend_ready: backend?.status === "ok" && backend?.accepting_turns === true,
+          web_readiness: backend?.web_readiness ?? {
+            status: "unverified",
+            session_generation: null,
+            checked_at: null,
+            evidence_code: "backend_unavailable",
+            last_successful_turn_at: null,
+          },
           backend_pid: backend?.pid ?? null,
           accepting_requests: !draining,
           active_requests: activeRequests,

@@ -10,11 +10,8 @@ import {
   compareWireToDom,
   resetChatGptWireTelemetry,
 } from "../src/adapters/chatgpt-web/wire/shadow-observer";
-import {
-  MAX_WIRE_RECORDS_PER_PAGE,
-  parseWireRecord,
-} from "../src/adapters/chatgpt-web/wire/wire-tap-host";
-import { CHATGPT_WIRE_TAP_BINDING, type ChatGptWireRecord } from "../src/adapters/chatgpt-web/wire/page-tap";
+import type { attachChatGptWireTap } from "../src/adapters/chatgpt-web/wire/cdp-wire-tap";
+import type { ChatGptWireRecord } from "../src/adapters/chatgpt-web/wire/wire-record";
 import {
   WIRE_TRANSCRIPT_ENV,
   buildWireTranscript,
@@ -23,7 +20,7 @@ import {
 } from "../src/adapters/chatgpt-web/wire/transcript-store";
 import { observeWireStream } from "../src/adapters/chatgpt-web/wire/turn-observation";
 import { decodeSseStream } from "../src/adapters/chatgpt-web/wire/sse-frames";
-import type { ChatGptWireStream } from "../src/adapters/chatgpt-web/wire/wire-collector";
+import type { ChatGptWireCollector, ChatGptWireStream } from "../src/adapters/chatgpt-web/wire/wire-collector";
 
 const temporaries: string[] = [];
 const temporaryDirectory = (): string => {
@@ -38,20 +35,19 @@ afterEach(() => {
   while (temporaries.length > 0) rmSync(temporaries.pop()!, { recursive: true, force: true });
 });
 
-/** A page that records what the tap installed, so the host wiring is exercised without a browser. */
-function fakePage(): { page: Page; emit: (record: unknown) => void; initScripts: string[] } {
-  let binding: ((value: unknown) => void) | undefined;
-  const initScripts: string[] = [];
-  const page = {
-    exposeFunction: async (name: string, callback: (value: unknown) => void) => {
-      if (name !== CHATGPT_WIRE_TAP_BINDING) throw new Error(`unexpected binding ${name}`);
-      binding = callback;
-    },
-    addInitScript: async (script: { content: string }) => {
-      initScripts.push(script.content);
-    },
-  } as unknown as Page;
-  return { page, emit: value => binding?.(value), initScripts };
+type TapAttacher = typeof attachChatGptWireTap;
+
+/**
+ * A page whose records go straight to the collector the session attached, the way the real tap
+ * routes a page's traffic to the current turn. The protocol side is covered in cdp-wire-tap.test.ts.
+ */
+function fakePage(overflowed = 0): { page: Page; emit: (record: ChatGptWireRecord) => void; attachTap: TapAttacher } {
+  let collector: ChatGptWireCollector | undefined;
+  const attachTap: TapAttacher = async (_page, next) => {
+    collector = next;
+    return { attached: true, overflowed: () => overflowed };
+  };
+  return { page: {} as Page, emit: record => collector?.record(record), attachTap };
 }
 
 /** The frame shape a live turn actually produces: an add at the document root, then completion. */
@@ -61,7 +57,7 @@ const answerStream = (text: string): string => [
   "[DONE]",
 ].map(payload => `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`).join("");
 
-function emitStream(emit: (record: unknown) => void, sse: string, status = 200): void {
+function emitStream(emit: (record: ChatGptWireRecord) => void, sse: string, status = 200): void {
   const records: ChatGptWireRecord[] = [
     { kind: "request", id: "w1", method: "POST", url: "https://chatgpt.com/backend-api/f/conversation", at: 1 },
     { kind: "response", id: "w1", status, at: 2 },
@@ -102,8 +98,8 @@ test("a turn the page read as empty is answered from the observed stream", async
   // The silent failure this layer was built to catch. Watching it and then handing the user an
   // empty turn anyway is worth less than recovering it, and the DOM already produced nothing, so
   // there is no working behaviour to put at risk.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emitStream(emit, answerStream("the answer the page missed"));
 
@@ -116,8 +112,8 @@ test("a turn the page read as empty is answered from the observed stream", async
 test("a failed turn carries what ChatGPT said, so the page's guess is not the only account", async () => {
   // The page can see that the surface is unusable but not why. One real failure was an upstream
   // capacity limit read as an expired login.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emitStream(emit, `data: ${JSON.stringify({ error: { message: "Selected model is at capacity." } })}\n\n`);
 
@@ -128,8 +124,8 @@ test("a failed turn carries what ChatGPT said, so the page's guess is not the on
 
 test("a turn that succeeded does not report a stream error as its outcome", async () => {
   // On a successful turn a stream-level error is a fact worth comparing, not a message to show.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emitStream(emit, answerStream("the answer"), 500);
 
@@ -145,8 +141,8 @@ test("a turn that handed its stream off records the streams it could have contin
   // been wrong twice, so the candidates are captured whole.
   process.env[WIRE_TRANSCRIPT_ENV] = "1";
   const root = join(temporaryDirectory(), "wire-transcripts");
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", root);
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await session.attach(page);
   // The socket the page already holds open, then the conversation request that hands off to it.
   emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
@@ -173,8 +169,8 @@ test("a handed-off turn is followed onto the socket and observed there", async (
   // The conversation request ends after four frames naming where the turn continues; the answer
   // arrives on the socket the page already holds open. On the recorded turn this reassembly gave
   // 480 frames, nothing unrecognised, and an answer identical to the one the page displayed.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   const streamItem = (offset: string, encoded: string) => JSON.stringify({
     type: "message",
@@ -209,8 +205,8 @@ test("a handed-off turn is followed onto the socket and observed there", async (
 test("a continuation the fold cannot read completely is not passed off as the turn", async () => {
   // A partial observation that looks whole is worse than the honest empty one: everything
   // downstream trusts it the same way.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
   emit({
@@ -249,8 +245,8 @@ test("a turn this observer lost is recorded with every stream it could have been
   // somewhere this build did not look, whatever the reason.
   process.env[WIRE_TRANSCRIPT_ENV] = "1";
   const root = join(temporaryDirectory(), "wire-transcripts");
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", root);
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await session.attach(page);
   emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
   emit({ kind: "chunk", id: "ws", text: JSON.stringify([{ id: 1, type: "reply" }]), at: 2 });
@@ -267,8 +263,8 @@ test("a turn this observer lost is recorded with every stream it could have been
 test("a turn that was never handed off records no companion streams", async () => {
   process.env[WIRE_TRANSCRIPT_ENV] = "1";
   const root = join(temporaryDirectory(), "wire-transcripts");
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", root);
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await session.attach(page);
   emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
   emit({ kind: "chunk", id: "ws", text: "{}", at: 2 });
@@ -283,8 +279,8 @@ test("a turn that was never handed off records no companion streams", async () =
 test("a turn the page did read is never answered from the observation", async () => {
   // The rescue may only add an answer where there was none. Anything else would let the observer
   // change turns that already work, which is exactly what shadow mode exists to avoid.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emitStream(emit, answerStream("a".repeat(100)));
 
@@ -297,8 +293,8 @@ test("a turn the page did read is never answered from the observation", async ()
 test("an unfinished observation does not stand in for a missing answer", async () => {
   // A partial read substituted here turns a visible failure into a plausible wrong answer, which
   // is worse than the failure. The stream has to have ended the turn and reached its sentinel.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   const truncated = `data: ${JSON.stringify({
     p: "",
@@ -316,14 +312,14 @@ test("an unfinished observation does not stand in for a missing answer", async (
 test("a retried turn counts once, because the share of agreeing turns is what a cutover is judged on", async () => {
   // One turn can make several browser attempts, each concluding separately. Counting all of them
   // turned a turn that eventually succeeded into two failures and a success.
-  const { page, emit } = fakePage();
+  const { page, emit, attachTap } = fakePage();
   const root = temporaryDirectory();
-  const failed = new ChatGptWireShadowSession("trace_1", root);
+  const failed = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await failed.attach(page);
   emitStream(emit, answerStream("attempt one"));
   expect(failed.conclude({ answer: "", failed: true }).comparison).toBe("error_mismatch");
 
-  const succeeded = new ChatGptWireShadowSession("trace_1", root);
+  const succeeded = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await succeeded.attach(page);
   emitStream(emit, answerStream("attempt two"));
   expect(succeeded.conclude({ answer: "attempt two", failed: false }).comparison).toBe("agreed");
@@ -334,15 +330,15 @@ test("a retried turn counts once, because the share of agreeing turns is what a 
 });
 
 test("exact agreement is counted apart from agreement, because the tolerance hid a real defect", async () => {
-  const { page, emit } = fakePage();
+  const { page, emit, attachTap } = fakePage();
   const root = temporaryDirectory();
-  const exact = new ChatGptWireShadowSession("trace_1", root);
+  const exact = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await exact.attach(page);
   emitStream(emit, answerStream("identical text"));
   expect(exact.conclude({ answer: "identical text", failed: false }).comparison).toBe("agreed");
   expect(chatGptWireTelemetrySnapshot().exact).toBe(1);
 
-  const close = new ChatGptWireShadowSession("trace_2", root);
+  const close = new ChatGptWireShadowSession("trace_2", root, attachTap);
   await close.attach(page);
   emitStream(emit, answerStream("a".repeat(100)));
   // Within the 20% tolerance, so still `agreed` — and not exact.
@@ -375,10 +371,9 @@ test("a turn with no observation is reported as unobserved, not as agreement", (
 });
 
 test("a shadow session observes a turn and reports agreement without changing it", async () => {
-  const { page, emit, initScripts } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   expect(await session.attach(page)).toBeTrue();
-  expect(initScripts[0]).toContain("__codexChatGptWireTapInstalled__");
   emitStream(emit, answerStream("the answer"));
 
   const result = session.conclude({ answer: "the answer", failed: false });
@@ -393,45 +388,40 @@ test("a shadow session observes a turn and reports agreement without changing it
   });
 });
 
-test("a reused page installs once and routes each turn to its own collector", async () => {
-  // A retained ChatGPT conversation serves many turns from one page. Re-registering would throw,
-  // and leaving the first turn's collector wired up would silently blank every later turn.
-  const { page, emit, initScripts } = fakePage();
+test("a reused page routes each turn to its own collector", async () => {
+  // A retained ChatGPT conversation serves many turns from one page. Leaving the first turn's
+  // collector wired up would silently blank every later turn.
+  const { page, emit, attachTap } = fakePage();
   const root = temporaryDirectory();
-  const first = new ChatGptWireShadowSession("trace_1", root);
+  const first = new ChatGptWireShadowSession("trace_1", root, attachTap);
   expect(await first.attach(page)).toBeTrue();
   emitStream(emit, answerStream("first answer"));
   expect(first.conclude({ answer: "first answer", failed: false }).comparison).toBe("agreed");
 
-  const second = new ChatGptWireShadowSession("trace_2", root);
+  const second = new ChatGptWireShadowSession("trace_2", root, attachTap);
   expect(await second.attach(page)).toBeTrue();
   emitStream(emit, answerStream("second answer"));
   const result = second.conclude({ answer: "second answer", failed: false });
   expect(result.comparison).toBe("agreed");
   expect(result.observation?.answer).toBe("second answer");
-  // One installation, not one per turn.
-  expect(initScripts).toHaveLength(1);
   expect(chatGptWireTelemetrySnapshot().attach_failures).toBe(0);
 });
 
 test("a tap that cannot attach degrades to no observation rather than to a failed turn", async () => {
-  const page = {
-    exposeFunction: async () => {
-      throw new Error("binding already registered");
-    },
-    addInitScript: async () => {},
-  } as unknown as Page;
+  const refusing: TapAttacher = async () => {
+    throw new Error("the page closed before its session opened");
+  };
   const faults: string[] = [];
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
-  expect(await session.attach(page, message => faults.push(message))).toBeFalse();
-  expect(faults).toEqual(["binding already registered"]);
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), refusing);
+  expect(await session.attach({} as Page, message => faults.push(message))).toBeFalse();
+  expect(faults).toEqual(["the page closed before its session opened"]);
   expect(session.conclude({ answer: "x", failed: false }).comparison).toBe("not_observed");
   expect(chatGptWireTelemetrySnapshot().attach_failures).toBe(1);
 });
 
 test("unrecognized shapes are accumulated so a schema gap is a number, not a symptom", async () => {
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emitStream(emit, `data: {"future_frame":1}\n\n${answerStream("answer")}`);
   session.conclude({ answer: "answer", failed: false });
@@ -441,41 +431,12 @@ test("unrecognized shapes are accumulated so a schema gap is a number, not a sym
   expect(snapshot.unrecognized_shapes).toEqual(["no known frame shape matched: future_frame"]);
 });
 
-test("records the page sends in an unexpected shape are refused and counted", async () => {
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+test("records a page sent past the cap are counted as refused", async () => {
+  const { page, attachTap } = fakePage(3);
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
-  emit({ kind: "chunk", id: "w1" });
-  emit("not an object");
-  emit({ kind: "unknown_kind", id: "w1", at: 1 });
   session.conclude({ answer: "", failed: false });
   expect(chatGptWireTelemetrySnapshot().rejected_records).toBe(3);
-});
-
-test("the binding validates every field, because it is an entry point from a remote origin", () => {
-  const at = 1;
-  expect(parseWireRecord({ kind: "request", id: "w1", method: "POST", url: "https://x/y", at }))
-    .toEqual({ kind: "request", id: "w1", method: "POST", url: "https://x/y", at });
-  expect(parseWireRecord({ kind: "end", id: "w1", at })).toEqual({ kind: "end", id: "w1", at });
-  expect(parseWireRecord({ kind: "response", id: "w1", status: 200, at })).toEqual({ kind: "response", id: "w1", status: 200, at });
-
-  expect(parseWireRecord(null)).toBeUndefined();
-  expect(parseWireRecord({ kind: "chunk", id: "w1", text: 5, at })).toBeUndefined();
-  expect(parseWireRecord({ kind: "chunk", id: "", text: "x", at })).toBeUndefined();
-  expect(parseWireRecord({ kind: "chunk", id: "w".repeat(129), text: "x", at })).toBeUndefined();
-  expect(parseWireRecord({ kind: "chunk", id: "w1", text: "x", at: Number.NaN })).toBeUndefined();
-  expect(parseWireRecord({ kind: "response", id: "w1", status: 1.5, at })).toBeUndefined();
-  expect(parseWireRecord({ kind: "request", id: "w1", method: "POST", url: "u".repeat(4_097), at })).toBeUndefined();
-});
-
-test("an oversized error message is truncated rather than stored whole", () => {
-  const record = parseWireRecord({ kind: "error", id: "w1", message: "m".repeat(5_000), at: 1 });
-  expect(record).toMatchObject({ kind: "error" });
-  expect((record as { message: string }).message).toHaveLength(2_048);
-});
-
-test("a page cannot grow this process without bound", () => {
-  expect(MAX_WIRE_RECORDS_PER_PAGE).toBeLessThanOrEqual(1_000_000);
 });
 
 test("transcripts are off by default, because a transcript is a copy of the conversation", async () => {
@@ -483,8 +444,8 @@ test("transcripts are off by default, because a transcript is a copy of the conv
   expect(wireTranscriptsEnabled({ [WIRE_TRANSCRIPT_ENV]: "1" })).toBeTrue();
 
   const root = temporaryDirectory();
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", root);
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await session.attach(page);
   emitStream(emit, answerStream("private content"));
   expect(session.conclude({ answer: "private content", failed: false }).transcriptPath).toBeUndefined();
@@ -494,8 +455,8 @@ test("transcripts are off by default, because a transcript is a copy of the conv
 test("an enabled transcript is written owner-only and replays to the same observation", async () => {
   process.env[WIRE_TRANSCRIPT_ENV] = "1";
   const root = join(temporaryDirectory(), "wire-transcripts");
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", root);
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", root, attachTap);
   await session.attach(page);
   emitStream(emit, answerStream("recorded answer"));
 
@@ -560,8 +521,8 @@ function streamOf(sse: string, status = 200): ChatGptWireStream {
 }
 
 test("the conversation stream is picked out of ordinary backend traffic", async () => {
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   // Ordinary page traffic first, then the turn's conversation request.
   emit({ kind: "request", id: "a", method: "GET", url: "https://chatgpt.com/backend-api/me", at: 1 });
@@ -578,11 +539,40 @@ test("the conversation stream is picked out of ordinary backend traffic", async 
   expect(result.observation?.answer).toBe("the answer");
 });
 
+test("a challenged background event stream is not a conversation failure", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  emit({ kind: "request", id: "usage", method: "GET", url: "https://chatgpt.com/backend-api/wham/usage/stream", at: 1 });
+  emit({ kind: "response", id: "usage", status: 403, at: 2 });
+  emit({ kind: "chunk", id: "usage", text: "data: []\n\n", at: 3 });
+  emit({ kind: "end", id: "usage", at: 4 });
+
+  const result = session.conclude({ answer: "", failed: true });
+  expect(result.comparison).toBe("not_observed");
+  expect(result.serverError).toBeUndefined();
+});
+
+test("a later background stream cannot replace the submitted conversation's answer", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  emitStream(emit, answerStream("the answer"));
+  emit({ kind: "request", id: "usage", method: "GET", url: "https://chatgpt.com/backend-api/wham/usage/stream", at: 10 });
+  emit({ kind: "response", id: "usage", status: 200, at: 11 });
+  emit({ kind: "chunk", id: "usage", text: "data: []\n\n", at: 12 });
+  emit({ kind: "end", id: "usage", at: 13 });
+
+  const result = session.conclude({ answer: "", failed: false });
+  expect(result.observation?.answer).toBe("the answer");
+  expect(result.rescuedAnswer).toBe("the answer");
+});
+
 test("a renamed conversation endpoint is still found by what it carried", async () => {
   // Naming the endpoint in advance is what made the first live run report zero frames while the
   // turn itself succeeded. Identifying it by carrying event-stream frames survives a rename.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emit({ kind: "request", id: "s", method: "POST", url: "https://chatgpt.com/backend-api/v2/some-new-name", at: 1 });
   emit({ kind: "response", id: "s", status: 200, at: 2 });
@@ -592,8 +582,8 @@ test("a renamed conversation endpoint is still found by what it carried", async 
 });
 
 test("observed and streaming paths are reported without query strings", async () => {
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emit({ kind: "request", id: "a", method: "GET", url: "https://chatgpt.com/backend-api/me?token=secret", at: 1 });
   emit({ kind: "response", id: "a", status: 200, at: 2 });
@@ -612,8 +602,8 @@ test("a JSON handshake on a conversation path does not outrank the request that 
   // `/f/conversation/prepare` returns a small JSON body that decodes to no frames. Selecting by
   // path name picked it over the request holding the answer, and reported the turn as unobserved
   // while its data sat in the collector.
-  const { page, emit } = fakePage();
-  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory());
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
   await session.attach(page);
   emitStream(emit, answerStream("the answer"));
   emit({ kind: "request", id: "p", method: "POST", url: "https://chatgpt.com/backend-api/f/conversation/prepare", at: 5 });

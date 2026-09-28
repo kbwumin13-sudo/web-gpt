@@ -82,6 +82,8 @@ export interface AppConfig {
   browserHostDescriptorPath?: string;
   chromeExecutablePath: string;
   storageStatePath: string;
+  /** Owner-only Chrome profile shared by login, verification, and automatic turns. */
+  managedProfilePath?: string;
   brokerSocketPath: string;
   headed: boolean;
   solAvailable: boolean;
@@ -212,6 +214,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     browserInteractionMode: "automatic",
     chromeExecutablePath: defaultChromeExecutable(),
     storageStatePath: join(home, "browser", "storage-state.json"),
+    managedProfilePath: join(home, "browser", "managed-profile"),
     brokerSocketPath: defaultBrokerEndpoint(home),
     headed: true,
     solAvailable: true,
@@ -469,6 +472,13 @@ function parseConfig(value: unknown, path: string): AppConfig {
   for (const key of requiredStrings) {
     if (typeof parsed[key] !== "string" || !(parsed[key] as string).trim()) throw new Error(`Missing ${key} in ${path}`);
   }
+  if (parsed.managedProfilePath !== undefined) {
+    const profile = expandUserPath(parsed.managedProfilePath);
+    const expected = join(dirname(expandUserPath(parsed.storageStatePath!)), "managed-profile");
+    if (profile !== expected || !isAbsolute(profile)) {
+      throw new Error(`managedProfilePath must be the dedicated browser profile next to storageStatePath in ${path}`);
+    }
+  }
   if (parsed.appName!.length > 80) throw new Error(`appName is too long in ${path}`);
   const automaticAppName = parsed.automaticAppName
     ?? (browserInteractionMode === "automatic" ? parsed.appName : CHATGPT_CONNECTOR_NAME);
@@ -642,6 +652,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       browserHost: config.browserHost,
       browserHostDescriptorPath: config.browserHostDescriptorPath,
       storageStatePath: config.storageStatePath,
+      managedProfilePath: config.browserHost === "managed-chrome" ? config.managedProfilePath : undefined,
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),

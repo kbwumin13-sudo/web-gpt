@@ -17,6 +17,98 @@ import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-w
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
 
+test("a closed managed Chrome context is replaced before any prompt or new task page", async () => {
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    discardClosedManagedContext(context: unknown): void;
+    pageForNewTurn(signal?: AbortSignal): Promise<unknown>;
+  };
+  const old = { isClosed: () => true, newPage: async () => { throw new Error("old context must not create a page"); } };
+  const page = { id: "fresh-task-page" };
+  const fresh = { isClosed: () => false, newPage: async () => page };
+  let ensures = 0;
+  const retained = new Map<string, unknown>([["closed-conversation", {}]]);
+  const fixture = {
+    config: { browserHost: "managed-chrome" },
+    context: old as unknown,
+    browser: {} as unknown,
+    page: {} as unknown,
+    managedBrowserReady: Promise.resolve({ context: old }) as unknown,
+    managedRetainedPages: retained,
+    ensureManagedBrowser: async () => ({ context: ensures++ === 0 ? old : fresh }),
+    discardClosedManagedContext: prototype.discardClosedManagedContext,
+  };
+  expect(await prototype.pageForNewTurn.call(fixture)).toBe(page);
+  expect(ensures).toBe(2);
+  expect(retained.size).toBe(0);
+  expect(fixture.context).toBeUndefined();
+  expect(fixture.managedBrowserReady).toBeUndefined();
+});
+
+test("a page-creation close race gets one reopen, then fails terminally instead of retrying the stale context", async () => {
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    discardClosedManagedContext(context: unknown): void;
+    pageForNewTurn(signal?: AbortSignal): Promise<unknown>;
+  };
+  const closedDuringNewPage = {
+    isClosed: () => false,
+    newPage: async () => { throw new Error("newPage: Target page, context or browser has been closed"); },
+  };
+  let ensures = 0;
+  const fixture = {
+    config: { browserHost: "managed-chrome" },
+    context: closedDuringNewPage as unknown,
+    managedBrowserReady: Promise.resolve({ context: closedDuringNewPage }) as unknown,
+    managedRetainedPages: new Map(),
+    ensureManagedBrowser: async () => { ensures += 1; return { context: closedDuringNewPage }; },
+    discardClosedManagedContext: prototype.discardClosedManagedContext,
+  };
+  await expect(prototype.pageForNewTurn.call(fixture)).rejects.toMatchObject({
+    code: "browser_context_unavailable",
+    retryable: false,
+  });
+  expect(ensures).toBe(2);
+});
+
+test("a context closing during newPage recovers on a fresh context exactly once", async () => {
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    discardClosedManagedContext(context: unknown): void;
+    pageForNewTurn(signal?: AbortSignal): Promise<unknown>;
+  };
+  const old = {
+    isClosed: () => false,
+    newPage: async () => { throw new Error("newPage: Target page, context or browser has been closed"); },
+  };
+  const page = { id: "reopened-page" };
+  const fresh = { isClosed: () => false, newPage: async () => page };
+  let ensures = 0;
+  const fixture = {
+    config: { browserHost: "managed-chrome" },
+    context: old as unknown,
+    managedBrowserReady: Promise.resolve({ context: old }) as unknown,
+    managedRetainedPages: new Map(),
+    ensureManagedBrowser: async () => ({ context: ensures++ === 0 ? old : fresh }),
+    discardClosedManagedContext: prototype.discardClosedManagedContext,
+  };
+  expect(await prototype.pageForNewTurn.call(fixture)).toBe(page);
+  expect(ensures).toBe(2);
+});
+
+test("cancellation during managed Chrome launch cannot create a page afterward", async () => {
+  const prototype = ChatGptBrowserWorker.prototype as unknown as { pageForNewTurn(signal?: AbortSignal): Promise<unknown> };
+  const controller = new AbortController();
+  let pageCreations = 0;
+  const context = { isClosed: () => false, newPage: async () => { pageCreations += 1; return {}; } };
+  const fixture = {
+    config: { browserHost: "managed-chrome" },
+    ensureManagedBrowser: async () => {
+      controller.abort(new DOMException("cancelled", "AbortError"));
+      return { context };
+    },
+  };
+  await expect(prototype.pageForNewTurn.call(fixture, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+  expect(pageCreations).toBe(0);
+});
+
 function personalizedTemporaryChatRole(
   _role: string,
   options: { name: string | RegExp },
@@ -105,6 +197,52 @@ test("submission DOM tracks logical identities and retains virtualized history i
   turns.push({ ...turns[3]!, index: 20 });
   observers.forEach(notify => notify());
   await expect(worker.submissionDomState(page, baseline.domCache)).rejects.toThrow("duplicate");
+});
+
+test("current ChatGPT search units bind a submitted turn by message UUID rather than display index", async () => {
+  type Unit = { id: string; role: "user" | "assistant"; displayIndex: number };
+  let units: Unit[] = [];
+  const observers: Array<() => void> = [];
+  const element = (unit: Unit) => ({
+    getAttribute: (name: string) => ({
+      "data-chatgpt-search-unit-key": `fallback-turn-0:${unit.displayIndex}:${unit.role}`,
+      "data-chatgpt-search-message-ids": unit.id,
+    })[name] ?? null,
+  });
+  const context = createContext({
+    performance: { timeOrigin: 1 },
+    document: {
+      documentElement: {},
+      querySelectorAll: (selector: string) => selector === "[data-turn-id-container]" ? []
+        : selector.includes("data-chatgpt-search-unit-key") ? units.map(element) : [],
+    },
+    MutationObserver: class {
+      constructor(callback: () => void) { observers.push(callback); }
+      observe() {}
+    },
+  });
+  const page = {
+    evaluate: async (callback: Function, options: unknown) => runInContext(`(${callback.toString()})`, context)(options),
+    locator: () => ({}),
+  } as unknown as Page;
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as {
+    captureSubmissionBaseline(page: Page): Promise<{ initialTurnIdentities: string[]; domCache: unknown }>;
+    currentSubmissionEvidence(page: Page, baseline: unknown): Promise<string | undefined>;
+    submissionDomState(page: Page, cache: unknown): Promise<{ responseIdentities: string[] }>;
+  };
+  const baseline = await worker.captureSubmissionBaseline(page);
+  units = [
+    { id: "user-uuid-1234", role: "user", displayIndex: 0 },
+    { id: "assistant-uuid-5678", role: "assistant", displayIndex: 2 },
+  ];
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+  expect((await worker.submissionDomState(page, baseline.domCache)).responseIdentities)
+    .toEqual(["search:assistant:assistant-uuid-5678"]);
+  const accepted = await worker.captureSubmissionBaseline(page);
+  units = units.map(unit => ({ ...unit, displayIndex: unit.displayIndex + 5 }));
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, accepted)).toBeUndefined();
 });
 
 test("assistant tracking rebinds only one proven replacement after React detaches its node", () => {
@@ -580,7 +718,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     press: async () => { sendPresses += 1; },
   };
   const composer = {
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({ locator: () => ({ last: () => sendButton }) }),
   };
   worker.activeComposer = async () => composer;
 
@@ -702,7 +840,7 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
     },
   };
   worker.activeComposer = async () => ({
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({ locator: () => ({ last: () => sendButton }) }),
   });
   worker.waitForSubmissionAcceptedWithRecovery = async () => "user_turn";
 
@@ -1017,6 +1155,44 @@ test("active composer resolution waits for exactly one visible editor", async ()
   expect(await activeComposer.call({}, page, 500)).toBe(composer);
 });
 
+function composerPage(count: () => Promise<number>, composer: unknown) {
+  return { locator: () => ({ filter: () => ({ count, first: () => composer }) }) };
+}
+
+const activeComposerOf = (ChatGptBrowserWorker.prototype as unknown as {
+  activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
+}).activeComposer;
+
+test("a probe that outlives its timeout while the page loads does not end the composer wait", async () => {
+  // Five turn pages hydrating at once, or ChatGPT reloading after Cloudflare let it through, can
+  // hold one probe past its timeout. The composer that appears afterwards must still be found.
+  const composer = { id: "active" };
+  const probes: Array<() => Promise<number>> = [
+    async () => { throw new ChatGptBrowserObservationTimeoutError(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS); },
+    async () => 1,
+  ];
+  const page = composerPage(() => probes.shift()!(), composer);
+  expect(await activeComposerOf.call({}, page, 500)).toBe(composer);
+});
+
+test("a page that never answers within the whole wait is reported as unresponsive", async () => {
+  const page = composerPage(async () => {
+    throw new ChatGptBrowserObservationTimeoutError(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS);
+  }, {});
+  const error = await activeComposerOf.call({}, page, 100).then(() => undefined, (caught: unknown) => caught);
+  expect(error).toBeInstanceOf(ChatGptBrowserObservationTimeoutError);
+});
+
+test("a closed page ends the composer wait at once", async () => {
+  let probes = 0;
+  const page = composerPage(async () => {
+    probes += 1;
+    throw new Error("Target page, context or browser has been closed");
+  }, {});
+  await expect(activeComposerOf.call({}, page, 500)).rejects.toThrow("has been closed");
+  expect(probes).toBe(1);
+});
+
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
   // Lexical may preserve indentation as alternating NBSP and ASCII spaces while keeping the same
   // UTF-16 length; that representation is equivalent only for whitespace runs.
@@ -1323,6 +1499,66 @@ test("connector selection moves highlight to the exact hidden-viewport row befor
     activeComposer: async () => selected ? selectedComposer : initialComposer,
   }, page)).resolves.toBe(selectedComposer);
   expect(keys).toEqual(["ArrowDown", "ArrowDown", "Enter"]);
+});
+
+test("current ChatGPT mention menu accepts its aria-current row and app mention pill", async () => {
+  const calls: string[] = [];
+  let selected = false;
+  const appResult = {
+    waitFor: async () => {},
+    count: async () => 1,
+    getAttribute: async (name: string) => name === "aria-current" ? "true" : null,
+  };
+  const selectedPill = { waitFor: async () => {} };
+  const initialComposer = {
+    fill: async () => {},
+    focus: async () => {},
+    pressSequentially: async () => {},
+    press: async (key: string) => { calls.push(key); selected = true; },
+  };
+  const selectedComposer = {
+    locator: (selector: string) => {
+      expect(selector).toContain("[app-mention-display-name][app-mention-path]");
+      return { filter: () => selectedPill };
+    },
+  };
+  const page = {
+    getByRole: personalizedTemporaryChatRole,
+    getByText: () => ({}),
+    locator: (selector: string) => {
+      expect(selector).toContain('[data-mention-list-scroll-area] button[data-list-navigation-item="true"]');
+      return { filter: () => appResult };
+    },
+  };
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    selectConnector(page: unknown): Promise<unknown>;
+    selectedConnectorControl(composer: unknown): unknown;
+  };
+  await expect(prototype.selectConnector.call({
+    config: { appName: CHATGPT_CONNECTOR_NAME },
+    connectorIsSelected: async () => selected,
+    selectedConnectorControl: prototype.selectedConnectorControl,
+    activeComposer: async () => selected ? selectedComposer : initialComposer,
+  }, page)).resolves.toBe(selectedComposer);
+  expect(calls).toEqual(["Enter"]);
+});
+
+test("current ChatGPT app mention is recognized by its exact display name", async () => {
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    connectorIsSelected(composer: unknown): Promise<boolean>;
+    selectedConnectorControl(composer: unknown): unknown;
+  };
+  const pill = { getAttribute: (name: string) => name === "app-mention-display-name" ? CHATGPT_CONNECTOR_NAME : null };
+  const composer = {
+    locator: (selector: string) => {
+      expect(selector).toContain("[app-mention-display-name][app-mention-path]");
+      return { filter: () => ({ evaluateAll: async (callback: (elements: unknown[]) => unknown) => callback([pill]) }) };
+    },
+  };
+  await expect(prototype.connectorIsSelected.call({
+    config: { appName: CHATGPT_CONNECTOR_NAME },
+    selectedConnectorControl: prototype.selectedConnectorControl,
+  }, composer)).resolves.toBeTrue();
 });
 
 test("repeated connector verification reuses its selected pill before clearing the composer", async () => {
@@ -2133,7 +2369,7 @@ test("an abort while inserting a connector prompt clears the selected pill and p
   expect(connectorSelected).toBeFalse();
 });
 
-test("retained tool turns insert into the connector-bound composer without selecting it again", async () => {
+test("retained tool turns recheck the current composer connector before inserting", async () => {
   const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
     attachPrompt(
       page: unknown,
@@ -2149,16 +2385,16 @@ test("retained tool turns insert into the connector-bound composer without selec
 
   const calls: string[] = [];
   const composer = {
-    fill: async (value: string) => { expect(value).toBe(""); calls.push("fill"); },
     focus: async () => { calls.push("focus"); },
+    press: async () => { calls.push("end"); },
   };
   await attachPrompt.call({
     activeComposer: async () => composer,
-    selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
-    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
+    selectConnector: async () => { calls.push("select"); return composer; },
+    insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe(" retained context"); calls.push("insert"); },
     assertPromptAttached: async () => { calls.push("assert"); },
   }, {}, "retained context", true, undefined, undefined, false, undefined, true);
-  expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
+  expect(calls).toEqual(["select", "focus", "end", "insert", "assert"]);
 });
 
 test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
@@ -2181,9 +2417,9 @@ test("image attachment readiness uses exact file tiles and not localized remove-
         },
       };
     },
-    getByTestId: (testId: string) => {
-      expect(testId).toBe("send-button");
-      return send;
+    locator: (selector: string) => {
+      expect(selector).toBe('button[data-testid="send-button"], button[type="submit"]');
+      return { last: () => send };
     },
   };
   const composer = {
@@ -2193,6 +2429,7 @@ test("image attachment readiness uses exact file tiles and not localized remove-
     },
   };
   const input = {
+    count: async () => 1,
     waitFor: async (state: { state: string; timeout: number }) => {
       expect(state).toEqual({ state: "attached", timeout: 20_000 });
       calls.push(["inputReady"]);
@@ -2224,6 +2461,52 @@ test("image attachment readiness uses exact file tiles and not localized remove-
     ["fileTile", "codex-input-image-1.png"],
     ["sendEnabled"],
   ]);
+});
+
+test("current ChatGPT image attachment opens the composer upload action and verifies its thumbnail", async () => {
+  const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const calls: string[] = [];
+  const uploadRow = {
+    count: async () => 1,
+    click: async () => { calls.push("chooseUpload"); },
+  };
+  const composerForm = {
+    locator: (selector: string) => {
+      if (selector === 'button[data-composer-navigation-target="add-context"]') return {
+        waitFor: async () => { calls.push("addReady"); },
+        click: async () => { calls.push("openAddMenu"); },
+      };
+      if (selector === 'img[alt="codex-input-image-1.png"]') return {
+        waitFor: async () => { calls.push("thumbnailVisible"); },
+      };
+      expect(selector).toBe('button[data-testid="send-button"], button[type="submit"]');
+      return { last: () => ({ isEnabled: async () => true }) };
+    },
+  };
+  const composer = { locator: () => composerForm };
+  const page = {
+    locator: (selector: string) => {
+      if (selector === 'input[data-testid="upload-photos-input"]') return { count: async () => 0 };
+      if (selector === '[role="alert"]') return { allInnerTexts: async () => [] };
+      expect(selector).toContain('[data-composer-overlay-floating-ui="true"]');
+      return { filter: (options: { hasText: RegExp; visible: boolean }) => {
+        expect(options.hasText.test("从电脑上传")).toBeTrue();
+        expect(options.visible).toBeTrue();
+        return uploadRow;
+      } };
+    },
+    waitForEvent: async () => ({ setFiles: async (files: Array<{ name: string }>) => {
+      expect(files.map(file => file.name)).toEqual(["codex-input-image-1.png"]);
+      calls.push("setFiles");
+    } }),
+  };
+  const attachFiles = (ChatGptBrowserWorker.prototype as unknown as {
+    attachFiles(page: unknown, prompt: unknown): Promise<void>;
+  }).attachFiles;
+  await attachFiles.call({ activeComposer: async () => composer }, page, {
+    images: [{ ref: "codex-input-image-1", imageUrl }],
+  });
+  expect(calls).toEqual(["addReady", "openAddMenu", "chooseUpload", "setFiles", "thumbnailVisible"]);
 });
 
 test("effort slider ARIA state fails closed on malformed and unsupported ranges", () => {
@@ -2354,14 +2637,14 @@ test("Think attachment runs after fresh connector selection and rechecks retaine
     };
     await attach.call(worker, ui.page, "requested task", localTools, undefined, undefined, false, undefined, retained, true);
     expect(submitted).toEqual([true]);
-    expect(connectorSelections).toBe(localTools && !retained ? 1 : 0);
-    if (localTools && !retained) expect(ui.state.connectors).toEqual(["Codex Native2"]);
+    expect(connectorSelections).toBe(localTools ? 1 : 0);
+    if (localTools) expect(ui.state.connectors).toEqual(["Codex Native2"]);
     if (retained) {
       ui.state.pressed = false;
       await attach.call(worker, ui.page, "follow-up task", localTools, undefined, undefined, false, undefined, retained, true);
       expect(submitted).toEqual([true, true]);
       expect(ui.state.commands).toEqual(["/think", "/think"]);
-      expect(connectorSelections).toBe(0);
+      expect(connectorSelections).toBe(2);
     }
   }
 });
@@ -2731,8 +3014,8 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
   }, {
     locator: (selector: string) => {
       if (selector.includes('[role="alert"]')) return sessionAlert;
-      if (selector.includes('[role="menu"]') || selector.includes("composer-intelligence-picker-content")) return effortMenu;
       if (selector.includes("data-model-reasoning-effort-slider")) return effortSlider;
+      if (selector.includes('[role="menu"]') || selector.includes("composer-intelligence-picker-content")) return effortMenu;
       if (selector.includes('[role="dialog"]')) return hiddenDialog;
       return effortMenu;
     },

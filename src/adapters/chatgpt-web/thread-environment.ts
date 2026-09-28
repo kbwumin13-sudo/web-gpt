@@ -13,6 +13,7 @@ import {
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
+  hasOnlyHistoricalAbortedEnvironmentContext,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
@@ -249,7 +250,8 @@ export class ChatGptThreadEnvironmentStore {
       }
       // Only a current native rollout can supersede an unrecognized historical envelope. Without
       // that proof, do not turn arbitrary history or an invalid update into cached authority.
-      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
+      if (hasRawChatGptEnvironmentContext(parsed)
+        && (!sameThread || !hasOnlyHistoricalAbortedEnvironmentContext(parsed))) throw error;
       if (sameThread) return {
         cwd: sameThread.cwd,
         roots: sameThread.roots,
