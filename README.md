@@ -24,15 +24,32 @@
 > Bring the ChatGPT Web models available to your account into Codex while keeping the native task
 > UI, context lifecycle, streaming, compaction, and tool harness.
 
-ChatGPT Web for Codex is a local bridge that lets Codex use the ChatGPT models already available
-to your account through the native Codex workflow. It keeps the task editor, filesystem access,
-MCP tools, streaming events, and context management in Codex while routing selected model turns
-through a managed ChatGPT Web session.
+<p align="center">
+  <strong>One Codex workspace. Multiple ChatGPT Web capabilities.</strong><br>
+  <sub>A native bridge that connects subscription-based ChatGPT Web models with Codex's development workflow.</sub>
+</p>
 
-The project focuses on three layers: a native model integration layer, a task-bound ChatGPT Web
-backend, and a desktop setup experience for managing sign-in, diagnostics, and MCP connectivity.
-It is designed for users who want the flexibility of ChatGPT Web subscriptions inside their
-existing Codex development workflow.
+<p align="center">
+  <img src="https://img.shields.io/badge/Architecture-Native%20Gateway%20%2B%20MCP-111827" alt="Architecture">
+  <img src="https://img.shields.io/badge/Runtime-macOS%2013%2B-111827" alt="Runtime">
+  <img src="https://img.shields.io/badge/Transport-Streaming%20SSE-111827" alt="Transport">
+</p>
+
+ChatGPT Web for Codex extends the native Codex experience with the ChatGPT models available to
+your account. The task editor, filesystem, tools, MCP connections, streaming events, and context
+lifecycle remain inside Codex while selected model requests are routed through a managed ChatGPT
+Web session.
+
+The system is built around three components:
+
+| Layer | Role |
+| --- | --- |
+| Native Gateway | Integrates model selection and request routing into Codex |
+| Web Backend | Maintains task-bound ChatGPT sessions and browser communication |
+| Desktop Launcher | Handles setup, diagnostics, updates, and MCP configuration |
+
+Designed for developers who want ChatGPT Web subscriptions to participate in the same engineering
+environment as Codex, with explicit routing and observable runtime behavior.
 
 <table>
   <tr>
