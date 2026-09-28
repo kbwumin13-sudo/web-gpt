@@ -21,12 +21,12 @@
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
-> Bring the ChatGPT Web models available to your account into Codex while keeping the native task
-> UI, context lifecycle, streaming, compaction, and tool harness.
+> **ChatGPT Web, inside Codex.** Route selected model turns through the ChatGPT models available to
+> your account while Codex keeps the task UI, files, tools, streaming, tracing, and compaction lifecycle.
 
 <p align="center">
-  <strong>One Codex workspace. Multiple ChatGPT Web capabilities.</strong><br>
-  <sub>A native bridge that connects subscription-based ChatGPT Web models with Codex's development workflow.</sub>
+  <strong>Keep the Codex surface. Add the ChatGPT Web model stack.</strong><br>
+  <sub>A local bridge for model routing, task-bound sessions, and MCP-backed tool execution.</sub>
 </p>
 
 <p align="center">
@@ -35,35 +35,27 @@
   <img src="https://img.shields.io/badge/Transport-Streaming%20SSE-111827" alt="Transport">
 </p>
 
-ChatGPT Web for Codex extends the native Codex experience with the ChatGPT models available to
-your account. The task editor, filesystem, tools, MCP connections, streaming events, and context
-lifecycle remain inside Codex while selected model requests are routed through a managed ChatGPT
-Web session.
-
-The system is built around three components:
-
-| Layer | Role |
-| --- | --- |
-| Native Gateway | Integrates model selection and request routing into Codex |
-| Web Backend | Maintains task-bound ChatGPT sessions and browser communication |
-| Desktop Launcher | Handles setup, diagnostics, updates, and MCP configuration |
-
-Designed for developers who want ChatGPT Web subscriptions to participate in the same engineering
-environment as Codex, with explicit routing and observable runtime behavior.
-
 <table>
   <tr>
-    <td width="33%"><strong>Native model picker</strong><br><sub>Choose ChatGPT Web tiers directly from Codex and keep working in the same task.</sub></td>
-    <td width="33%"><strong>Full Codex harness</strong><br><sub>Connect the active task's filesystem, shell, images, approvals, tools, and apps through MCP.</sub></td>
-    <td width="33%"><strong>Task-bound sessions</strong><br><sub>Keep sequential turns together and hand context back to native Codex compaction at the boundary.</sub></td>
+    <td width="33%"><strong>First-class model routing</strong><br><sub>ChatGPT Web appears in Codex's native model picker. Pick a route and stay in the same task.</sub></td>
+    <td width="33%"><strong>Full task harness</strong><br><sub>Round-trip filesystem, shell, images, approvals, tools, and apps through turn-scoped MCP.</sub></td>
+    <td width="33%"><strong>Context continuity</strong><br><sub>Reuse a task-bound ChatGPT session and hand context back to native Codex compaction at the boundary.</sub></td>
   </tr>
 </table>
 
+| Codex remains native | The bridge adds |
+| --- | --- |
+| Task UI, filesystem, approvals, tracing, streaming, context lifecycle | ChatGPT Web model routes, managed browser transport, task-bound Temporary Chat |
+| Native compaction and project state | MCP tool round-trips and explicit browser-route diagnostics |
+
 <p align="center">
-  <img src="docs/assets/codex-model-picker.png" alt="ChatGPT Web models in the native Codex model picker" width="520">
+  <img src="docs/assets/codex-model-picker.png" alt="ChatGPT Web models in the native Codex model picker" width="540">
 </p>
 
-<p align="center"><sub>Real Codex model picker with ChatGPT Web — Medium, High, Extra High, Pro, and Instant available alongside native Codex models.</sub></p>
+<p align="center"><sub>Real Codex model picker with ChatGPT Web routes alongside native Codex models.</sub></p>
+
+The result is one engineering surface: Codex remains the workspace and tool host, while selected
+model turns can use the ChatGPT Web capabilities already exposed by the signed-in account.
 
 Free and Go accounts get **ChatGPT Web — Luna** in Codex's native model picker. Accounts that
 expose the reasoning selector keep **Instant**, **Medium**, **High**, **Extra High**, and **Pro** as

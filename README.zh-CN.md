@@ -21,8 +21,13 @@
   <a href="SECURITY.md"><strong>安全</strong></a>
 </p>
 
-> 把当前 ChatGPT 账户可用的 Web 模型带进 Codex，同时保留原生任务界面、上下文生命周期、
-> 流式输出、上下文压缩以及完整工具链。
+> **把 ChatGPT Web 直接接进 Codex。** 所选模型轮次通过当前账户可用的 ChatGPT Web 模型执行，
+> Codex 继续负责原生任务界面、文件、工具、流式输出、追踪和上下文压缩生命周期。
+
+<p align="center">
+  <strong>保留 Codex 工作台，把 ChatGPT Web 模型栈接进来。</strong><br>
+  <sub>本地桥接模型路由、任务绑定会话，以及基于 MCP 的工具回传。</sub>
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Architecture-Native%20Gateway%20%2B%20MCP-111827" alt="Architecture">
@@ -32,17 +37,25 @@
 
 <table>
   <tr>
-    <td width="33%"><strong>原生模型选择器</strong><br><sub>直接在 Codex 中选择 ChatGPT Web 档位，并继续使用同一个任务。</sub></td>
-    <td width="33%"><strong>完整 Codex Harness</strong><br><sub>通过 MCP 接入当前任务的文件、Shell、图片、审批、工具和应用。</sub></td>
-    <td width="33%"><strong>任务绑定会话</strong><br><sub>连续消息保持在同一会话中，并在边界处交回 Codex 原生上下文压缩。</sub></td>
+    <td width="33%"><strong>原生模型路由</strong><br><sub>ChatGPT Web 直接出现在 Codex 模型选择器中，选完模型后继续留在同一个任务里工作。</sub></td>
+    <td width="33%"><strong>完整任务工具链</strong><br><sub>通过当前轮次 MCP 回传文件系统、Shell、图片、审批、工具和应用。</sub></td>
+    <td width="33%"><strong>上下文连续性</strong><br><sub>连续轮次复用任务绑定会话，并在边界处交回 Codex 原生 compaction。</sub></td>
   </tr>
 </table>
 
+| Codex 保持原生 | 桥接层负责 |
+| --- | --- |
+| 任务界面、文件系统、审批、追踪、流式输出、上下文生命周期 | ChatGPT Web 模型路由、托管浏览器传输、任务绑定 Temporary Chat |
+| 原生 compaction 与项目状态 | MCP 工具回传和明确的浏览器路由诊断 |
+
 <p align="center">
-  <img src="docs/assets/codex-model-picker.png" alt="Codex 原生模型选择器中的 ChatGPT Web 模型" width="520">
+  <img src="docs/assets/codex-model-picker.png" alt="Codex 原生模型选择器中的 ChatGPT Web 模型" width="540">
 </p>
 
-<p align="center"><sub>真实 Codex 模型选择器：ChatGPT Web — Medium、High、Extra High、Pro、Instant 与原生 Codex 模型并列显示。</sub></p>
+<p align="center"><sub>真实 Codex 模型选择器：ChatGPT Web 路由与原生 Codex 模型并列显示。</sub></p>
+
+最终只有一个工程工作台：Codex 继续承载任务和工具，所选模型轮次则可以调用当前登录账户已经开放的
+ChatGPT Web 能力。
 
 Free 和 Go 账户会在 Codex 原生模型选择器中看到 **ChatGPT Web — Luna**。具有推理选择器的
 账户仍会按订阅权限看到 **Instant**、**Medium**、**High**、**Extra High** 和 **Pro**。

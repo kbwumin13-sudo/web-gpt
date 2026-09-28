@@ -21,8 +21,14 @@
   <a href="SECURITY.md"><strong>セキュリティ</strong></a>
 </p>
 
-> アカウントで利用できる ChatGPT Web モデルを Codex に持ち込みながら、ネイティブのタスク UI、
-> コンテキスト管理、ストリーミング、コンパクション、ツールハーネスを維持します。
+> **ChatGPT Web を Codex の中へ。** 選択したモデルターンをサインイン中のアカウントで利用できる
+> ChatGPT Web モデルへルーティングしながら、Codex のタスク UI、ファイル、ツール、ストリーミング、
+> トレース、コンパクションのライフサイクルを維持します。
+
+<p align="center">
+  <strong>Codex の作業面はそのまま。ChatGPT Web のモデルスタックを追加。</strong><br>
+  <sub>モデルルーティング、タスク紐付きセッション、MCP ツール実行をローカルで橋渡しします。</sub>
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Architecture-Native%20Gateway%20%2B%20MCP-111827" alt="Architecture">
@@ -32,17 +38,25 @@
 
 <table>
   <tr>
-    <td width="33%"><strong>Native model picker</strong><br><sub>Codex から ChatGPT Web のモデル階層を直接選び、同じタスクで作業を続けられます。</sub></td>
-    <td width="33%"><strong>Full Codex harness</strong><br><sub>MCP 経由で現在のタスクのファイル、Shell、画像、承認、ツール、アプリに接続します。</sub></td>
-    <td width="33%"><strong>Task-bound sessions</strong><br><sub>連続ターンを同じセッションに保ち、境界では Codex のネイティブ compaction に引き継ぎます。</sub></td>
+    <td width="33%"><strong>ネイティブなモデルルーティング</strong><br><sub>ChatGPT Web が Codex のモデル選択画面に現れ、同じタスクのままルートを切り替えられます。</sub></td>
+    <td width="33%"><strong>フルタスクハーネス</strong><br><sub>ターン単位の MCP で、ファイル、Shell、画像、承認、ツール、アプリを往復させます。</sub></td>
+    <td width="33%"><strong>コンテキスト継続</strong><br><sub>タスクに紐付いた ChatGPT セッションを再利用し、境界では Codex のネイティブ compaction に引き継ぎます。</sub></td>
   </tr>
 </table>
 
+| Codex 側に残るもの | ブリッジが追加するもの |
+| --- | --- |
+| タスク UI、ファイル、承認、トレース、ストリーミング、コンテキスト管理 | ChatGPT Web モデルルート、管理ブラウザー転送、タスク紐付き Temporary Chat |
+| ネイティブ compaction とプロジェクト状態 | MCP ツール往復と明示的なブラウザールート診断 |
+
 <p align="center">
-  <img src="docs/assets/codex-model-picker.png" alt="Codex のネイティブモデル選択画面に表示された ChatGPT Web モデル" width="520">
+  <img src="docs/assets/codex-model-picker.png" alt="Codex のネイティブモデル選択画面に表示された ChatGPT Web モデル" width="540">
 </p>
 
-<p align="center"><sub>実際の Codex モデル選択画面。ChatGPT Web — Medium、High、Extra High、Pro、Instant がネイティブ Codex モデルと並んで表示されています。</sub></p>
+<p align="center"><sub>実際の Codex モデル選択画面。ChatGPT Web ルートがネイティブ Codex モデルと並んで表示されます。</sub></p>
+
+Codex は作業空間とツールホストのまま、選択したモデルターンだけがサインイン中のアカウントで
+利用可能な ChatGPT Web 機能を使う、という 1 つのエンジニアリング面にまとまります。
 
 Free および Go アカウントでは、Codex のネイティブモデル選択画面に
 **ChatGPT Web — Luna** が追加されます。reasoning セレクターが表示されるアカウントでは、
