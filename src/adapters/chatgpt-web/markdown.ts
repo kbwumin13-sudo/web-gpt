@@ -9,6 +9,9 @@ const turndown = new TurndownService({
   emDelimiter: "*",
   strongDelimiter: "**",
   linkStyle: "inlined",
+  // Whitespace inside <code> is content. ChatGPT's code blocks carry their line breaks there with no
+  // <pre> around them, and collapsing it turned multi-line code into one line.
+  preformattedCode: true,
 });
 
 turndown.use(gfm);
@@ -54,6 +57,60 @@ turndown.addRule("compactListItem", {
       .replace(/^\n+|\n+$/g, "")
       .replace(/\n/g, `\n${" ".repeat(prefix.length)}`);
     return `${prefix}${normalized}${node.nextSibling ? "\n" : ""}`;
+  },
+});
+
+function attribute(node: Node, name: string): string | null {
+  return node.nodeType === 1 ? (node as HTMLElement).getAttribute(name) : null;
+}
+
+function hasClass(node: Node | null, name: string): boolean {
+  return Boolean(node) && (attribute(node!, "class") ?? "").split(/\s+/).includes(name);
+}
+
+/**
+ * The TeX behind a rendered formula. KaTeX renders every formula three times — MathML, its TeX
+ * annotation, and the visible HTML — so converting its text wrote each formula out three times
+ * over. ChatGPT's renderer also keeps the source on the wrapper in `data-math-source`.
+ */
+function renderedMath(node: Node): { tex: string; display: boolean } | undefined {
+  const source = attribute(node, "data-math-source");
+  if (source !== null) return { tex: source, display: attribute(node, "data-math-display") === "true" };
+  if (!hasClass(node, "katex")) return undefined;
+  const tex = (node as HTMLElement).querySelector('annotation[encoding="application/x-tex"]')?.textContent;
+  return tex ? { tex, display: hasClass(node.parentNode, "katex-display") } : undefined;
+}
+
+turndown.addRule("renderedMath", {
+  filter: node => renderedMath(node) !== undefined,
+  replacement: (_content, node) => {
+    const { tex, display } = renderedMath(node)!;
+    return display ? `\n\n$$\n${tex.trim()}\n$$\n\n` : `$${tex.trim()}$`;
+  },
+});
+
+// ChatGPT marks what its own copy button takes: the header of a code block (language label, copy
+// and wrap buttons) is `data-markdown-copy="exclude"`.
+turndown.addRule("markdownCopyExclude", {
+  filter: node => attribute(node, "data-markdown-copy") === "exclude",
+  replacement: () => "",
+});
+
+/**
+ * A code block in ChatGPT's current renderer is a `data-markdown-copy="code-block"` container whose
+ * `<code>` holds the lines without any `<pre>`. Read as ordinary HTML it collapsed into a single line
+ * of inline code, with the language label left behind as a paragraph of its own.
+ */
+turndown.addRule("markdownCopyCodeBlock", {
+  filter: node => attribute(node, "data-markdown-copy") === "code-block",
+  replacement: (_content, node) => {
+    const element = node as HTMLElement;
+    const code = (element.querySelector("code")?.textContent ?? "").replace(/\n$/, "");
+    const label = element.querySelector('[data-markdown-copy="exclude"]')?.textContent?.trim() ?? "";
+    const language = /^[\w+#.-]{1,32}$/.test(label) ? label : "";
+    const longestTicks = Math.max(0, ...Array.from(code.matchAll(/`+/g), run => run[0].length));
+    const fence = "`".repeat(Math.max(3, longestTicks + 1));
+    return `\n\n${fence}${language}\n${code}\n${fence}\n\n`;
   },
 });
 
@@ -303,7 +360,7 @@ export class ChatGptMarkdownBuffer {
         }
         previousSourceStart = segment.sourceStart;
       }
-      const committedIndex = this.committedIndex(segment);
+      const committedIndex = this.committedIndex(segment, highestCommittedIndex, sawPending);
       if (committedIndex !== undefined) {
         const committed = this.committed[committedIndex]!;
         if (sawPending || committedIndex < highestCommittedIndex || committed.text !== segment.text) {
@@ -339,7 +396,11 @@ export class ChatGptMarkdownBuffer {
     return pending;
   }
 
-  private committedIndex(segment: ChatGptMarkdownSegment): number | undefined {
+  private committedIndex(
+    segment: ChatGptMarkdownSegment,
+    afterCommittedIndex: number,
+    afterPending: boolean,
+  ): number | undefined {
     const exact = this.committed.findIndex(committed => (
       segment.sourceStart !== undefined && committed.sourceStart !== undefined
         ? segment.sourceStart === committed.sourceStart && segment.tag === committed.tag
@@ -349,9 +410,18 @@ export class ChatGptMarkdownBuffer {
 
     if (segment.sourceStart !== undefined) return undefined;
     if (!segment.tag) return undefined;
+    // Without a source range a block is recognised only by its tag and text, and different blocks
+    // share both: every horizontal rule is an empty <hr>. So the match is believed only where the
+    // committed block could still stand — after the last block already matched and before any
+    // block not yet streamed. Anywhere else it is a new block with the same content. ChatGPT's
+    // renderer stopped emitting source ranges (seen 2026-09-28), which made this the common path:
+    // an answer with two horizontal rules failed every time the second one appeared.
+    if (afterPending) return undefined;
     const semanticMatches = this.committed
       .map((committed, index) => ({ committed, index }))
-      .filter(({ committed }) => committed.tag === segment.tag && committed.text === segment.text);
+      .filter(({ committed, index }) => index > afterCommittedIndex
+        && committed.tag === segment.tag
+        && committed.text === segment.text);
     return semanticMatches.length === 1 ? semanticMatches[0]!.index : undefined;
   }
 

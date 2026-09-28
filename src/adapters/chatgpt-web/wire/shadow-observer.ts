@@ -4,7 +4,7 @@ import { buildWireTranscript, wireTranscriptsEnabled, writeWireTranscript } from
 import { ChatGptWireCollector, type ChatGptWireStream } from "./wire-collector";
 import { attachChatGptWireTap } from "./cdp-wire-tap";
 import { resumedConversationStream, STREAM_HANDOFF } from "./handoff";
-import { decodeSseStream } from "./sse-frames";
+import { decodeSseStream, type SseFrame } from "./sse-frames";
 import { parseConversationFrame } from "./conversation-events";
 import { observeConversationEvents } from "./turn-observation";
 
@@ -212,6 +212,16 @@ export function requestPath(url: string): string {
   }
 }
 
+/**
+ * Whether a frame is this turn's own progress: anything on the conversation request, or a socket
+ * message carrying a conversation-turn stream item after a handoff. Background traffic on the same
+ * socket or other backend requests says nothing about whether the turn is still being generated.
+ */
+function carriesTurnProgress(stream: ChatGptWireStream, frame: SseFrame): boolean {
+  if (stream.framing === "message") return frame.data.includes("conversation-turn-stream");
+  return stream.method.toUpperCase() === "POST" && conversationPath(stream.url);
+}
+
 export function conversationPath(url: string): boolean {
   const path = requestPath(url);
   return path === "/backend-api/f/conversation" || path === "/backend-api/conversation";
@@ -279,7 +289,12 @@ function completeEnoughToRescue(wire: ChatGptWireObservation): boolean {
  * turn, which makes page, stream, and turn the same thing.
  */
 export class ChatGptWireShadowSession {
-  private readonly collector = new ChatGptWireCollector();
+  private lastTurnFrameAt: number | undefined;
+  private readonly collector = new ChatGptWireCollector({
+    onFrame: (stream, frame) => {
+      if (carriesTurnProgress(stream, frame)) this.lastTurnFrameAt = Date.now();
+    },
+  });
   private attached = false;
   private overflowed: (() => number) | undefined;
 
@@ -288,6 +303,17 @@ export class ChatGptWireShadowSession {
     private readonly transcriptRoot: string,
     private readonly attachTap: typeof attachChatGptWireTap = attachChatGptWireTap,
   ) {}
+
+  /**
+   * When this turn's own stream last delivered a frame, or undefined before the first one.
+   *
+   * Liveness evidence only, never content: a model composing a long tool call, or continuing on
+   * the socket after a stream handoff, can leave the page without any assistant turn for minutes
+   * while its frames keep arriving here.
+   */
+  lastTurnActivityAt(): number | undefined {
+    return this.lastTurnFrameAt;
+  }
 
   /** Install the observer. Never throws: shadow observation must not be able to fail a turn. */
   async attach(page: Page, onFault?: (message: string) => void): Promise<boolean> {

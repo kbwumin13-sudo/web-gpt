@@ -59,7 +59,14 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(tokenMatches).toHaveLength(1);
   expect(compiled.text).toContain("[retired turn handle]");
   expect(transportOnly).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
-  expect(transportOnly).toContain("Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.");
+  // Tasks are done on the user's computer, as a native Codex agent does them; only questions skip tools.
+  expect(transportOnly).toContain("run commands and edit files directly on the user's own computer");
+  expect(transportOnly).toContain("When the user says local, 本地, this computer, or my computer");
+  expect(transportOnly).toContain("when the latest active request asks you to create, change, build, run, compute, or fix something, do that work yourself with the Codex Native tools.");
+  expect(transportOnly).toContain("Do not hand the work back as instructions or code for the user to run.");
+  expect(transportOnly.lastIndexOf("carry out requested work there and verify it")).toBeGreaterThan(transportOnly.indexOf("<codex_transport_resume>"));
+  expect(transportOnly).toContain("Answer directly without a tool call only when the request is a question or discussion that needs no local effect and no fresh local evidence beyond the supplied context.");
+  expect(transportOnly).not.toContain("otherwise answer the request directly without a tool call");
   expect(transportOnly).toContain("Use actual Codex Native results as evidence for local observations and effects.");
   expect(transportOnly).toContain("A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.");
   expect(transportOnly).toContain("After a deterministic tool failure, update the working hypothesis from that result");

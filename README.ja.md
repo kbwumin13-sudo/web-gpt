@@ -24,6 +24,12 @@
 > アカウントで利用できる ChatGPT Web モデルを Codex に持ち込みながら、ネイティブのタスク UI、
 > コンテキスト管理、ストリーミング、コンパクション、ツールハーネスを維持します。
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Architecture-Native%20Gateway%20%2B%20MCP-111827" alt="Architecture">
+  <img src="https://img.shields.io/badge/Runtime-macOS%2013%2B-111827" alt="Runtime">
+  <img src="https://img.shields.io/badge/Transport-Streaming%20SSE-111827" alt="Transport">
+</p>
+
 <table>
   <tr>
     <td width="33%"><strong>Native model picker</strong><br><sub>Codex から ChatGPT Web のモデル階層を直接選び、同じタスクで作業を続けられます。</sub></td>

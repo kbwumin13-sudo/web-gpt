@@ -2085,7 +2085,8 @@ class ChatGptBrowserDiagnostics {
               assistant: assistantTurns.map(element => ({
                 textChars: (element.textContent ?? "").length,
                 htmlChars: (element as HTMLElement).innerHTML.length,
-                markdownCount: element.querySelectorAll(".markdown").length,
+                // Both answer-root markings; the current renderer uses only the attribute.
+                markdownCount: element.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"]').length,
                 streamingStatusCount: element.querySelectorAll("[data-streaming-response-status]").length,
                 completionActionCount: element.querySelectorAll(completionActionSelector).length,
                 renderedCompletionActionCount: [...element.querySelectorAll(completionActionSelector)]
@@ -3104,6 +3105,7 @@ export class ChatGptBrowserWorker {
     graceMs: number = CHATGPT_RESPONSE_DOM_GRACE_MS,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    turnStreamActivityAt?: () => number | undefined,
   ): Promise<ChatGptAssistantTurnBinding> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3116,10 +3118,16 @@ export class ChatGptBrowserWorker {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       if (observationPage.isClosed()) throw chatGptBrowserTabClosedError();
       let progress = externalProgress?.snapshot();
-      if (progress?.lastProgressAt !== undefined) {
+      // Proven activity pushes the grace forward: a native tool call, or a frame on this turn's own
+      // stream. The second matters once the model works like an agent: between two tool calls it
+      // can spend minutes composing the next one, and ChatGPT's page shows no assistant turn while
+      // it does. Measured 2026-09-28, Extra High writing two MATLAB programs: the stream moved to
+      // the socket and kept going while the page stayed empty past the old 60-second grace.
+      const lastActivityAt = Math.max(progress?.lastProgressAt ?? -Infinity, turnStreamActivityAt?.() ?? -Infinity);
+      if (Number.isFinite(lastActivityAt)) {
         responseDeadline = Math.min(
           deadline ?? Number.POSITIVE_INFINITY,
-          Math.max(responseDeadline, progress.lastProgressAt + graceMs),
+          Math.max(responseDeadline, lastActivityAt + graceMs),
         );
       }
       if (deadline !== undefined && Date.now() >= deadline) {
@@ -5194,6 +5202,7 @@ export class ChatGptBrowserWorker {
             return recovered;
           }
           : undefined,
+        () => wireShadow.lastTurnActivityAt(),
       );
       await diagnostics.capture(page, "send-accepted");
 
@@ -5349,6 +5358,7 @@ export class ChatGptBrowserWorker {
               return recovered;
             }
             : undefined,
+          () => wireShadow.lastTurnActivityAt(),
         );
         submissionBaseline = continuationBaseline;
         visibleTrace = new ChatGptVisibleTraceTracker();

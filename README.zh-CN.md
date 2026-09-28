@@ -24,6 +24,12 @@
 > 把当前 ChatGPT 账户可用的 Web 模型带进 Codex，同时保留原生任务界面、上下文生命周期、
 > 流式输出、上下文压缩以及完整工具链。
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Architecture-Native%20Gateway%20%2B%20MCP-111827" alt="Architecture">
+  <img src="https://img.shields.io/badge/Runtime-macOS%2013%2B-111827" alt="Runtime">
+  <img src="https://img.shields.io/badge/Transport-Streaming%20SSE-111827" alt="Transport">
+</p>
+
 <table>
   <tr>
     <td width="33%"><strong>原生模型选择器</strong><br><sub>直接在 Codex 中选择 ChatGPT Web 档位，并继续使用同一个任务。</sub></td>

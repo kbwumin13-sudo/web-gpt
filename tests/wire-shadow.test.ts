@@ -615,3 +615,28 @@ test("a JSON handshake on a conversation path does not outrank the request that 
   expect(result.comparison).toBe("agreed");
   expect(result.observation?.answer).toBe("the answer");
 });
+
+test("only this turn's own stream counts as proof that the turn is still being generated", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  expect(session.lastTurnActivityAt()).toBeUndefined();
+
+  // Background requests and unrelated socket traffic are not the turn.
+  emit({ kind: "request", id: "usage", method: "GET", url: "https://chatgpt.com/backend-api/wham/usage/stream", at: 1 });
+  emit({ kind: "chunk", id: "usage", text: "data: []\n\n", at: 2 });
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 3 });
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "presence" }), at: 4 });
+  expect(session.lastTurnActivityAt()).toBeUndefined();
+
+  const before = Date.now();
+  emit({ kind: "request", id: "w1", method: "POST", url: "https://chatgpt.com/backend-api/f/conversation", at: 5 });
+  emit({ kind: "chunk", id: "w1", text: "data: {\"type\":\"resume_conversation_token\"}\n\n", at: 6 });
+  expect(session.lastTurnActivityAt()).toBeGreaterThanOrEqual(before);
+
+  // After a handoff the turn continues as conversation-turn stream items on the socket.
+  const handedOff = session.lastTurnActivityAt()!;
+  await new Promise(resolve => setTimeout(resolve, 5));
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "message", payload: { type: "conversation-turn-stream" } }), at: 7 });
+  expect(session.lastTurnActivityAt()).toBeGreaterThan(handedOff);
+});

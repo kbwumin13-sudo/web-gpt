@@ -687,7 +687,18 @@ export function compileChatGptWebPrompt(
         : []),
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
       "When project, history, or memory context is insufficient, discover deeper read/search capabilities on demand with codex_tool_inventory and invoke the needed capability with codex_tool_call instead of requiring all such context to be preloaded into this prompt.",
-      "Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.",
+      // A native Codex model does the work instead of describing it; that is what makes it an
+      // agent rather than a chat. The earlier rule here ("call a tool only when the request requires
+      // a local effect, otherwise answer directly") let "solve these with local MATLAB" come back as
+      // code for the user to run. Saying only "do the work" was not enough either (measured
+      // 2026-09-28, Extra High): the model did not know the tools reach the user's own computer, so
+      // it read "local" as a machine it cannot touch. The tools' own descriptions cannot say it
+      // without a new connector identity, because ChatGPT caches them per connector.
+      "The attached Codex Native tools run commands and edit files directly on the user's own computer, the machine running Codex, inside the workspace named in the environment context. Programs installed on that computer, such as MATLAB, Python, or a compiler, can be run through them.",
+      "When the user says local, 本地, this computer, or my computer, or asks for a program installed there, that is the computer these tools operate.",
+      "Work the way the native Codex agent works: when the latest active request asks you to create, change, build, run, compute, or fix something, do that work yourself with the Codex Native tools. Write the files into the workspace, run the programs the work needs, check the results, and then report what you did with links to the files. Do not hand the work back as instructions or code for the user to run.",
+      "If a program the task needs is not on PATH, look in its usual install locations for this operating system before concluding that it is unavailable.",
+      "Answer directly without a tool call only when the request is a question or discussion that needs no local effect and no fresh local evidence beyond the supplied context.",
       "Use actual Codex Native results as evidence for local observations and effects.",
       "A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.",
       "After a deterministic tool failure, update the working hypothesis from that result and inspect the relevant repository or environment before choosing a different next action; do not repeat the same call unless its inputs or observable state changed.",
@@ -765,6 +776,7 @@ export function compileChatGptWebPrompt(
     ? [
       "<codex_transport_resume>",
       `${retainedResume ? "The incremental task context is complete." : "The task context is complete."} Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
+      "The Codex Native tools operate the user's own computer: carry out requested work there and verify it, rather than replying with code or steps for the user to run.",
       "</codex_transport_resume>",
     ]
     : [

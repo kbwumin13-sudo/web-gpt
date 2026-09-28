@@ -2,47 +2,59 @@
 
 ## Current verdict
 
-**Failed stability gate.** Installed candidate `5.0.7-local.46` has package and process identity
-evidence. The prior `.45` fresh-task and retained-task two-hour runs both stopped on their first
-round because the automated browser received a Cloudflare challenge; no 20-round run has passed.
-`.46` additionally fixes a separate closed-browser-context defect found in a real user chat.
-Prior successful paths are carried forward where their implementation is unchanged, following
-the user's instruction. Failed rounds remain failures and are never counted as passing.
+**Cloudflare blocker fixed; stability gate still open.** Installed candidate `5.0.7-local.49` no longer
+shows the automated browser to Cloudflare as automated, and real installed turns pass without a
+challenge. The two-hour gate is not complete: its first run passed slots 1–5 and was then stopped by
+this Mac's clamshell sleep, and a rerun was stopped the same way three seconds after it began. Both
+stops are in `pmset -g log`; neither reached a bridge failure. Failed rounds remain failures and are
+never counted as passing.
+
+## Cloudflare root cause (2026-09-28)
+
+A controlled matrix against a public Cloudflare managed challenge (same Mac, same exit IP, Chrome
+153, a fresh profile per run, nobody clicking) isolated three page-visible signals:
+
+| Launch | Result |
+| --- | --- |
+| Ordinary Chrome | passed 2/2 |
+| Ordinary Chrome with `--remote-debugging-port`, no client attached | looped 0/2 |
+| Playwright's default launch, as the worker used it (`navigator.webdriver === true`) | failed 0/3 |
+| The same with `--disable-blink-features=AutomationControlled`, CDP attached throughout | passed 7/7 |
+| That plus the old in-page wire tap (edited `fetch`/`WebSocket` in every frame) | failed 0/3 |
+| That plus an out-of-page CDP network observer, or with the sandbox enabled | passed |
+
+The fix, from `.47`: one launch policy for every automated Chrome (`src/chrome-launch.ts`), the wire
+observer moved out of the page (`wire/cdp-wire-tap.ts`), and a grace window for a Cloudflare check
+that is still running. `.48` stops a cancelled wait from being reported as a block; `.49` stops one
+slow DOM probe from ending the composer wait. On the real profile, deleting the `chatgpt.com`
+clearance and opening a Temporary Chat produced no challenge, a composer in 2.4 s and a fresh
+clearance issued silently.
 
 ## Candidate identity and offline gates
 
-- Candidate: `5.0.7-local.46`; installed bundle ID
-  `8e41eaa8572d4e2fa8496f9b5f87c521bddcdcc2a4cc7ca068fb41b4938ded1d`.
-- `bun run verify`: all 11 stages passed, including typecheck, tests, audits, runtime bundle and
-  relocatable runtime smoke. The final source tree, including the retained-session acceptance
-  script, passed again; see `output/web-recovery-local46-verify.log`.
-- Signed macOS ZIP and DMG: `launcher/artifacts/codex-web-gpt-5.0.7-local.46-mac-arm64.zip` and
-  `.dmg`. SHA-256: ZIP `75422a4842e936d209f787dcfda19a8595559e97d47da80186f92643b2d36d5d`,
-  DMG `85eee755766250c1c0fc53db888654990693c45d20ed08978f0d48930be4f64c`. Package
-  smoke passed and preflight verified code signature and embedded runtime manifest.
-- The installed App, stable CLI, gateway and backend report `.46`; the two running services report
-  the same bundle ID. The installed App signature verifies, and its embedded runtime manifest
-  matches the versioned runtime manifest. See `output/web-recovery-local46-install.log`.
-- With the Web backend stopped, the gateway completed a real native `gpt-5.6-luna` response (`OK`,
-  nine SSE events). A malformed Web-route request then started the backend on demand without
-  opening a ChatGPT browser turn. `scripts/acceptance-native-isolation.ts` reproduced the full
-  sequence on `.44`; see `output/web-recovery-local44-native-isolation.log`. `doctor` correctly reports Web as **unverified** until a real
-  installed Web turn completes. After the real Light turn and five-way batch, `doctor --json`
-  reports `ok: true` and Web readiness `ok`; see `output/web-recovery-local44-doctor-after-web.json`.
+- Candidate: `5.0.7-local.49`; installed bundle ID
+  `efb36cddc3c692e97f5c0ee362adde1266b001be8aa7eddec8d6ffe1adc71714`; the gateway and the backend
+  report the same ID.
+- `bun run verify`: all 11 stages passed; see `output/web-recovery-local49-verify.log`.
+- Signed macOS ZIP `launcher/artifacts/codex-web-gpt-5.0.7-local.49-mac-arm64.zip`, SHA-256
+  `2e07201541f80f074fc5920ad12b35e85831c26269011e145feb390620e95c93`. Preflight verified the code
+  signature and embedded runtime manifest; the transactional install passed. See
+  `output/web-recovery-local49-{preflight,install}.log`.
+- `doctor --json` after install: `ok: true`.
 
 ## Real acceptance matrix
 
-| Gate | `.46` result, including carried evidence | Evidence / remaining check |
+| Gate | `.49` result, including carried evidence | Evidence / remaining check |
 | --- | --- | --- |
 | Every account tier, selected model/effort and tool read | Passed, carried | A `.44` five-way batch gave distinct correct answers and successful file-read receipts for all five tiers. `output/web-recovery-local44-parallel-effort-evidence.json` shows browser slider values 0–4. Source routing binds each tier to one value; the parallel snapshot itself does not carry the Codex turn ID. Pro will not be repeated. |
 | Coding task and image input | Passed, carried | `.43` created and verified a result file; High identified a red 64×64 image. The stability window will recheck both without Pro. |
 | Three-round context and retained compaction | Pending | `.43` Pro third round recalled the fact, but retained handoff stalled and fresh fallback supplied the checkpoint. Retained path remains unproven. |
 | Lost browser session and fresh compaction | Pending | `.43` rebuilt a checkpoint after backend restart; the following turn failed on Cloudflare `/backend-api/models` HTTP 403. |
-| Two-way and five-way isolation; sixth rejection | Passed, carried | `.43` two-way and `.44` five-way batches passed distinct markers and tool receipts; the sixth was rejected by the five-turn contract. Codex retried that expected rejection five times, but browser diagnostics show five batch pages and no sixth page. Another two-way batch is included in the stability run. |
+| Two-way and five-way isolation; sixth rejection | Passed with one open observation | `.49` five-way batch without Pro: four turns read their own marker and answered inline, the sixth was rejected by the five-turn contract. The Extra High turn had the connector exactly selected in the page yet answered that no connector tool was available and made no call; DOM and wire agreed on that answer. Not reproduced; the bridge cannot observe ChatGPT's tool injection. See `output/web-recovery-local49-parallel.log`. |
 | Cancellation, interrupted recovery | Passed, carried | `.42` completed a real accepted-prompt interruption, stopped new browser/tool work, released resources and completed the next turn. Cancellation path is unchanged in `.45`. |
 | Settings close, idle exit, restart, sleep/wake | Passed, carried | `.44` native isolation, on-demand backend start and service restart passed; gateway stayed up after backend idle exit with Settings closed. `.41` logged real Sleep/FullWake and completed a Web tool read afterward. Sleep handling is unchanged in `.45`. A later three-second lid close only produced Display off/on and is not counted. |
-| Two hours / 20 valid real rounds | Failed | The fresh-task script stopped at 0/20 after slot 1 hit Cloudflare. More than an hour later, the retained-task script also stopped at 0/20 on its first Light turn. Both logs preserve their first failure: `output/web-recovery-local45-stability.jsonl` and `output/web-recovery-local45-retained-stability.jsonl`. Neither run used Pro. |
-| Installed delivery | Partial | `.46` offline verification, signed package smoke, preflight and installed identity passed. Its closed-context fix has package identity and offline regression evidence; a real accepted Web turn after context loss remains unverified while Cloudflare blocks the browser. Long-running Web stability has not passed. |
+| Two hours / 20 valid real rounds | Partial | `.49` run 1 passed slots 1–5 (Light tool read, Medium, High image, Extra High tool read, High) with no challenge; slot 6 froze at 18:13:29 when the Mac entered clamshell sleep and failed on waking. Run 2 was frozen by the same sleep three seconds after it began. Needs a full run with the Mac on AC power under `caffeinate -s`. See `output/web-recovery-local49-stability*.jsonl`. |
+| Installed delivery | Passed for `.49` | Offline verification, signed package, preflight, transactional install, matching gateway/backend identity and real installed turns (tool read, answer, image, parallel batch). |
 
 ## Reproduction commands
 
@@ -139,3 +151,13 @@ needs to be withdrawn.
 
 Do not describe this candidate as ready until every pending matrix row passes on the same installed
 bundle and the stability log ends with `STABILITY_LIVE_OK`.
+
+- 2026-09-28 16:09–16:16 CST: two human clicks failed in a dedicated-profile Chrome started with
+  `--remote-debugging-port`, with and without a client attached. The same profile in a plain Chrome
+  was challenged and let through after 9 s with nobody clicking. This led to the matrix above.
+- `.47`–`.49`, 16:54–17:16 CST: installed Light tool read passed with wire and DOM agreeing. Five-way
+  batches exposed two defects that `.48`/`.49` fix (a cancelled wait reported as login or Cloudflare
+  failure; one slow probe ending the composer wait) and a prompt ambiguity in the acceptance script,
+  whose participants now answer inline. Pro was removed from the batch to preserve its quota.
+- `.49` stability, 17:17–18:25 CST: slots 1–5 passed; the Mac slept at 17:55 and again at 18:13:29
+  (`Clamshell Sleep`, battery), which froze slot 6. Rerun at 19:18:56 was frozen at 19:18:59.

@@ -1098,6 +1098,64 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
   }
 });
 
+test("a turn whose own stream keeps arriving is not failed for an empty page", async () => {
+  // An agentic turn can compose its next tool call for minutes while ChatGPT's page shows no
+  // assistant turn at all; the frames on its stream are the evidence that it is still working.
+  type Baseline = { initialTurnIdentities: string[]; domCache: Record<string, unknown> };
+  const hiddenLocator = { filter() { return this; }, first() { return this; }, last() { return this; }, isVisible: async () => false };
+  const assistantLocator = { id: "assistant" };
+  const page = {
+    isClosed: () => false,
+    locator: (selector: string) => selector.startsWith("[data-turn-id=") ? assistantLocator : hiddenLocator,
+  } as unknown as Page;
+  const realDateNow = Date.now;
+  try {
+    for (const scenario of ["appears-after-long-work", "stream-stops"] as const) {
+      let now = 1_000;
+      Date.now = () => now;
+      const worker = ChatGptBrowserWorker.forProvider({
+        adapter: "chatgpt-web",
+        baseUrl: `browser://stream-liveness-${scenario}-${Math.random()}`,
+        chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+      }) as unknown as {
+        waitForNewAssistantTurn(
+          page: Page, baseline: Baseline, deadline: number | undefined, signal: undefined, progress: undefined,
+          graceMs: number, tracker: undefined, recover: undefined, activity: () => number | undefined,
+        ): Promise<{ identity: string }>;
+        submissionDomState(): Promise<unknown>;
+        waitForTurnDomOrExternalProgress(): Promise<void>;
+      };
+      // Frames arrive every 30s for five minutes, then stop.
+      const streamEnds = 1_000 + 5 * 60_000;
+      let lastFrameAt = 1_000;
+      const appearsAt = scenario === "appears-after-long-work" ? streamEnds : Number.POSITIVE_INFINITY;
+      worker.submissionDomState = async () => ({
+        turnIdentities: ["conversation-turn-user", "conversation-turn-assistant"],
+        userIdentities: ["conversation-turn-user"],
+        responseIdentities: now >= appearsAt ? ["conversation-turn-assistant"] : [],
+      });
+      worker.waitForTurnDomOrExternalProgress = async () => {
+        now += 30_000;
+        if (now <= streamEnds) lastFrameAt = now;
+      };
+      const result = worker.waitForNewAssistantTurn(
+        page, { initialTurnIdentities: [], domCache: {} }, undefined, undefined, undefined,
+        CHATGPT_RESPONSE_DOM_GRACE_MS, undefined, undefined, () => lastFrameAt,
+      );
+      if (scenario === "appears-after-long-work") {
+        await expect(result).resolves.toMatchObject({ identity: "conversation-turn-assistant" });
+      } else {
+        await expect(result).rejects.toThrow("its page never rendered the reply");
+        // Failed only once the stream had been silent for the whole grace, not while it worked.
+        expect(now).toBeGreaterThanOrEqual(streamEnds + CHATGPT_RESPONSE_DOM_GRACE_MS);
+        expect(now).toBeLessThan(streamEnds + CHATGPT_RESPONSE_DOM_GRACE_MS + 60_000);
+      }
+    }
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
 test("a failed stale-browser disconnect prevents the replacement connection", async () => {
   let replacementAttempts = 0;
   const disconnectFailure = new Error("stale CDP transport did not close");
