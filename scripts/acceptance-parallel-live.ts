@@ -89,8 +89,10 @@ try {
         status: item.status,
         command: typeof item.command === "string" ? item.command.slice(0, 160) : undefined,
       }));
+      const error = participant.evidence.outcome().turn.error as { message?: unknown } | undefined;
       throw new Error(`${participant.model} parallel turn failed isolation (status=${status}, answerChars=${answer.length}, read=${read}, `
-        + `answer=${JSON.stringify(text.slice(0, 240))}, tools=${JSON.stringify(tools)})`);
+        + `answer=${JSON.stringify(text.slice(0, 240))}, tools=${JSON.stringify(tools)}`
+        + `${error?.message ? `, error=${JSON.stringify(String(error.message).slice(0, 300))}` : ""})`);
     }
     return { model: participant.model, thread_id: participant.evidence.threadId, turn_id: participant.evidence.turnId, marker: participant.marker, answer_chars: answer.length, tool_read: true };
   }));

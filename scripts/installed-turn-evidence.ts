@@ -48,7 +48,10 @@ export class InstalledTurnEvidence {
     for (const [id, item] of this.items) items.set(id, item);
     const ordered = [...items.values()];
     const messages = ordered.filter(item => item.type === "agentMessage" && typeof item.text === "string" && item.text.trim());
-    const final = messages.filter(item => item.phase === "final").at(-1) ?? messages.at(-1);
+    // Codex tags the answer `final_answer` and progress notes `commentary`; an untagged message is
+    // the answer only when nothing is tagged as one.
+    const final = messages.filter(item => item.phase === "final_answer" || item.phase === "final").at(-1)
+      ?? messages.filter(item => item.phase !== "commentary").at(-1);
     const toolItems = ordered.filter(item => ["commandExecution", "mcpToolCall", "functionCallOutput", "fileChange"].includes(String(item.type)));
     return { status: turn.status, answer: typeof final?.text === "string" ? final.text : "", toolItems, turn };
   }

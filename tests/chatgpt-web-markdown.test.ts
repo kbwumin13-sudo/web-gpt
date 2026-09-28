@@ -173,3 +173,23 @@ test("KaTeX without the renderer's source attribute falls back to its TeX annota
   expect(chatGptHtmlToMarkdown(`<p>Newton ${katex("p_4(x)")} form</p>`)).toBe("Newton $p_4(x)$ form");
   expect(chatGptHtmlToMarkdown(`<p><span class="katex-display">${katex("S(x)")}</span></p>`)).toBe("$$\nS(x)\n$$");
 });
+
+const INLINE_FIXTURE = readFileSync(join(import.meta.dir, "fixtures", "chatgpt-answer-inline-code-file-link.html"), "utf8");
+
+test("inline code and a linked local file keep their Markdown in the current renderer", () => {
+  // Real answer DOM captured 2026-09-29 from a synthetic prompt. The renderer draws inline code as a
+  // span and a local file link as a mention; read as text, Codex got neither the backticks nor the link.
+  expect(chatGptHtmlToMarkdown(INLINE_FIXTURE)).toBe([
+    "Run `wc -l primes.txt` and **bold**.  ",
+    "[primes.py](</private/tmp/fixture-dir/primes.py>)  ",
+    "OpenAI  ",
+    "END-OF-FIXTURE",
+  ].join("\n"));
+});
+
+test("an inline code span fences its own backticks and still links a file path", () => {
+  const span = (code: string) => `<p>x <span data-markdown-copy="inline-code">${code}</span> y</p>`;
+  expect(chatGptHtmlToMarkdown(span("a`b"))).toBe("x ``a`b`` y");
+  expect(chatGptHtmlToMarkdown(span("`tick"))).toBe("x `` `tick `` y");
+  expect(chatGptHtmlToMarkdown(span("src/example.ts"))).toBe("x [src/example.ts](<src/example.ts>) y");
+});

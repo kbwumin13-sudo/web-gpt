@@ -27,3 +27,20 @@ test("a completed status without answer evidence remains incomplete", () => {
   evidence.observe({ method: "turn/completed", params: { threadId: "thread_target", turn: { id: "turn_target", status: "completed", itemsView: "notLoaded", items: [] } } });
   expect(evidence.outcome().answer).toBe("");
 });
+
+test("progress commentary is never taken for the final answer, whichever completes last", () => {
+  const evidence = new InstalledTurnEvidence("thread_target", "turn_target");
+  const item = (id: string, phase: string, text: string) => ({
+    method: "item/completed",
+    params: { threadId: "thread_target", turnId: "turn_target", item: { id, type: "agentMessage", phase, text } },
+  });
+  evidence.observe(item("answer", "final_answer", "MARKER"));
+  evidence.observe(item("note", "commentary", "Reading input.txt first."));
+  evidence.observe({ method: "turn/completed", params: { threadId: "thread_target", turn: { id: "turn_target", status: "completed", items: [] } } });
+  expect(evidence.outcome().answer).toBe("MARKER");
+
+  const commentaryOnly = new InstalledTurnEvidence("thread_target", "turn_target");
+  commentaryOnly.observe(item("note", "commentary", "Reading input.txt first."));
+  commentaryOnly.observe({ method: "turn/completed", params: { threadId: "thread_target", turn: { id: "turn_target", status: "completed", items: [] } } });
+  expect(commentaryOnly.outcome().answer).toBe("");
+});

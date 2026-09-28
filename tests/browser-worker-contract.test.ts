@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT, CHATGPT_STOPPED_THINKING_LABELS, CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT, ChatGptCompletionTracker, chatGptCanonicalConversationNavigation, chatGptExternalProgressSuppressesDomHealth, chatGptStoppedTurnContinuationPlan, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptAgentCommentaryRelay, CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT, CHATGPT_STOPPED_THINKING_LABELS, CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT, ChatGptCompletionTracker, chatGptCanonicalConversationNavigation, chatGptExternalProgressSuppressesDomHealth, chatGptStoppedTurnContinuationPlan, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -16,6 +16,7 @@ import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGpt
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
+import { chatGptAgentCommentaryProbe } from "../src/adapters/chatgpt-web/agent-commentary";
 
 test("a closed managed Chrome context is replaced before any prompt or new task page", async () => {
   const prototype = ChatGptBrowserWorker.prototype as unknown as {
@@ -1096,6 +1097,94 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
   } finally {
     Date.now = realDateNow;
   }
+});
+
+test("an agentic turn relays each finished commentary before its tool call is released", async () => {
+  // ChatGPT renders an agentic turn's answer unit only when the answer starts, so the whole work
+  // phase happens while this wait has nothing to bind. The relay is what shows that work in Codex.
+  type Baseline = { initialTurnIdentities: string[]; domCache: Record<string, unknown> };
+  const hiddenLocator = { filter() { return this; }, first() { return this; }, last() { return this; }, isVisible: async () => false };
+  const assistantLocator = { id: "assistant" };
+  const turnKeys = ["fallback-turn-0"];
+  const bothSteps = ["<p>Checking the workspace.</p>", "<p>Running it.</p>"];
+  const commentary = [[], bothSteps.slice(0, 1), bothSteps, bothSteps];
+  let step = 0;
+  const page = {
+    isClosed: () => false,
+    locator: (selector: string) => selector.startsWith("[data-turn-id=") ? assistantLocator : hiddenLocator,
+    evaluate: async (fn: unknown, argument: { fromBlock: number }) => {
+      if (fn !== chatGptAgentCommentaryProbe) throw new Error("unexpected page evaluation");
+      // Before the send the page has no turn; afterwards it has this submission's turn. ChatGPT
+      // renders a call's row only once the call returns, so while a call waits the commentary
+      // that led to it is the newest root and still carries the streaming mark.
+      return {
+        turnKeys: step === 0 ? [] : turnKeys,
+        blocks: commentary[step]!
+          .map((html, index, all) => ({ html, complete: step === 3 || index < all.length - 1 }))
+          .slice(argument.fromBlock),
+      };
+    },
+  } as unknown as Page;
+  const worker = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web",
+    baseUrl: `browser://agent-commentary-${Math.random()}`,
+    chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+  }) as unknown as {
+    waitForNewAssistantTurn(
+      page: Page,
+      baseline: Baseline,
+      deadline: number | undefined,
+      signal: AbortSignal | undefined,
+      externalProgress: ChatGptExternalTurnProgress,
+      graceMs: number,
+      completionTracker: ChatGptCompletionTracker,
+      recoverObservation: undefined,
+      turnStreamActivityAt: undefined,
+      agentCommentary: ChatGptAgentCommentaryRelay,
+    ): Promise<{ identity: string }>;
+    submissionDomState(): Promise<{ turnIdentities: string[]; userIdentities: string[]; responseIdentities: string[] }>;
+    waitForTurnDomOrExternalProgress(): Promise<void>;
+  };
+  const events: string[] = [];
+  const relay = await ChatGptAgentCommentaryRelay.open(page, text => events.push(`commentary: ${text}`));
+  if (!relay) throw new Error("relay did not open");
+  const progress = new ChatGptExternalTurnProgress();
+  const acknowledge = progress.acknowledgeToolBatch.bind(progress);
+  progress.acknowledgeToolBatch = async (revision: number) => {
+    events.push(`tool call ${revision} released`);
+    await acknowledge(revision);
+  };
+  worker.submissionDomState = async () => ({
+    turnIdentities: step === 3 ? ["conversation-turn-assistant"] : [],
+    userIdentities: [],
+    responseIdentities: step === 3 ? ["conversation-turn-assistant"] : [],
+  });
+  worker.waitForTurnDomOrExternalProgress = async () => {
+    step += 1;
+    // Each step renders one more commentary root and then the call it led to; the last renders
+    // the answer unit.
+    if (step < 3) progress.recordToolBatch(1);
+  };
+
+  const binding = await worker.waitForNewAssistantTurn(
+    page,
+    { initialTurnIdentities: [], domCache: {} },
+    undefined,
+    undefined,
+    progress,
+    60_000,
+    new ChatGptCompletionTracker(),
+    undefined,
+    undefined,
+    relay,
+  );
+  expect(binding.identity).toBe("conversation-turn-assistant");
+  expect(events).toEqual([
+    "commentary: Checking the workspace.",
+    "tool call 1 released",
+    "commentary: Running it.",
+    "tool call 2 released",
+  ]);
 });
 
 test("a turn whose own stream keeps arriving is not failed for an empty page", async () => {

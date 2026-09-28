@@ -24,15 +24,37 @@ turndown.addRule("removeSvg", {
   filter: node => node.nodeName === "SVG",
   replacement: () => "",
 });
+/** A local destination written in angle brackets, so spaces and parentheses survive. */
+function localLinkTarget(href: string): string {
+  return href.replaceAll("<", "%3C").replaceAll(">", "%3E").replaceAll("\n", "%0A").replaceAll("\r", "%0D");
+}
+
 // Preserve local artifact destinations across DOM extraction, including spaces and parentheses.
 turndown.addRule("localArtifactLinks", {
   filter: node => node.nodeName === "A"
     && /^\/(?!\/)/.test((node as HTMLElement).getAttribute("href") ?? ""),
-  replacement: (content, node) => {
-    const target = (node as HTMLElement).getAttribute("href")!
-      .replaceAll("<", "%3C").replaceAll(">", "%3E")
-      .replaceAll("\n", "%0A").replaceAll("\r", "%0D");
-    return `[${content}](<${target}>)`;
+  replacement: (content, node) => `[${content}](<${localLinkTarget((node as HTMLElement).getAttribute("href")!)}>)`,
+});
+// ChatGPT's current renderer draws a linked local file as a mention, not an anchor: the model's
+// target and label are on `data-prompt-link-href` and `data-prompt-link-label`, and read as text the
+// link was reduced to its bare label.
+turndown.addRule("fileReferenceLinks", {
+  filter: node => attribute(node, "data-file-reference") === "true" && Boolean(attribute(node, "data-prompt-link-href")),
+  replacement: (_content, node) => {
+    const label = attribute(node, "data-prompt-link-label") ?? node.textContent ?? "";
+    return `[${turndown.escape(label)}](<${localLinkTarget(attribute(node, "data-prompt-link-href")!)}>)`;
+  },
+});
+// The current renderer also draws inline code as a `data-markdown-copy="inline-code"` span, not
+// `<code>`, which read as plain text lost its backticks. A path in it is still linked, below.
+turndown.addRule("markdownCopyInlineCode", {
+  filter: node => attribute(node, "data-markdown-copy") === "inline-code",
+  replacement: (_content, node) => {
+    const code = node.textContent ?? "";
+    const longestTicks = Math.max(0, ...Array.from(code.matchAll(/`+/g), run => run[0].length));
+    const fence = "`".repeat(longestTicks + 1);
+    const padding = /^`|`$/.test(code) ? " " : "";
+    return `${fence}${padding}${code}${padding}${fence}`;
   },
 });
 turndown.addRule("linkInlineFilePaths", {
@@ -115,7 +137,7 @@ turndown.addRule("markdownCopyCodeBlock", {
 });
 
 function inlineFilePath(node: Node): string | undefined {
-  if (node.nodeName !== "CODE") return undefined;
+  if (node.nodeName !== "CODE" && attribute(node, "data-markdown-copy") !== "inline-code") return undefined;
   for (let ancestor = node.parentNode; ancestor; ancestor = ancestor.parentNode) {
     if (["A", "PRE"].includes(ancestor.nodeName)) return undefined;
   }

@@ -17,8 +17,15 @@ import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
 import {
+  chatGptAgentCommentaryProbe,
+  type ChatGptAgentCommentaryBlock,
+  type ChatGptAgentCommentaryProbe,
+} from "./agent-commentary";
+import { CHATGPT_DOM_SKELETON_LIMITS, chatGptDomSkeleton, sanitizeChatGptDomSkeleton } from "./dom-skeleton";
+import {
   ChatGptMarkdownBuffer,
   ChatGptMarkdownConsistencyError,
+  chatGptHtmlToMarkdown,
   type ChatGptMarkdownSegment,
 } from "./markdown";
 import {
@@ -125,6 +132,8 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
 }
 
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
+/** An ordinary reply binds its turn within seconds; an agentic one gets its first step by then. */
+const CHATGPT_UNBOUND_TURN_DIAGNOSTIC_MS = 20_000;
 /**
  * How long a staged Bigger Context part may take to produce its assistant turn. A staged part is two
  * orders of magnitude larger than an ordinary prompt and ChatGPT reads all of it before answering.
@@ -1867,6 +1876,143 @@ export class ChatGptVisibleTraceTracker {
   }
 }
 
+/**
+ * The loops that call the relay wake every 50 ms, in up to five tabs at once; commentary only needs
+ * trace pace, and a tool call does not wait for this interval.
+ */
+const CHATGPT_AGENT_COMMENTARY_PROBE_INTERVAL_MS = 500;
+const CHATGPT_AGENT_COMMENTARY_PROBE_TIMEOUT_MS = 1_000;
+/** Between tool calls a finished root is relayed once it has read the same for this long. */
+const CHATGPT_AGENT_COMMENTARY_STABLE_MS = 250;
+const CHATGPT_AGENT_COMMENTARY_SETTLE_POLL_MS = 100;
+/** How long a tool call, or the answer, waits at most for the commentary before it to stop changing. */
+export const CHATGPT_AGENT_COMMENTARY_SETTLE_GRACE_MS = 1_500;
+
+/**
+ * Relays an agentic turn's commentary to Codex while ChatGPT has not rendered the turn's answer.
+ *
+ * The answer reader binds to the answer's message unit, which ChatGPT creates only when the answer
+ * starts (see agent-commentary.ts). Until then this relay reads the work block and emits each
+ * commentary root once, in order, after it has finished. It is display trace: an unreadable page or
+ * an unattributable turn only means no commentary, never a failed turn.
+ */
+export class ChatGptAgentCommentaryRelay {
+  private emitted = 0;
+  private candidate?: { signature: string; since: number };
+  private lastProbeAt = Number.NEGATIVE_INFINITY;
+  private closed = false;
+
+  private constructor(
+    private readonly baselineTurnKeys: string[],
+    private readonly emit: (text: string) => void,
+    private readonly now: () => number,
+  ) {}
+
+  /** Records the turns already on the page, before the prompt is sent. */
+  static async open(
+    page: Page,
+    emit: ((text: string) => void) | undefined,
+    options: { now?: () => number } = {},
+  ): Promise<ChatGptAgentCommentaryRelay | undefined> {
+    if (!emit) return undefined;
+    const probe = await probeChatGptAgentCommentary(page, [], 0);
+    return probe ? new ChatGptAgentCommentaryRelay(probe.turnKeys, emit, options.now ?? Date.now) : undefined;
+  }
+
+  /** Called on each wake of the loops that wait for the answer. */
+  async observe(page: Page): Promise<void> {
+    if (this.closed) return;
+    const now = this.now();
+    if (now - this.lastProbeAt < CHATGPT_AGENT_COMMENTARY_PROBE_INTERVAL_MS) return;
+    this.lastProbeAt = now;
+    const probe = await this.probe(page);
+    if (probe) this.relay(probe.blocks, false);
+  }
+
+  /**
+   * A tool call waits on this, so the commentary that led to it reaches Codex first. The call
+   * proves the model finished that commentary, although ChatGPT still marks it streaming: measured
+   * 2026-09-29, a call's row renders only after the call returns, so nothing follows the root yet.
+   */
+  async flushBeforeTool(page: Page): Promise<void> {
+    if (!this.closed) await this.settle(page, true);
+  }
+
+  /** The answer has started: flush what finished, then stop, so no commentary splits the answer. */
+  async close(page: Page): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    await this.settle(page, false);
+  }
+
+  /**
+   * Relays the unrelayed roots once they have finished and read the same twice, or at the grace.
+   * `callIssued` counts every root as finished: a pending tool call follows all of them.
+   */
+  private async settle(page: Page, callIssued: boolean): Promise<void> {
+    const deadline = this.now() + CHATGPT_AGENT_COMMENTARY_SETTLE_GRACE_MS;
+    let previous: string | undefined;
+    for (;;) {
+      const probe = await this.probe(page);
+      if (!probe) return;
+      const unrelayed = callIssued ? probe.blocks.map(block => ({ ...block, complete: true })) : probe.blocks;
+      const signature = JSON.stringify(unrelayed);
+      if (unrelayed.length === 0
+        || (signature === previous && unrelayed.every(block => block.complete))
+        || this.now() >= deadline) {
+        this.relay(unrelayed, true);
+        return;
+      }
+      previous = signature;
+      await new Promise(resolveSleep => setTimeout(resolveSleep, CHATGPT_AGENT_COMMENTARY_SETTLE_POLL_MS));
+    }
+  }
+
+  private probe(page: Page): Promise<ChatGptAgentCommentaryProbe | undefined> {
+    return probeChatGptAgentCommentary(page, this.baselineTurnKeys, this.emitted);
+  }
+
+  /** Emits the leading finished roots of `unrelayed`; `settled` skips the stability wait. */
+  private relay(unrelayed: ChatGptAgentCommentaryBlock[], settled: boolean): void {
+    const finished: ChatGptAgentCommentaryBlock[] = [];
+    for (const block of unrelayed) {
+      if (!block.complete) break;
+      finished.push(block);
+    }
+    if (finished.length === 0) return;
+    if (!settled) {
+      const signature = JSON.stringify(finished);
+      const now = this.now();
+      if (this.candidate?.signature !== signature) {
+        this.candidate = { signature, since: now };
+        return;
+      }
+      if (now - this.candidate.since < CHATGPT_AGENT_COMMENTARY_STABLE_MS) return;
+    }
+    this.candidate = undefined;
+    for (const block of finished) {
+      this.emitted += 1;
+      const text = chatGptHtmlToMarkdown(block.html).trim();
+      if (text) this.emit(text);
+    }
+  }
+}
+
+async function probeChatGptAgentCommentary(
+  page: Page,
+  baselineTurnKeys: string[],
+  fromBlock: number,
+): Promise<ChatGptAgentCommentaryProbe | undefined> {
+  try {
+    return await withChatGptBrowserObservationTimeout(
+      page.evaluate(chatGptAgentCommentaryProbe, { baselineTurnKeys, fromBlock }),
+      CHATGPT_AGENT_COMMENTARY_PROBE_TIMEOUT_MS,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 export function isChatGptTraceControl(block: ChatGptVisibleTraceBlock): boolean {
   if (block.kind !== "status") return false;
   const text = block.text.replace(/\s+/g, " ").trim();
@@ -1952,7 +2098,8 @@ class ChatGptBrowserDiagnostics {
     this.directory = join(this.root, `${traceId}-${randomUUID().slice(0, 8)}`);
   }
 
-  async capture(page: Page, checkpoint: string, error?: unknown): Promise<void> {
+  /** `skeleton` adds the page's structure-only map, for checkpoints where the turn may be unreadable. */
+  async capture(page: Page, checkpoint: string, error?: unknown, options: { skeleton?: boolean } = {}): Promise<void> {
     try {
       if (!this.initialized) {
         privateDirectory(this.root);
@@ -1963,7 +2110,7 @@ class ChatGptBrowserDiagnostics {
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
       const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
-      const [screenshotResult, stateResult] = await Promise.allSettled([
+      const [screenshotResult, stateResult, skeletonResult] = await Promise.allSettled([
         includeScreenshot
           ? page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
           : Promise.resolve(undefined),
@@ -2105,6 +2252,9 @@ class ChatGptBrowserDiagnostics {
           completionActionSelector: CHATGPT_COMPLETION_ACTION_SELECTOR,
           appName: this.appName,
         })),
+        options.skeleton
+          ? withChatGptBrowserObservationTimeout(page.evaluate(chatGptDomSkeleton, CHATGPT_DOM_SKELETON_LIMITS))
+          : Promise.resolve(undefined),
       ]);
       const capturedAt = new Date().toISOString();
       if (screenshotResult.status === "fulfilled" && screenshotResult.value) {
@@ -2123,6 +2273,12 @@ class ChatGptBrowserDiagnostics {
             stateResult.reason instanceof Error ? stateResult.reason.message : String(stateResult.reason),
           ),
         ]] : []),
+        ...(skeletonResult.status === "rejected" ? [[
+          "skeleton",
+          redactChatGptUiDiagnostic(
+            skeletonResult.reason instanceof Error ? skeletonResult.reason.message : String(skeletonResult.reason),
+          ),
+        ]] : []),
       ]);
       atomicWriteFile(join(this.directory, `${stem}.json`), `${JSON.stringify({
         version: 2,
@@ -2134,6 +2290,9 @@ class ChatGptBrowserDiagnostics {
         } : {}),
         ...(stateResult.status === "fulfilled"
           ? { state: sanitizeChatGptBrowserDiagnosticState(stateResult.value) }
+          : {}),
+        ...(skeletonResult.status === "fulfilled" && skeletonResult.value
+          ? { skeleton: sanitizeChatGptDomSkeleton(skeletonResult.value) }
           : {}),
         ...(Object.keys(captureErrors).length > 0 ? { captureErrors } : {}),
       }, null, 2)}\n`);
@@ -2879,6 +3038,7 @@ export class ChatGptBrowserWorker {
     externalProgress?: ChatGptTurnProgressReader,
     initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0,
     completionTracker?: ChatGptCompletionTracker,
+    agentCommentary?: ChatGptAgentCommentaryRelay,
   ): Promise<ChatGptSubmissionEvidence> {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     for (;;) {
@@ -2889,7 +3049,10 @@ export class ChatGptBrowserWorker {
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
         const boundaryText = await this.currentSubmissionAnswerText(page, baseline, signal);
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
+        await agentCommentary?.flushBeforeTool(page);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
+      } else {
+        await agentCommentary?.observe(page);
       }
       if (progress && progress.lastToolBatchRevision > initialToolBatchRevision) return "mcp_tool_call";
       await throwIfChatGptSessionFailureAlert(page);
@@ -3106,6 +3269,7 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
     turnStreamActivityAt?: () => number | undefined,
+    agentCommentary?: ChatGptAgentCommentaryRelay,
   ): Promise<ChatGptAssistantTurnBinding> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3204,13 +3368,17 @@ export class ChatGptBrowserWorker {
           chatGptAssistantTurnLocator(observationPage, identity),
         );
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
+        await agentCommentary?.flushBeforeTool(observationPage);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
       }
-      if (identity) return {
-        identity,
-        locator: chatGptAssistantTurnLocator(observationPage, identity),
-        acceptedTurnIdentities: state.turnIdentities,
-      };
+      if (identity) {
+        await agentCommentary?.close(observationPage);
+        return {
+          identity,
+          locator: chatGptAssistantTurnLocator(observationPage, identity),
+          acceptedTurnIdentities: state.turnIdentities,
+        };
+      }
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
@@ -3225,6 +3393,7 @@ export class ChatGptBrowserWorker {
           { status: 502, errorType: "server_error", code: "chatgpt_page_never_rendered", retryable: false },
         );
       }
+      await agentCommentary?.observe(observationPage);
       await this.waitForTurnDomOrExternalProgress(
         observationPage,
         progress?.revision ?? 0,
@@ -3694,6 +3863,7 @@ export class ChatGptBrowserWorker {
     initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    agentCommentary?: ChatGptAgentCommentaryRelay,
   ): Promise<ChatGptSubmissionEvidence> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3707,6 +3877,7 @@ export class ChatGptBrowserWorker {
           externalProgress,
           initialToolBatchRevision,
           completionTracker,
+          agentCommentary,
         );
         return evidence;
       } catch (error) {
@@ -3746,6 +3917,7 @@ export class ChatGptBrowserWorker {
     submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    agentCommentary?: ChatGptAgentCommentaryRelay,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -3785,6 +3957,7 @@ export class ChatGptBrowserWorker {
       initialToolBatchRevision,
       completionTracker,
       recoverObservation,
+      agentCommentary,
     );
     submissionLifecycle?.onSubmitted?.();
     return evidence;
@@ -5163,6 +5336,7 @@ export class ChatGptBrowserWorker {
       await diagnostics.capture(page, "file-attachment-complete");
       let submittedPageUrl = page.url();
       let completionTracker = new ChatGptCompletionTracker();
+      const agentCommentary = await ChatGptAgentCommentaryRelay.open(page, turn.onCommentary);
       const finalSubmissionEvidence = await this.runStage(
         turn.traceId,
         "send",
@@ -5184,26 +5358,38 @@ export class ChatGptBrowserWorker {
               return recovered;
             }
             : undefined,
+          agentCommentary,
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
-      let responseTurn = await this.waitForNewAssistantTurn(
-        page,
-        submissionBaseline,
-        deadline,
-        turn.abortSignal,
-        turn.externalProgress,
-        CHATGPT_RESPONSE_DOM_GRACE_MS,
-        completionTracker,
-        launcherObservationRecovery
-          ? async (...args) => {
-            const recovered = await recoverAssistantObservation(...args);
-            submissionBaseline = recovered.baseline;
-            return recovered;
-          }
-          : undefined,
-        () => wireShadow.lastTurnActivityAt(),
-      );
+      // An accepted message whose assistant turn the reader cannot find is the signature of a
+      // reshaped page: record the page's structure while that turn is still unbound.
+      const unboundTurnDiagnostic = setTimeout(() => {
+        void diagnostics.capture(page, "assistant-turn-unbound", undefined, { skeleton: true });
+      }, CHATGPT_UNBOUND_TURN_DIAGNOSTIC_MS);
+      let responseTurn: ChatGptAssistantTurnBinding;
+      try {
+        responseTurn = await this.waitForNewAssistantTurn(
+          page,
+          submissionBaseline,
+          deadline,
+          turn.abortSignal,
+          turn.externalProgress,
+          CHATGPT_RESPONSE_DOM_GRACE_MS,
+          completionTracker,
+          launcherObservationRecovery
+            ? async (...args) => {
+              const recovered = await recoverAssistantObservation(...args);
+              submissionBaseline = recovered.baseline;
+              return recovered;
+            }
+            : undefined,
+          () => wireShadow.lastTurnActivityAt(),
+          agentCommentary,
+        );
+      } finally {
+        clearTimeout(unboundTurnDiagnostic);
+      }
       await diagnostics.capture(page, "send-accepted");
 
       let lastHeartbeat = 0;
@@ -5322,6 +5508,7 @@ export class ChatGptBrowserWorker {
         await diagnostics.capture(page, "tool-final-continuation-attached");
         submittedPageUrl = page.url();
         completionTracker = new ChatGptCompletionTracker();
+        const continuationCommentary = await ChatGptAgentCommentaryRelay.open(page, turn.onCommentary);
         await this.runStage(
           turn.traceId,
           "tool_final_continuation_send",
@@ -5341,6 +5528,7 @@ export class ChatGptBrowserWorker {
                 return recovered;
               }
               : undefined,
+            continuationCommentary,
           ),
         );
         responseTurn = await this.waitForNewAssistantTurn(
@@ -5359,6 +5547,7 @@ export class ChatGptBrowserWorker {
             }
             : undefined,
           () => wireShadow.lastTurnActivityAt(),
+          continuationCommentary,
         );
         submissionBaseline = continuationBaseline;
         visibleTrace = new ChatGptVisibleTraceTracker();
@@ -5606,7 +5795,7 @@ export class ChatGptBrowserWorker {
           }
           if (!loggedCompletionWait && Date.now() - sentAt >= 60_000) {
             loggedCompletionWait = true;
-            await diagnostics.capture(page, "response-stalled-60s");
+            await diagnostics.capture(page, "response-stalled-60s", undefined, { skeleton: true });
             const diagnostic = await this.stalledTurnDiagnostic(page, responseTurn.locator).catch(error => JSON.stringify({
               diagnosticError: error instanceof Error ? error.message : String(error),
             }));
@@ -5745,7 +5934,7 @@ export class ChatGptBrowserWorker {
         + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}${abortDetail}`,
       );
       if (diagnosticPage && !diagnosticPage.isClosed()) {
-        await diagnostics.capture(diagnosticPage, "turn-failed", error);
+        await diagnostics.capture(diagnosticPage, "turn-failed", error, { skeleton: true });
       }
       // A failed turn is the case worth comparing most: the wire says whether ChatGPT actually
       // failed or whether only the DOM reading of it did.
