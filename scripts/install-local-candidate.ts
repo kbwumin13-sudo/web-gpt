@@ -176,13 +176,19 @@ async function main(): Promise<void> {
     let gateway = await health(current.nativeGatewayPort);
     gatewayPid = gateway.pid as number;
     originalGatewayBundle = bundle(gateway);
-    if (!gatewayPreviousIdentity(gateway, oldManifest.bundleId) || !originalGatewayBundle) {
+    if (gateway.service !== "codex-chatgpt-web-gateway"
+      || !Number.isSafeInteger(gatewayPid) || gatewayPid < 1 || !originalGatewayBundle) {
       throw new Error("Cannot prove original gateway package/process identity");
     }
     // Wake the old backend while the stable link still points at its package.
     startService();
     await waitForBackendReady(current);
     let backend = await health(current.port);
+    gateway = await health(current.nativeGatewayPort);
+    if (!gatewayPreviousIdentity(gateway, oldManifest.bundleId)
+      || gateway.pid !== gatewayPid || bundle(gateway) !== originalGatewayBundle) {
+      throw new Error("Preserved gateway did not route to the previous backend after startup");
+    }
     originalBackendBundle = bundle(backend);
     if (originalBackendBundle !== oldManifest.bundleId) throw new Error("Previous backend does not match rollback package");
     const idleDeadline = Date.now() + 30_000;

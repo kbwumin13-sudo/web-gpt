@@ -56,6 +56,7 @@ describe("service drain lifecycle", () => {
     expect(gatewayPreviousIdentity(gateway, "backend-v2")).toBeTrue();
     expect(gatewayPreviousIdentity(gateway, "gateway-v1")).toBeFalse();
     expect(gatewayPreviousIdentity({ ...gateway, pid: undefined }, "backend-v2")).toBeFalse();
+    expect(gatewayPreviousIdentity({ ...gateway, backend_build: null }, "backend-v2")).toBeFalse();
   });
 
   test("native Codex traffic through the preserved gateway does not block a Web backend cutover", () => {
