@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { decodeSseStream } from "./sse-frames";
 import { observeConversationEvents, type ChatGptWireObservation } from "./turn-observation";
 import { parseConversationFrame } from "./conversation-events";
+import { handoffBinding, resumeHandoffStream } from "./handoff";
 
 /**
  * Replays a recorded conversation stream through the same fold the live path uses.
@@ -60,12 +61,34 @@ export function replayWireCapture(contents: string): WireReplay {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { source: "raw", observation: observeRaw(contents) };
   }
-  const record = parsed as { raw?: unknown; observation?: unknown; stream?: unknown };
+  const record = parsed as { raw?: unknown; observation?: unknown; stream?: unknown; companions?: unknown };
   if (typeof record.raw !== "string") return { source: "raw", observation: observeRaw(contents) };
   const recordedStream = record.stream && typeof record.stream === "object" && !Array.isArray(record.stream)
     ? record.stream as { truncated?: unknown; framing?: unknown }
     : undefined;
-  const observation = observeRaw(record.raw, recordedStream?.framing === "message" ? "message" : "sse");
+  let observation = observeRaw(record.raw, recordedStream?.framing === "message" ? "message" : "sse");
+  if (recordedStream?.framing !== "message" && Array.isArray(record.companions)) {
+    const prefix = decodeSseStream(record.raw);
+    const binding = handoffBinding(prefix);
+    if (binding) {
+      let conflict = false;
+      const candidates = record.companions.flatMap(value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+        const companion = value as { framing?: unknown; raw?: unknown };
+        if (companion.framing !== "message" || typeof companion.raw !== "string") return [];
+        const resumed = resumeHandoffStream(companion.raw, binding);
+        if (resumed.conflict) conflict = true;
+        if (resumed.conflict || !resumed.stream) return [];
+        const result = observeConversationEvents([
+          ...prefix.map(parseConversationFrame),
+          ...decodeSseStream(resumed.stream).map(parseConversationFrame),
+        ]);
+        return result.endedTurn && result.sawDone && result.answer && result.counts.unrecognized === 0
+          && result.unappliedDeltas === 0 ? [result] : [];
+      });
+      if (!conflict && candidates.length === 1) observation = candidates[0]!;
+    }
+  }
   const recorded = record.observation && typeof record.observation === "object" && !Array.isArray(record.observation)
     ? record.observation as { answer?: unknown }
     : undefined;

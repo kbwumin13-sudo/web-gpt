@@ -400,7 +400,12 @@ export class ChatGptWireShadowSession {
       if (resumed.conflict) return undefined;
       const sse = resumed.stream;
       if (sse.length === 0) continue;
-      const observation = observeConversationEvents(decodeSseStream(sse).map(parseConversationFrame));
+      // The handoff transports the rest of the same response. Patches on the socket can refer to
+      // an assistant message created in the SSE prefix, so fold both streams in one context.
+      const observation = observeConversationEvents([
+        ...chosen.frames.map(parseConversationFrame),
+        ...decodeSseStream(sse).map(parseConversationFrame),
+      ]);
       if (observation.counts.unrecognized > 0 || observation.unappliedDeltas > 0) continue;
       if (!observation.endedTurn || !observation.sawDone || observation.answer.length === 0) continue;
       matches.push(observation);
@@ -460,7 +465,7 @@ export class ChatGptWireShadowSession {
     // A turn ChatGPT moved off its conversation request continues on the socket the page already
     // holds open, carrying the same event-stream text in topic messages. Reassembling it is what
     // makes those turns observable at all; without it the request is four frames and no answer.
-    const resumed = direct?.counts.controlTypes.includes(STREAM_HANDOFF) === true && direct.answer.length === 0
+    const resumed = direct?.counts.controlTypes.includes(STREAM_HANDOFF) === true
       ? this.followHandoff(stream)
       : undefined;
     if (resumed) handoffsFollowed += 1;

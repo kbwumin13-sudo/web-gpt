@@ -217,6 +217,32 @@ test("a handed-off turn is followed onto the socket and observed there", async (
   expect(chatGptWireTelemetrySnapshot()).toMatchObject({ handoffs_observed: 1, handoffs_followed: 1, exact: 1 });
 });
 
+test("a WebSocket patch continues the assistant message created in the SSE prefix", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  const encoded = [
+    { p: "/message/content/parts/0", o: "append", v: " and suffix" },
+    { p: "", o: "patch", v: [{ p: "/message/end_turn", o: "replace", v: true }] },
+    "[DONE]",
+  ].map(payload => `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  encoded.forEach((part, index) => emit({ kind: "chunk", id: "ws", at: 2 + index, text: JSON.stringify({
+    type: "message", topic_id: "topic-1", offset: `100-${index}`,
+    payload: { type: "conversation-turn-stream", payload: {
+      type: "stream-item", conversation_id: "conv_1", turn_id: "web-turn-1", encoded_item: part,
+    } },
+  }) }));
+  const prefix = { p: "", o: "add", v: { message: { id: "m1", author: { role: "assistant" },
+    recipient: "all", content: { content_type: "text", parts: ["prefix"] } } } };
+  const handoff = { type: "stream_handoff", conversation_id: "conv_1", turn_exchange_id: "exchange-1",
+    options: [{ type: "subscribe_ws_topic", topic_id: "topic-1" }] };
+  emitStream(emit, [prefix, handoff, "[DONE]"].map(payload =>
+    `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`).join(""));
+  expect(session.currentObservation()?.answer).toBe("prefix and suffix");
+  expect(session.conclude({ answer: "prefix and suffix", failed: false }).comparison).toBe("agreed");
+});
+
 test("a conflicting WS offset cannot rescue a handed-off turn", async () => {
   const { page, emit, attachTap } = fakePage();
   const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);

@@ -129,3 +129,31 @@ test("a recorded socket stream replays to the same frames it was observed as", (
   expect(replay.observation.endedTurn).toBeTrue();
   expect(replay.observation.counts.unrecognized).toBe(0);
 });
+
+test("a recorded handoff replays SSE prefix and WebSocket patches in one context", () => {
+  const prefix = [
+    { p: "", o: "add", v: { message: { id: "m1", author: { role: "assistant" }, recipient: "all",
+      content: { content_type: "text", parts: ["prefix"] } } } },
+    { type: "stream_handoff", conversation_id: "conv_1", turn_exchange_id: "exchange_1",
+      options: [{ type: "subscribe_ws_topic", topic_id: "topic_1" }] },
+  ].map(payload => `data: ${JSON.stringify(payload)}\n\n`).join("");
+  const encoded = [
+    { p: "/message/content/parts/0", o: "append", v: " suffix" },
+    { p: "", o: "patch", v: [{ p: "/message/end_turn", o: "replace", v: true }] },
+    "[DONE]",
+  ].map(payload => `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`);
+  const raw = encoded.map((part, index) => `${JSON.stringify(JSON.stringify({ type: "message", topic_id: "topic_1",
+    offset: `100-${index}`, payload: { type: "conversation-turn-stream", payload: {
+      type: "stream-item", conversation_id: "conv_1", turn_id: "web_turn_1", encoded_item: part,
+    } },
+  }))}\n`).join("");
+  const primary = streamOf(prefix);
+  const companion = { ...streamOf(""), id: "ws", method: "WS", framing: "message" as const,
+    url: "wss://ws.chatgpt.com/p4/ws/user/u1", raw };
+  const recorded = buildWireTranscript("trace_1", primary, observeWireStream(primary), new Date(),
+    undefined, [companion]);
+  const replay = replayWireCapture(JSON.stringify(recorded));
+  expect(replay.observation.answer).toBe("prefix suffix");
+  expect(replay.observation.endedTurn).toBeTrue();
+  expect(replay.observation.unappliedDeltas).toBe(0);
+});
