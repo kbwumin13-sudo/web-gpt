@@ -346,10 +346,10 @@ function messageChars(message: CodexMessage): number {
 }
 
 /**
- * A compact first packet keeps every current system/developer instruction in-band, together with
- * the latest human task instruction and the exchange immediately before it when that fits. Earlier
- * user, assistant, and tool state remains canonical and is available through Runtime retrieval; it
- * is never discarded or summarized heuristically at the browser boundary.
+ * A fresh packet keeps every current system/developer instruction in-band. Short tasks carry the
+ * complete non-tool dialogue; larger ones carry the latest request, recent exchange, a bounded
+ * first-task anchor, and the latest readable checkpoint. Omitted user, assistant, and tool state
+ * remains canonical in the Runtime; no record is excerpted into a misleading partial message.
  *
  * The previous exchange is included because follow-up questions are the common case and they are
  * the case retrieval handles worst. "Tell me about this book" carries no term to search for, so a
@@ -381,6 +381,16 @@ export function bootstrapContractMessages(
   // Zero Risk drives a chat a person is looking at, and the launcher may reuse it; the previous
   // reply is already on their screen, so carrying it again would only duplicate it.
   if (maxRecentChars <= 0) return withCheckpoint([...instructions, messages[latestTask]!]);
+  // On a cache miss, the attached connector may still have an older frozen action list. For a
+  // short task, carrying canonical dialogue is cheaper and more reliable than betting its facts
+  // on a history tool the model cannot see. Tool results remain on the Runtime side; no record is
+  // clipped to fit. A readable checkpoint replaces the pre-compaction dialogue instead.
+  if (!checkpoint) {
+    const dialogue = messages.filter(message => message.role !== "toolResult");
+    const dialogueChars = dialogue.reduce((total, message) =>
+      total + (message.role === "developer" ? 0 : messageChars(message)), 0);
+    if (dialogueChars <= maxRecentChars) return dialogue;
+  }
   const previous: CodexMessage[] = [];
   let budget = maxRecentChars;
   // The reply that the follow-up is about, then the request that produced it. Tool records in

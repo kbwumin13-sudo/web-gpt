@@ -149,15 +149,18 @@ scope fails closed. An accepted handoff replaces one unresolved physical Send wi
 authorization for a different compaction epoch; the old epoch cannot be submitted again, and an
 unconsumed authorization blocks downgrade to a runtime that does not understand it.
 
-Automatic Full-mode first turns and normal cache misses receive a compact
-`<codex_bootstrap_context_json>` envelope containing the current task message. The omitted canonical
-system/developer/history records remain in the Runtime broker and are retrieved on demand through
+Automatic Full-mode first turns and normal cache misses receive a
+`<codex_bootstrap_context_json>` envelope. When the non-tool dialogue fits the 8,000-character
+bootstrap budget, it carries that complete canonical dialogue. Larger tasks retain the current
+request, previous exchange, a small first-task anchor, and the latest readable checkpoint. Tool
+results and any other omitted records remain in the Runtime broker for on-demand retrieval through
 `codex_context_search` and `codex_context_read`, which are registered connector tools declared
 read-only. The `codex_tool_call` dispatch that carried them before remains as a compatibility path,
 because ChatGPT caches a connector's tool list under its identity and a conversation on the earlier
-schema cannot see a newly attached tool. A new bootstrap also carries the latest readable
-compaction summary in full, so a request such as "continue" does not depend on history retrieval
-to recover its checkpoint. Official encrypted checkpoints are rejected before starting a Web
+schema cannot see a newly attached tool. The installed connector's action snapshot must be checked
+with a real tool receipt before claiming that its model can read omitted history. A new bootstrap
+also carries the latest readable compaction summary in full, so a request such as "continue" does
+not depend on history retrieval to recover its checkpoint. Official encrypted checkpoints are rejected before starting a Web
 turn; continue on the official model or supply a readable summary in a new Web task. Native
 passthrough preserves those encrypted checkpoints unchanged. A retained continuation receives
 `<codex_resume_context_json>`, carrying only the canonical suffix after its last assistant reply
@@ -275,6 +278,9 @@ The DOM still operates the page and supplies a candidate when network attributio
 incomplete. Published text is append-only; a later source that disagrees with its prefix is an
 explicit integrity failure. Privately recorded transcripts remain opt-in, owner-only, and bounded.
 Live traffic counts and comparison categories stay on `/healthz` without conversation text.
+An attributed post-Send tool call may take longer to reach the local broker than an ordinary reply
+takes to render. The single current conversation POST can extend the DOM observation grace to three
+minutes, but this weaker liveness signal never qualifies its text for publication or completion.
 
 ## Memory plane
 

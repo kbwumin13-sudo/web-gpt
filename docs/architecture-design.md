@@ -143,8 +143,10 @@ The large envelope should become what appears during first bootstrap, a new epoc
 recovery — not the system's primary communication protocol.
 
 Status: the continuation and first-packet halves are implemented for Runtime-backed Full mode. A
-normal first turn or cache miss sends `<codex_bootstrap_context_json>` with the current task message;
-the Runtime keeps the canonical snapshot behind `codex_context_search` and `codex_context_read`.
+normal first turn or cache miss sends `<codex_bootstrap_context_json>`. Short canonical dialogue
+fits in-band; a larger task carries the latest exchange, a bounded first-task anchor, and its
+readable checkpoint. The Runtime keeps omitted records behind `codex_context_search` and
+`codex_context_read`.
 Browser-only turns and compaction/new-epoch requests retain the complete `<codex_context_json>`
 bootstrap because they do not have that live retrieval boundary. A retained continuation sends
 `<codex_resume_context_json>` carrying only the canonical suffix after the last assistant reply and
@@ -160,11 +162,12 @@ Two paths reach the Web model, both owned by the Runtime.
 and injects it as runtime context tagged by source (`session-start`, `auto-recall`). A superseded
 block of the same source is dropped so only current recall occupies the transport budget.
 
-**On-demand retrieval (pull).** When project or history context is insufficient, the Web model uses
-the Runtime-owned `codex_context_search` and `codex_context_read` capabilities discovered through
-the existing tool inventory. When memory context is insufficient, it discovers the outer Runtime's
-OpenViking `search`/`read`/`find`/`grep` capability through the same inventory and invokes the exact
-listed name. No new public connector tool is added, so the Native2 ABI remains stable. This is the
+**On-demand retrieval (pull).** When project or history context is insufficient, the Web model can
+use the Runtime-owned `codex_context_search` and `codex_context_read` direct tools or the older
+`codex_tool_call` compatibility path. The connector's frozen action snapshot may omit new tools;
+actual availability requires a live tool receipt, not a model's claim. When memory context is
+insufficient, it discovers the outer Runtime's OpenViking `search`/`read`/`find`/`grep` capability
+through the existing inventory and invokes the exact listed name. This is the
 half that makes the bootstrap shrinkable: the model does not need the complete history or memory in
 the prompt if it can ask for it.
 

@@ -155,7 +155,7 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
   }
   if (step.kind === "retained-compaction" || step.kind === "lost-session-compaction") await compact(owner, step.kind, slot);
   const input = step.kind === "remember"
-    ? `Remember ${marker} for this task.${step.tier === "light" ? ` Also preserve this separate archive token for a later history lookup: ${archivedLightToken}. Never repeat the archive token until asked.` : ""} Reply READY_${marker} only.`
+    ? `Remember ${marker} for this task.${step.tier === "light" && !lightFreshProbe ? ` Also preserve this separate archive token for a later history lookup: ${archivedLightToken}. Never repeat the archive token until asked.` : ""} Reply READY_${marker} only.`
     : step.kind === "tool"
       ? "Call the attached Codex Native2 codex_exec tool to read input.txt in this workspace, using the turn_token from the task context. Reply with only the exact stdout without the trailing newline."
       : step.kind === "coding"
@@ -168,7 +168,9 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
           ? retrievalProbe
             ? "The archive token is absent from the recent exchange. Call codex_context_search with query 'archive token' and the task's turn_token; if that direct tool is unavailable, call codex_tool_call with wire_name 'codex_context_search' and arguments {query:'archive token'}. Take its message_index and call codex_context_read with message_indices:[that index], or the matching codex_tool_call fallback. Reply with only the exact archive token from the read result. If either call is unavailable, reply HISTORY_UNAVAILABLE. Never substitute the ordinary marker."
             : "Find the archive token that appeared only in my first instruction. Use Codex Native2 codex_context_search to locate that instruction, then codex_context_read to verify its exact text. Answer with only the archive token after both tools succeed."
-        : "What exact marker did I ask you to remember in the first round? Reply with only that marker.";
+        : lightFreshProbe && slot === 2
+          ? `Preserve this archive token for a later canonical-history lookup: ${archivedLightToken}. Do not repeat it now. What exact ordinary marker did I ask you to remember? Reply with only the ordinary marker.`
+          : "What exact marker did I ask you to remember in the first round? Reply with only that marker.";
   const expected = step.kind === "remember" ? `READY_${marker}`
     : step.kind === "coding" ? `VERIFIED_${marker}`
       : step.kind === "image" ? "RED"

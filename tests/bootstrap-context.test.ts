@@ -45,10 +45,26 @@ test("a fresh bootstrap retains a small first-task anchor across later exchanges
   ]);
   expect(bodies(selected)).toEqual([
     "Original task archive token: ARCHIVE_72f4.",
+    "Ready.",
     "Read the local file.",
     "The file contains LIME.",
     "What was the original archive token?",
   ]);
+});
+
+test("a short cache miss carries a middle-turn fact without copying tool output", () => {
+  const selected = bootstrapContractMessages([
+    text("user", "Start the task."),
+    text("assistant", "Ready."),
+    text("user", "The archive key is MIDDLE_89ac; do not repeat it yet."),
+    text("assistant", "Saved."),
+    text("user", "Read input.txt."),
+    text("toolResult", "file bytes"),
+    text("assistant", "The file says LIME."),
+    text("user", "What was the archive key?"),
+  ]);
+  expect(bodies(selected)).toContain("The archive key is MIDDLE_89ac; do not repeat it yet.");
+  expect(roles(selected)).not.toContain("toolResult");
 });
 
 test("tool records stay with retrieval, which is where the bulk of a turn belongs", () => {
