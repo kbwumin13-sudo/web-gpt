@@ -114,6 +114,20 @@ interface ProxyProbe {
   backendReady?: boolean;
 }
 
+/** A preserved native gateway may run an older package while its Web backend runs the candidate. */
+export function proxyBuildError(config: Pick<AppConfig, "browserHost" | "releaseVersion">, body: Record<string, unknown>): string | undefined {
+  if (config.browserHost === "launcher") {
+    if (body.version !== config.releaseVersion) return `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}`;
+    return staleDaemonBuild(body.build);
+  }
+  const backend = body.backend_build as { version?: unknown; bundleId?: unknown } | undefined;
+  if (backend === undefined) return undefined; // The backend normally stops when idle.
+  if (backend.version !== config.releaseVersion) {
+    return `Web backend version is ${String(backend.version)}; config requires ${config.releaseVersion}`;
+  }
+  return staleDaemonBuild(backend);
+}
+
 async function proxyCheck(config: AppConfig): Promise<ProxyProbe> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2_000);
@@ -137,12 +151,9 @@ async function proxyCheck(config: AppConfig): Promise<ProxyProbe> {
     if (config.browserHost === "launcher" && body.mode !== config.mode) {
       return fail({ id: "proxy", status: "error", message: `Daemon is running in ${String(body.mode)} mode; config requires ${config.mode}` });
     }
-    if (body.version !== config.releaseVersion) {
-      return fail({ id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` });
-    }
-    const staleDaemon = staleDaemonBuild(body.build);
-    if (staleDaemon) {
-      return fail({ id: "proxy", status: "error", message: "The running daemon predates the installed runtime", detail: staleDaemon });
+    const buildError = proxyBuildError(config, body);
+    if (buildError) {
+      return fail({ id: "proxy", status: "error", message: "The running Web backend differs from the installed runtime", detail: buildError });
     }
     if (config.browserHost === "launcher" && body.accepting_turns !== true) {
       return fail({

@@ -1,9 +1,77 @@
 import { describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
-import { backendServiceDefinition, backendServiceDefinitionMatches, gatewayServiceDefinition, negotiateDrain, waitForPortReleased } from "../src/service";
+import { mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { backendServiceDefinition, backendServiceDefinitionMatches, backendStartupGatePath, gatewayServiceDefinition, negotiateDrain, releaseBackendStartupGate, waitForPortReleased, writeBackendStartupGate } from "../src/service";
 import { defaultConfig } from "../src/config";
+import { armCandidateRuntime, backendCutoverIdle, candidateClosed, candidateRollbackSafe, gatewayCandidateIdentity } from "../scripts/install-local-candidate";
 
 describe("service drain lifecycle", () => {
+  test("candidate gate persists until the matching bundle releases it", () => {
+    const root = mkdtempSync(join(tmpdir(), "candidate-gate-"));
+    const bundle = "a".repeat(64);
+    try {
+      writeBackendStartupGate(bundle, root);
+      expect(JSON.parse(readFileSync(backendStartupGatePath(root), "utf8"))).toEqual({ schemaVersion: 1, bundleId: bundle });
+      expect(() => writeBackendStartupGate(bundle, root)).toThrow("already exists");
+      expect(() => releaseBackendStartupGate("b".repeat(64), root)).toThrow("identity changed");
+      releaseBackendStartupGate(bundle, root);
+      expect(() => readFileSync(backendStartupGatePath(root))).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("gateway prestart observes the closed candidate gate before the stable link changes", () => {
+    const root = mkdtempSync(join(tmpdir(), "candidate-race-"));
+    const link = join(root, "cli");
+    const bundle = "c".repeat(64);
+    try {
+      symlinkSync("old-runtime", link);
+      armCandidateRuntime(link, "new-runtime", bundle, root, () => {}, (path, target) => {
+        // This callback stands in for a gateway prestart at the link replacement boundary.
+        expect(readlinkSync(path)).toBe("old-runtime");
+        expect(JSON.parse(readFileSync(backendStartupGatePath(root), "utf8"))).toEqual({ schemaVersion: 1, bundleId: bundle });
+        symlinkSync(target, `${path}.new`);
+        renameSync(`${path}.new`, path);
+        expect(readlinkSync(path)).toBe("new-runtime");
+        expect(readFileSync(backendStartupGatePath(root), "utf8")).toContain(bundle);
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("candidate is released only after backend and preserved gateway identities agree", () => {
+    const old = "a".repeat(64);
+    const next = "b".repeat(64);
+    const backend = { service: "codex-chatgpt-web", build: { bundleId: next }, accepting_turns: false, deployment_gate: { status: "closed", bundleId: next } };
+    const gateway = { service: "codex-chatgpt-web-gateway", build: { bundleId: old }, backend_build: { bundleId: next }, pid: 123 };
+    expect(candidateClosed(backend, next)).toBeTrue();
+    expect(candidateClosed({ ...backend, accepting_turns: true }, next)).toBeFalse();
+    expect(gatewayCandidateIdentity(gateway, backend, 123, old, next)).toBeTrue();
+    expect(gatewayCandidateIdentity({ ...gateway, pid: 124 }, backend, 123, old, next)).toBeFalse();
+  });
+
+  test("native Codex traffic through the preserved gateway does not block a Web backend cutover", () => {
+    const gateway = { service: "codex-chatgpt-web-gateway", active_requests: 3 };
+    const backend = { service: "codex-chatgpt-web", active_http_turns: 0, active_browser_turns: 0 };
+    expect(backendCutoverIdle(gateway, backend)).toBeTrue();
+    expect(backendCutoverIdle(gateway, { ...backend, active_browser_turns: 1 })).toBeFalse();
+  });
+
+  test("downgrade reads the persisted V1 intent set and fails closed on malformed state", () => {
+    const root = mkdtempSync(join(tmpdir(), "candidate-intents-"));
+    const statePath = join(root, "turn-results.json");
+    try {
+      expect(candidateRollbackSafe(statePath)).toBeFalse();
+      writeFileSync(statePath, JSON.stringify({ version: 1, records: [], intents: [] }));
+      expect(candidateRollbackSafe(statePath)).toBeTrue();
+      writeFileSync(statePath, JSON.stringify({ version: 1, records: [], intents: [{ executionKey: "turn-1", createdAt: 1 }] }));
+      expect(candidateRollbackSafe(statePath)).toBeFalse();
+      writeFileSync(statePath, JSON.stringify({ version: 1, records: [], intents: "redacted" }));
+      expect(candidateRollbackSafe(statePath)).toBeFalse();
+      writeFileSync(statePath, JSON.stringify({ version: 2, records: [], intents: [] }));
+      expect(candidateRollbackSafe(statePath)).toBeFalse();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test("the managed daemon definition starts the Backend Host", () => {
     const definition = backendServiceDefinition(defaultConfig("browser-only"));
     expect(definition).toContain("<string>backend</string>");

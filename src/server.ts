@@ -59,6 +59,7 @@ import type { ProviderAdapter } from "./adapters/base";
 import { buildProvenance } from "./build-provenance";
 import { VERSION } from "./version";
 import { processRunning } from "./process";
+import { backendStartupGateStatus } from "./service";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
@@ -810,7 +811,11 @@ export async function compactRequest(
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
+  dependencies: {
+    fetchUpstream?: NativeFetch;
+    adapterFactory?: ChatGptWebAdapterFactory;
+    backendStartupGateStatus?: () => "open" | "closed" | "invalid";
+  } = {},
 ): BackendServer {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
@@ -825,6 +830,13 @@ export function startServer(
     });
   }
   let draining = false;
+  const deploymentGate = dependencies.backendStartupGateStatus
+    ?? (() => backendStartupGateStatus(buildProvenance().bundleId));
+  if (deploymentGate() === "closed" && config.releaseVersion !== VERSION) {
+    throw new Error("Candidate backend started before its versioned configuration was activated");
+  }
+  const acceptingTurns = () => !draining && deploymentGate() === "open";
+  turnBroker?.setExternalOwnersAccepted(acceptingTurns());
   let shutdownPromise: Promise<void> | undefined;
   let successfulModelCatalogRequests = 0;
   let lastSuccessfulModelCatalogRequestAt: string | null = null;
@@ -863,6 +875,8 @@ export function startServer(
     idleTimeout: 0,
     async fetch(req) {
       const url = new URL(req.url);
+      const gateStatus = deploymentGate();
+      turnBroker?.setExternalOwnersAccepted(!draining && gateStatus === "open");
       if (url.pathname !== "/healthz") lastActivityAt = Date.now();
       if (req.method === "GET" && url.pathname === "/healthz") {
         pruneSessionLeases();
@@ -877,7 +891,8 @@ export function startServer(
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
-          accepting_turns: !draining,
+          accepting_turns: !draining && gateStatus === "open",
+          deployment_gate: { status: gateStatus, ...(buildProvenance().bundleId ? { bundleId: buildProvenance().bundleId } : {}) },
           web_readiness: webReadinessSnapshot(),
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
@@ -945,8 +960,8 @@ export function startServer(
       if (req.method === "POST" && (url.pathname === "/admin/drain" || url.pathname === "/admin/resume")) {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
         draining = url.pathname === "/admin/drain";
-        turnBroker?.setExternalOwnersAccepted(!draining);
-        return Response.json({ status: "ok", accepting_turns: !draining, ...activity() });
+        turnBroker?.setExternalOwnersAccepted(acceptingTurns());
+        return Response.json({ status: "ok", accepting_turns: acceptingTurns(), ...activity() });
       }
       if (req.method === "POST" && url.pathname === "/admin/cancel-turn") {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
@@ -1067,7 +1082,7 @@ export function startServer(
         return Response.json({ status: "ok", accepting_turns: false, ...current });
       }
       if (req.method === "GET" && url.pathname === "/v1/models") {
-        if (draining) {
+        if (!acceptingTurns()) {
           return formatErrorResponse(
             503,
             "server_error",
@@ -1118,7 +1133,7 @@ export function startServer(
         });
       }
       if (req.method === "POST" && url.pathname === "/v1/responses") {
-        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        if (!acceptingTurns()) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           (signal, bindIdentity) => responseRequest(
             new Request(req, { signal }),
@@ -1132,7 +1147,7 @@ export function startServer(
         );
       }
       if (req.method === "POST" && url.pathname === "/v1/responses/compact") {
-        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        if (!acceptingTurns()) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           (signal, bindIdentity) => compactRequest(
             new Request(req, { signal }),
@@ -1146,7 +1161,7 @@ export function startServer(
         );
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
-        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        if (!acceptingTurns()) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),
           req.signal,
@@ -1156,7 +1171,7 @@ export function startServer(
       }
       if (req.method === "POST"
         && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits")) {
-        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        if (!acceptingTurns()) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         const endpoint: NativeImageEndpoint = url.pathname === "/v1/images/generations"
           ? "images/generations"
           : "images/edits";

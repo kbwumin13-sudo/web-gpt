@@ -5,6 +5,11 @@ transport model, the memory contract, the known blockers, and the turn state mac
 design. [architecture.md](architecture.md) describes what the code currently does; where the two
 disagree, this document states the intent and the other states the fact.
 
+The 2026-09-29 implementation tightened the recovery contract: an automatic task whose Send was
+authorized is never submitted again under the same native execution key after an unknown outcome.
+The historical bounded-retained-retry discussion below explains the earlier design and its failure;
+[architecture.md](architecture.md#turn-recovery) records the current behavior and ownership rules.
+
 Designed 2026-09-12 in Codex thread `01a095db-9edf-7881-92ac-24a94f83b8ff`. Each section marks
 implementation status, because several design decisions are deliberately not built yet.
 

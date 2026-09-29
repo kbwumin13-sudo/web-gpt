@@ -251,43 +251,23 @@ Codex commentary.
 
 ## Wire observation
 
-Turn decisions are read from the rendered DOM: whether a submission was accepted, which reply is
-this turn's, whether generation is still running, whether a block is reasoning or the answer,
-whether the turn ended. Each of those is an inference over a private, unversioned presentation
-layer, and each fails silently — a classification error returns an empty answer and raises nothing.
-Measured over this repository's history, the three files holding that logic account for 119 of the
-changes made by fix commits, against 5 for the Zero Risk path, which reads no DOM at all.
+The browser still creates every authenticated ChatGPT request. A page-external CDP observer reads its
+SSE and WebSocket response records without altering page networking. The stream payload is private
+and unversioned: unknown frames, unapplied patches, truncated captures, and ambiguous stream
+ownership are recorded, not interpreted as an answer.
 
-ChatGPT's own client does not infer any of it. It streams each turn over `fetch`, and the facts the
-DOM path derives are fields in that stream. A page-side observer reads the same bytes:
+A network reply belongs to the current turn only after request, conversation, topic and Web turn
+observations agree. The fold keeps visible assistant `commentary` apart from the final user message;
+hidden content, system text, and tool payloads cannot finish a turn. A complete, attributed final
+message can settle before an assistant DOM node appears. The broker's completion fence still has to
+commit before the Runtime accepts it. The network text preserves Markdown and local artifact links
+that the renderer's DOM extraction can omit.
 
-- **Nothing is forged.** The page's client builds and sends every request, so anti-automation
-  tokens, headers, and TLS characteristics remain exactly what ChatGPT produced. This observes
-  traffic; it never synthesises it.
-- **Nothing is perturbed.** The response passes through a `TransformStream` rather than being
-  `clone()`d or `tee()`d. There is no second consumer and therefore no added backpressure:
-  observation happens on the page's own read. A body the page never reads is never observed, which
-  is correct, because those are bytes the user never saw either.
-- **Nothing propagates.** Every observation path is guarded, and the host refuses any record that
-  does not match the expected shape — the binding is an entry point from a remote origin.
-
-Framing is decoded to the WHATWG event-stream rules, which are public and therefore implemented
-exactly. The payload schema above it is private, so it is written to *recognise* rather than to
-assume: a frame matching no known shape becomes an explicit `unrecognized` event naming its keys,
-and a patch the fold cannot apply is counted rather than approximated. `/healthz` reports both
-tallies under `wire_observation`; their target is zero, and a non-zero value names the shape still
-to be understood instead of leaving a wrong answer to be discovered by a user.
-
-The observer currently holds no authority. Every turn is still decided by the DOM path, and the two
-conclusions are compared per turn so the disagreement rate is measured before anything depends on
-it. The comparison is shaped around the failure that motivated it: `dom_empty` — the DOM found
-nothing while the stream carried a reply — is its own outcome rather than part of a generic
-mismatch, because that is the signature of the silent failure. Comparisons record lengths, not text.
-
-Raw transcripts are what turn a live failure into an offline regression test, and are also verbatim
-copies of a conversation. They are therefore written only when `CODEX_CHATGPT_WEB_WIRE_TRANSCRIPTS`
-is set, into an owner-only directory, pruned to a bounded window. The counters need no content and
-are always on.
+The browser worker uses the validated network projection first for final text and visible commentary.
+The DOM still operates the page and supplies a candidate when network attribution or parsing is
+incomplete. Published text is append-only; a later source that disagrees with its prefix is an
+explicit integrity failure. Privately recorded transcripts remain opt-in, owner-only, and bounded.
+Live traffic counts and comparison categories stay on `/healthz` without conversation text.
 
 ## Memory plane
 
@@ -338,48 +318,23 @@ model a write closes a second entry point rather than stopping anything from bei
 
 ## Turn recovery
 
-A browser-reported failure has no authority over state the control plane has already accepted. Three
-decisions follow from one classification in `recovery-policy.ts`, so a new ChatGPT error code is
-handled in one place instead of three: whether to wait for a compaction handoff, whether to retain a
-failed tab, and whether a retained retry is allowed.
+`ChatGptTurnSession` owns one `WebTurnAuthority` for the native execution. Browser and helper events
+carry an execution key, browser epoch and ordered observation sequence. The authority rejects late
+observations from another execution or a retired page, tracks outstanding tool calls, and permits a
+final only after the broker confirms its completion fence. The broker still owns the tool capability,
+real tool queue and atomic activity leases. The Launcher helper reports observations and release
+acknowledgements; it does not own a second completion policy.
 
-- **Compaction handoff.** A structured checkpoint that has crossed the MCP boundary is recorded by a
-  short-lived broker tombstone. A page-terminal error arriving afterwards defers to the checkpoint
-  instead of winning the `Promise.race` and killing the local compact. The external token keeps its
-  one-shot semantics — a second submit still returns invalid/consumed. The grace window covers only
-  upstream errors that can genuinely arrive alongside an MCP submit; timeouts, missing resources,
-  cancellation, and "Stopped thinking" fail immediately.
-- **Post-submit failures.** An unclassified exception after submission is a structured error rather
-  than an automatic dead turn. A turn holding a retained conversation may reconnect, and the retry
-  sends an empty incremental envelope so the accepted prompt is never delivered twice. A turn with no
-  retained conversation still returns a non-retryable error. Only a provably idempotent continuation
-  reconnects; nothing is blindly replayed.
-- **Physical agreement.** The Launcher retains a failed tab only when `retainForRetry` is set and the
-  connector is bound, so the adapter's retryable conclusion and the real ChatGPT session stay
-  consistent. Other failures still release the tab.
-- **Bounded reconnection.** Reconnecting is allowed once. A conversation whose responses keep
-  erroring is not repaired by sending it more messages — each retry only appends another user turn
-  to a chat that answers none of them — so after the allowance is spent the retained conversation is
-  released before the next lease. The Launcher then leases a fresh Temporary Chat, and the worker's
-  existing choice between the continuation prompt and the full bootstrap does the rest. Failing to
-  release costs only the rebuild and leaves the ordinary resume in place, since an unreachable
-  Launcher must not turn a recoverable retry into a dead turn.
+Before an automatic Send, the Runtime durably records its execution intent and acknowledges the
+helper only after that write succeeds. A crash with an intent but no recorded final is an unknown
+outcome, so the same native instruction cannot be submitted again automatically. A completed final
+remains replayable under its exact execution key. Accepted compaction handoffs remain independent of
+a later browser error. A short, tool-free continuation may produce a missing final after completed
+tool results; no new local tool work is authorized in that continuation.
 
-Verification status: confirmed by live logged-in runs on 2026-09-13, including the rebuild path.
-
-The first run established both the recovery and its limit. A transient "Something went wrong" was
-reconnected within one second and the turn completed, and a structured compaction handoff was
-accepted with the next epoch opening on a new conversation. Then the post-compaction turn failed
-three consecutive resumes into one conversation, each within ten seconds, while its user turns grew
-from one to three and its assistant replies stayed at one. Codex spent its retry budget and the task
-ended with no answer.
-
-The second run, after bounding reconnection, hit the same failures at the same points and finished.
-The opening turn failed, resumed, failed again, then released the conversation and rebuilt on a fresh
-one that retrieved context and completed. Compaction was accepted as before. The post-compaction turn
-— the one that had ended the first run — failed once on its new-epoch bootstrap, released, rebuilt,
-and completed. Message sizes distinguish the paths without ambiguity: a resume carried 1,884
-characters against the bootstrap's 3,560, and each rebuild returned to full bootstrap size.
+Logical completion and physical browser release are separate. A release failure preserves a
+published answer but keeps the owner from being replaced until the surface is actually retired.
+This avoids treating a rejected worker promise as proof that its page or Launcher lease disappeared.
 
 ## Installation and service lifecycle
 
@@ -394,8 +349,10 @@ A build says which source produced it. The runtime manifest records the commit, 
 had uncommitted changes, and when the build ran; `/healthz`, `codex-chatgpt-web --build`, `doctor`,
 and the Launcher's first log record of each session all report it. Because a daemon keeps serving
 the build it started with, reinstalling a runtime changes nothing until that process restarts —
-both sides report the bundle they are running, so `doctor` decides that mismatch rather than
-leaving "the fix does not work" indistinguishable from "the fix is not running". The identity lives
+the backend and gateway report their own bundles. `doctor` checks the configured Web backend
+build while a preserved native gateway may intentionally run the preceding package. This keeps a
+candidate backend upgrade from stopping the gateway that carries the current Codex session. The
+identity lives
 in the manifest rather than inside the bundle, because `bundleId` hashes the bundle's own files and
 an embedded timestamp would change that hash on every build; the manifest is excluded from the
 hash, so a build stays reproducible while still naming itself.
@@ -423,6 +380,14 @@ the backend owns both processes after migration. Automatic setup initiated from 
 `managed-chrome`, and login state is stored in the backend browser profile. Codex and the service
 both use the stable `~/.codex-chatgpt-web/bin/codex-chatgpt-web` entry when a packaged runtime is
 available, so runtime upgrades do not require rewriting every command to a versioned directory.
+
+
+The local candidate installer preflights the signed package and previous rollback package, drains
+only Web backend turns, and installs a candidate startup gate before changing the stable CLI link.
+The candidate reports its bundle while refusing new Web turns; after identity checks the installer
+releases the gate. The gateway PID stays in place and continues forwarding native requests. A
+candidate with unresolved Send intents is not downgraded to an older runtime that cannot interpret
+them.
 
 Launcher-owned mode remains as a compatibility path for Zero Risk and other browser surfaces that
 still require the embedded BrowserHost. In that path the launcher remains the process supervisor,

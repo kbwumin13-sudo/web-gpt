@@ -18,6 +18,40 @@ export interface ServiceStatus {
   definitionPath?: string;
 }
 
+/** The backend reads this durable marker before accepting Web turns. The native gateway ignores it. */
+export function backendStartupGatePath(core = getConfigDir()): string {
+  return join(core, "runtime", "backend-startup-gate.json");
+}
+
+export function backendStartupGateStatus(bundleId: string | undefined, core = getConfigDir()): "open" | "closed" | "invalid" {
+  const path = backendStartupGatePath(core);
+  if (!existsSync(path)) return "open";
+  try {
+    const marker = JSON.parse(readFileSync(path, "utf8")) as { schemaVersion?: unknown; bundleId?: unknown };
+    return marker.schemaVersion === 1 && typeof bundleId === "string" && marker.bundleId === bundleId
+      ? "closed" : "invalid";
+  } catch {
+    return "invalid";
+  }
+}
+
+export function writeBackendStartupGate(bundleId: string, core = getConfigDir()): void {
+  if (!/^[a-f0-9]{64}$/.test(bundleId)) throw new Error("Invalid candidate bundle ID");
+  const path = backendStartupGatePath(core);
+  if (existsSync(path)) throw new Error(`Backend startup gate already exists: ${path}`);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  atomicWriteFile(path, `${JSON.stringify({ schemaVersion: 1, bundleId })}\n`, { mode: 0o600 });
+}
+
+export function releaseBackendStartupGate(bundleId: string, core = getConfigDir()): void {
+  const path = backendStartupGatePath(core);
+  const marker = JSON.parse(readFileSync(path, "utf8")) as { schemaVersion?: unknown; bundleId?: unknown };
+  if (marker.schemaVersion !== 1 || marker.bundleId !== bundleId) {
+    throw new Error("Backend startup gate identity changed; refusing to release it");
+  }
+  rmSync(path);
+}
+
 function xml(value: string): string {
   return value
     .replaceAll("&", "&amp;")

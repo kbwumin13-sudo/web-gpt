@@ -205,6 +205,7 @@ writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
   schemaVersion: 2,
   appVersion: VERSION,
   bundleId: bundleIdFor(files),
+  deploymentGate: "backend-file-v1",
   build: readWorkingTreeIdentity(root),
   bunVersion: Bun.version,
   platform: process.platform,

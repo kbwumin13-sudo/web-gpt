@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { defaultConfig } from "../src/config";
+import { proxyBuildError } from "../src/doctor";
 import { augmentNativeModelCatalog } from "../src/model-catalog";
 import {
   catalogMatchesExpected,
@@ -7,6 +8,20 @@ import {
   expectedWebModels,
   publishedWebCatalogEvidence,
 } from "../src/readiness";
+
+test("doctor compares candidate backend separately from preserved native gateway", () => {
+  const config = defaultConfig("browser-only");
+  config.releaseVersion = "5.0.7-local.65";
+  expect(proxyBuildError(config, {
+    version: "5.0.7-local.64",
+    build: { version: "5.0.7-local.64", bundleId: "a".repeat(64) },
+    backend_build: { version: config.releaseVersion },
+  })).toBeUndefined();
+  expect(proxyBuildError(config, {
+    version: "5.0.7-local.64",
+    backend_build: { version: "5.0.7-local.64" },
+  })).toContain("Web backend version");
+});
 
 test("catalog readiness requires the exact Web rows and fixed effort contract", () => {
   const config = defaultConfig("full");

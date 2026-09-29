@@ -48,9 +48,18 @@ const config = loadConfig();
 const executable = process.env.CODEX_APP_SERVER_EXECUTABLE?.trim() || Bun.which("codex") || resolve("/Applications/ChatGPT.app/Contents/Resources/codex");
 const backendUrl = `http://${config.host}:${config.port}/healthz`;
 const gatewayUrl = `http://${config.host}:${config.nativeGatewayPort}/healthz`;
-const gateway = await (await fetch(gatewayUrl, { signal: AbortSignal.timeout(3_000) })).json() as { build?: { bundleId?: string; version?: string } };
-const bundleId = gateway.build?.bundleId;
-if (!bundleId || gateway.build?.version !== config.releaseVersion) throw new Error("Gateway and installed version mismatch");
+const gateway = await (await fetch(gatewayUrl, { signal: AbortSignal.timeout(3_000) })).json() as {
+  build?: { bundleId?: string }; backend_build?: { bundleId?: string };
+};
+const backend = await (await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) })).json() as {
+  build?: { bundleId?: string; version?: string };
+};
+const gatewayBundleId = gateway.build?.bundleId;
+const bundleId = backend.build?.bundleId;
+if (!gatewayBundleId || !bundleId || backend.build?.version !== config.releaseVersion
+  || gateway.backend_build?.bundleId !== bundleId) {
+  throw new Error("Gateway route and installed backend candidate identity mismatch");
+}
 const markers: Record<Tier, string> = {
   light: "STABILITY_LIME_618", medium: "STABILITY_COBALT_527",
   high: "STABILITY_GARNET_904", "extra-high": "STABILITY_IVORY_263",
@@ -60,7 +69,8 @@ type Owner = { client: AppServerClient; threadId: string; workspace: string; tie
 const owners = new Map<Tier, Owner>();
 let passed = 0;
 const beganAt = Date.now();
-record({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion, bundle_id: bundleId, expected_rounds: EXPECTED_ROUNDS, duration_minutes: 120 });
+record({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion,
+  bundle_id: bundleId, gateway_bundle_id: gatewayBundleId, expected_rounds: EXPECTED_ROUNDS, duration_minutes: 120 });
 
 async function backendMetrics(): Promise<{ delivered: number; fresh_rounds: number; failed: number; abandoned: number }> {
   const response = await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) });
@@ -186,7 +196,12 @@ try {
     throw new Error(`Stability run ended early: passed=${passed}, elapsedMs=${Date.now() - beganAt}`);
   }
   const finalGateway = await (await fetch(gatewayUrl)).json() as { build?: { bundleId?: string } };
-  if (finalGateway.build?.bundleId !== bundleId) throw new Error("Gateway bundle identity changed during stability run");
+  const finalBackend = await (await fetch(backendUrl)).json() as { build?: { bundleId?: string } };
+  if (finalGateway.build?.bundleId !== gatewayBundleId
+    || (finalGateway as { backend_build?: { bundleId?: string } }).backend_build?.bundleId !== bundleId
+    || finalBackend.build?.bundleId !== bundleId) {
+    throw new Error("Gateway or candidate backend identity changed during stability run");
+  }
 } catch (error) {
   failure = error;
 } finally {

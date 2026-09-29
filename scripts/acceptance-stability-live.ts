@@ -32,13 +32,24 @@ if (args.includes("--plan")) {
 if (!args.includes("--run")) throw new Error("Pass --plan or --run; live acceptance never starts implicitly");
 const config = loadConfig();
 const gatewayUrl = `http://${config.host}:${config.nativeGatewayPort}/healthz`;
-const health = await (await fetch(gatewayUrl, { signal: AbortSignal.timeout(3_000) })).json() as { build?: { bundleId?: string; version?: string } };
-const bundleId = health.build?.bundleId;
-if (!bundleId || health.build?.version !== config.releaseVersion) throw new Error("Installed gateway identity does not match configuration");
+const backendUrl = `http://${config.host}:${config.port}/healthz`;
+const health = await (await fetch(gatewayUrl, { signal: AbortSignal.timeout(3_000) })).json() as {
+  build?: { bundleId?: string }; backend_build?: { bundleId?: string };
+};
+const backend = await (await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) })).json() as {
+  build?: { bundleId?: string; version?: string };
+};
+const gatewayBundleId = health.build?.bundleId;
+const bundleId = backend.build?.bundleId;
+if (!gatewayBundleId || !bundleId || backend.build?.version !== config.releaseVersion
+  || health.backend_build?.bundleId !== bundleId) {
+  throw new Error("Installed backend identity does not match the configured candidate and gateway route");
+}
 mkdirSync(dirname(record), { recursive: true, mode: 0o700 });
 const write = (event: Record<string, unknown>): void => appendFileSync(record, `${JSON.stringify(event)}\n`, { mode: 0o600 });
 const beganAt = Date.now();
-write({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion, bundle_id: bundleId, expected_rounds: expectedRounds, duration_minutes: 120 });
+write({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion,
+  bundle_id: bundleId, gateway_bundle_id: gatewayBundleId, expected_rounds: expectedRounds, duration_minutes: 120 });
 let completedRounds = 0;
 
 async function runRound(round: Round, slot: number): Promise<void> {
@@ -86,7 +97,12 @@ try {
     throw new Error(`Stability gate ended early: rounds=${completedRounds}, elapsedMs=${Date.now() - beganAt}`);
   }
   const finalHealth = await (await fetch(gatewayUrl, { signal: AbortSignal.timeout(3_000) })).json() as { build?: { bundleId?: string } };
-  if (finalHealth.build?.bundleId !== bundleId) throw new Error("Gateway bundle identity changed during the stability window");
+  const finalBackend = await (await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) })).json() as { build?: { bundleId?: string } };
+  if (finalHealth.build?.bundleId !== gatewayBundleId
+    || (finalHealth as { backend_build?: { bundleId?: string } }).backend_build?.bundleId !== bundleId
+    || finalBackend.build?.bundleId !== bundleId) {
+    throw new Error("Gateway or candidate backend identity changed during the stability window");
+  }
   write({ type: "complete", at: new Date().toISOString(), passed_rounds: completedRounds, elapsed_ms: Date.now() - beganAt, bundle_id: bundleId });
   process.stdout.write(`STABILITY_LIVE_OK rounds=${completedRounds} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);
 } catch (error) {

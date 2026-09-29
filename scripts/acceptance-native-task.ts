@@ -1,0 +1,78 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { loadConfig } from "../src/config";
+import { AppServerClient } from "./smoke-installed";
+import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-evidence";
+
+if (!process.argv.includes("--run")) throw new Error("Pass --run to perform the installed native-tool task");
+const config = loadConfig();
+const backend = await (await fetch(`http://${config.host}:${config.port}/healthz`, {
+  signal: AbortSignal.timeout(3_000),
+})).json() as { build?: { bundleId?: string; version?: string } };
+const bundleId = backend.build?.bundleId;
+if (!bundleId || backend.build?.version !== config.releaseVersion) {
+  throw new Error("Installed backend identity does not match the configured candidate");
+}
+const executable = process.env.CODEX_APP_SERVER_EXECUTABLE?.trim()
+  || Bun.which("codex") || resolve("/Applications/ChatGPT.app/Contents/Resources/codex");
+if (!existsSync(executable)) throw new Error(`Codex app-server executable is missing: ${executable}`);
+const workspace = resolve("output", `native-task-${config.releaseVersion}`);
+if (existsSync(workspace)) throw new Error(`Acceptance workspace already exists: ${workspace}`);
+mkdirSync(workspace, { recursive: true, mode: 0o700 });
+writeFileSync(join(workspace, "input.csv"), "name,score\nAda,14\nBo,21\nCy,9\nDi,31\nEve,10\n", { mode: 0o600 });
+const client = new AppServerClient(executable);
+let threadId: string | undefined;
+let turnId: string | undefined;
+let stderr = "";
+try {
+  await client.request("initialize", { clientInfo: { name: "codex-web-native-task-acceptance", version: "1" },
+    capabilities: { experimentalApi: true } });
+  client.notify("initialized");
+  const started = await client.request("thread/start", { cwd: workspace, model: "chatgpt-web/light",
+    approvalPolicy: "never", sandbox: "workspace-write", ephemeral: true }) as { thread?: { id?: unknown } };
+  if (typeof started.thread?.id !== "string") throw new Error("Native task has no thread ID");
+  threadId = started.thread.id;
+  const prompt = [
+    "Complete this local file-processing task through the attached Codex Native2 tools. Use the current Runtime turn token.",
+    "Make at least TEN SEPARATE real tool calls during this single turn; each numbered step must be a separate call,",
+    "and do not combine shell commands or claim success from chat alone. Work only in this workspace.",
+    "1. Print the working directory. 2. List the workspace. 3. Read input.csv.",
+    "4. Create process.py that reads input.csv and writes result.json with the score total and descending names.",
+    "5. Read process.py. 6. Run process.py. 7. Read result.json. 8. Run a programmatic assertion that",
+    "the total is 85 and names are Di,Bo,Ada,Eve,Cy. 9. Compute the SHA-256 of result.json.",
+    "10. List both output files. You may make further separate calls if needed.",
+    "Reply DONE_85 only after the script ran, assertion passed, and both files exist.",
+  ].join("\n");
+  const turn = await client.request("turn/start", { threadId,
+    input: [{ type: "text", text: prompt }] }) as { turn?: { id?: unknown } };
+  if (typeof turn.turn?.id !== "string") throw new Error("Native task has no turn ID");
+  turnId = turn.turn.id;
+  const evidence = new InstalledTurnEvidence(threadId, turnId);
+  await client.waitForTurn(evidence, 600_000);
+  const outcome = evidence.outcome();
+  const successfulCommands = outcome.toolItems.filter(item => item.type === "commandExecution"
+    && item.status === "completed" && item.exitCode === 0);
+  const result = JSON.parse(readFileSync(join(workspace, "result.json"), "utf8")) as {
+    total?: unknown; names?: unknown;
+  };
+  const validResult = result.total === 85
+    && Array.isArray(result.names) && result.names.join(",") === "Di,Bo,Ada,Eve,Cy";
+  if (outcome.status !== "completed" || visibleFinalText(outcome.answer) !== "DONE_85"
+    || successfulCommands.length < 10 || !existsSync(join(workspace, "process.py")) || !validResult) {
+    throw new Error(`Installed native task failed: status=${outcome.status}, commands=${successfulCommands.length}, validResult=${validResult}, answer=${JSON.stringify(outcome.answer.slice(0, 120))}`);
+  }
+  const resultBytes = readFileSync(join(workspace, "result.json"));
+  const report = {
+    status: "passed", version: config.releaseVersion, bundle_id: bundleId, thread_id: threadId, turn_id: turnId,
+    successful_tool_calls: successfulCommands.length, result_sha256: createHash("sha256").update(resultBytes).digest("hex"),
+    artifact: join(workspace, "result.json"),
+  };
+  writeFileSync(join(workspace, "acceptance.json"), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+  process.stdout.write(`NATIVE_TASK_OK ${JSON.stringify(report)}\n`);
+} finally {
+  stderr = await client.close();
+  if (/stream disconnected - retrying sampling request/.test(stderr)) {
+    throw new Error(`Native task required an implicit sampling retry (thread=${threadId}, turn=${turnId})`);
+  }
+}

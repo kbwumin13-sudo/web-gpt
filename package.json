@@ -1,6 +1,6 @@
 {
   "name": "codex-chatgpt-web",
-  "version": "5.0.7-local.64",
+  "version": "5.0.7-local.65",
   "private": true,
   "description": "A focused local Responses bridge that runs Codex tasks through a user-authenticated ChatGPT web session.",
   "repository": {
@@ -77,7 +77,7 @@
   },
   "overrides": {
     "@hono/node-server": "2.0.12",
-    "fast-uri": "3.1.6",
+    "fast-uri": "3.1.7",
     "hono": "4.13.5",
     "qs": "6.16.0",
     "zod-to-json-schema": "3.25.1"

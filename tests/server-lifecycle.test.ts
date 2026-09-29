@@ -20,6 +20,33 @@ test("DEV harness configuration cannot bind a Responses listener", () => {
   expect(() => startServer(config)).toThrow("cannot start a Responses listener");
 });
 
+test("a closed startup gate rejects Web work until the candidate is released", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  let gate: "open" | "closed" = "closed";
+  const server = startServer(config, { backendStartupGateStatus: () => gate });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  try {
+    const closedHealth = await (await fetch(`${endpoint}/healthz`)).json() as Record<string, unknown>;
+    expect(closedHealth).toMatchObject({ accepting_turns: false, deployment_gate: { status: "closed" } });
+    expect((await fetch(`${endpoint}/v1/responses`, { method: "POST", body: "{}" })).status).toBe(503);
+    const resume = await fetch(`${endpoint}/admin/resume`, {
+      method: "POST", headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    expect(await resume.json()).toMatchObject({ accepting_turns: false });
+    gate = "open";
+    const openHealth = await (await fetch(`${endpoint}/healthz`)).json() as Record<string, unknown>;
+    expect(openHealth).toMatchObject({ accepting_turns: true, deployment_gate: { status: "open" } });
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("a candidate prestarted during link activation refuses a stale configuration", () => {
+  const config = { ...defaultConfig("browser-only"), port: 0, releaseVersion: "previous-package" };
+  expect(() => startServer(config, { backendStartupGateStatus: () => "closed" }))
+    .toThrow("before its versioned configuration was activated");
+});
+
 test("managed browser compaction uses a fresh checkpoint without a launcher surface", () => {
   expect(structuredCompactionMode({
     manualRequest: false,

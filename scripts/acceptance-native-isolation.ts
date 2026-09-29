@@ -17,9 +17,11 @@ const beforeBackend = await health(backendUrl);
 if (beforeGateway.active_requests !== 0 || beforeBackend.active_http_turns !== 0 || beforeBackend.active_browser_turns !== 0) {
   throw new Error("Native isolation acceptance requires idle gateway and backend turns");
 }
-const bundleId = (beforeGateway.build as { bundleId?: string } | undefined)?.bundleId;
-if (!bundleId || (beforeBackend.build as { bundleId?: string } | undefined)?.bundleId !== bundleId) {
-  throw new Error("Installed gateway/backend identity mismatch before native isolation acceptance");
+const gatewayBundleId = (beforeGateway.build as { bundleId?: string } | undefined)?.bundleId;
+const bundleId = (beforeBackend.build as { bundleId?: string } | undefined)?.bundleId;
+if (!gatewayBundleId || !bundleId
+  || (beforeGateway.backend_build as { bundleId?: string } | undefined)?.bundleId !== bundleId) {
+  throw new Error("Installed gateway route does not point to the candidate backend before native isolation acceptance");
 }
 await stopService(config);
 const stopped = await health(gatewayUrl);
@@ -74,7 +76,9 @@ if (rejected.status !== "failed" || !rejected.error?.message?.includes("requires
   throw new Error("Malformed Web route was not safely rejected before browser execution");
 }
 const resumed = await health(gatewayUrl);
-if (resumed.backend_ready !== true || (resumed.backend_build as { bundleId?: string } | undefined)?.bundleId !== bundleId) {
+if (resumed.backend_ready !== true
+  || (resumed.build as { bundleId?: string } | undefined)?.bundleId !== gatewayBundleId
+  || (resumed.backend_build as { bundleId?: string } | undefined)?.bundleId !== bundleId) {
   throw new Error("On-demand Web backend did not restore the installed bundle identity");
 }
 process.stdout.write(`NATIVE_ISOLATION_OK ${JSON.stringify({ bundle_id: bundleId, native_answer: answer, native_events: events.length, web_backend_stopped_for_native: true, on_demand_backend_started: true })}\n`);
