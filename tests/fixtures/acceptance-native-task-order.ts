@@ -9,6 +9,7 @@ let workspace = "";
 mock.module(`${repo}/src/config.ts`, () => ({ atomicWriteFile: (path: string, data: string) => writeFileSync(path, data), loadConfig: () => ({
   host: "127.0.0.1", port: 1, releaseVersion: "probe",
 }) }));
+mock.module(`${repo}/src/service.ts`, () => ({ startService() {}, async waitForBackendReady() {} }));
 mock.module(`${repo}/scripts/smoke-installed.ts`, () => ({ AppServerClient: class {
   async request(method: string, args: { cwd?: string } = {}) {
     if (method === "thread/start") { workspace = args.cwd!; return { thread: { id: "thread-probe" } }; }
@@ -19,17 +20,20 @@ mock.module(`${repo}/scripts/smoke-installed.ts`, () => ({ AppServerClient: clas
   async waitForTurn(evidence: { observe(value: unknown): void }, _timeout: number,
     onNotification: (value: unknown) => void) {
     mkdirSync(workspace, { recursive: true });
-    writeFileSync(join(workspace, "result.json"), JSON.stringify({ total: 85, names: ["Di", "Bo", "Ada", "Eve", "Cy"] }));
+    writeFileSync(join(workspace, "result.json"), JSON.stringify({ score_total: 85, names: ["Di", "Bo", "Ada", "Eve", "Cy"] }));
     writeFileSync(join(workspace, "process.py"), "# synthetic probe\n");
     onNotification({ method: "item/completed", params: { threadId: "thread-probe", turnId: "turn-probe",
       item: { type: "agentMessage", phase: "commentary" } } });
-    for (let index = 0; index < 10; index += 1) onNotification({ method: "item/completed",
+    for (let index = 0; index < 9; index += 1) onNotification({ method: "item/completed",
       params: { threadId: "thread-probe", turnId: "turn-probe", item: { type: "commandExecution" } } });
+    onNotification({ method: "item/completed", params: { threadId: "thread-probe", turnId: "turn-probe",
+      item: { type: "fileChange" } } });
     onNotification({ method: "item/completed", params: { threadId: "thread-probe", turnId: "turn-probe",
       item: { type: "agentMessage", phase: "commentary" } } });
     evidence.observe({ method: "turn/completed", params: {
       threadId: "thread-probe", turn: { id: "turn-probe", status: "completed", items: [
-        ...Array.from({ length: 10 }, (_, i) => ({ id: `command-${i}`, type: "commandExecution", status: "completed", exitCode: 0 })),
+        ...Array.from({ length: 9 }, (_, i) => ({ id: `command-${i}`, type: "commandExecution", status: "completed", exitCode: 0 })),
+        { id: "patch", type: "fileChange", status: "completed" },
         { id: "final", type: "agentMessage", phase: "final",
           text: `DONE_85\n[result.json](<${join(workspace, "result.json")}>)` },
       ] },

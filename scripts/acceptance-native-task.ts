@@ -2,11 +2,14 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { atomicWriteFile, loadConfig } from "../src/config";
+import { startService, waitForBackendReady } from "../src/service";
 import { AppServerClient } from "./smoke-installed";
 import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-evidence";
 
 if (!process.argv.includes("--run")) throw new Error("Pass --run to perform the installed native-tool task");
 const config = loadConfig();
+startService();
+await waitForBackendReady(config);
 const backend = await (await fetch(`http://${config.host}:${config.port}/healthz`, {
   signal: AbortSignal.timeout(3_000),
 })).json() as { build?: { bundleId?: string; version?: string } };
@@ -17,7 +20,10 @@ if (!bundleId || backend.build?.version !== config.releaseVersion) {
 const executable = process.env.CODEX_APP_SERVER_EXECUTABLE?.trim()
   || Bun.which("codex") || resolve("/Applications/ChatGPT.app/Contents/Resources/codex");
 if (!existsSync(executable)) throw new Error(`Codex app-server executable is missing: ${executable}`);
-const workspace = resolve("output", `native-task-${config.releaseVersion}`);
+const recordFlag = process.argv.indexOf("--record-dir");
+if (recordFlag >= 0 && (!process.argv[recordFlag + 1]
+  || process.argv[recordFlag + 1]!.startsWith("--"))) throw new Error("--record-dir requires a path");
+const workspace = resolve(recordFlag >= 0 ? process.argv[recordFlag + 1]! : join("output", `native-task-${config.releaseVersion}`));
 if (existsSync(workspace)) throw new Error(`Acceptance workspace already exists: ${workspace}`);
 mkdirSync(workspace, { recursive: true, mode: 0o700 });
 writeFileSync(join(workspace, "input.csv"), "name,score\nAda,14\nBo,21\nCy,9\nDi,31\nEve,10\n", { mode: 0o600 });
@@ -60,17 +66,20 @@ try {
     if (notification.method !== "item/completed") return;
     if (params.item?.type === "agentMessage" && params.item.phase === "commentary") {
       timeline.push({ kind: "commentary", elapsed_ms: Date.now() - startedAt });
-    } else if (params.item?.type === "commandExecution") {
+    } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(String(params.item?.type))) {
       timeline.push({ kind: "tool", elapsed_ms: Date.now() - startedAt });
     }
   });
   const outcome = evidence.outcome();
   const successfulCommands = outcome.toolItems.filter(item => item.type === "commandExecution"
     && item.status === "completed" && item.exitCode === 0);
+  const successfulToolItems = outcome.toolItems.filter(item =>
+    (item.type === "commandExecution" && item.status === "completed" && item.exitCode === 0)
+    || (["fileChange", "mcpToolCall"].includes(String(item.type)) && item.status === "completed"));
   const result = JSON.parse(readFileSync(join(workspace, "result.json"), "utf8")) as {
-    total?: unknown; names?: unknown;
+    total?: unknown; score_total?: unknown; names?: unknown;
   };
-  const validResult = result.total === 85
+  const validResult = (result.total ?? result.score_total) === 85
     && Array.isArray(result.names) && result.names.join(",") === "Di,Bo,Ada,Eve,Cy";
   const answer = visibleFinalText(outcome.answer);
   const expectedLink = `[result.json](<${join(workspace, "result.json")}>)`;
@@ -82,13 +91,14 @@ try {
     && commentary.some(at => at >= lastTool);
   if (outcome.status !== "completed" || !answer.startsWith("DONE_85")
     || !answer.includes(expectedLink) || !progressOrdered
-    || successfulCommands.length < 10 || !existsSync(join(workspace, "process.py")) || !validResult) {
-    throw new Error(`Installed native task failed: status=${outcome.status}, commands=${successfulCommands.length}, validResult=${validResult}, progressOrdered=${progressOrdered}, answer=${JSON.stringify(outcome.answer.slice(0, 120))}`);
+    || successfulToolItems.length < 10 || !existsSync(join(workspace, "process.py")) || !validResult) {
+    throw new Error(`Installed native task failed: status=${outcome.status}, toolItems=${successfulToolItems.length}, commands=${successfulCommands.length}, validResult=${validResult}, progressOrdered=${progressOrdered}, answer=${JSON.stringify(outcome.answer.slice(0, 120))}`);
   }
   const resultBytes = readFileSync(join(workspace, "result.json"));
   passedReport = {
     status: "passed", version: config.releaseVersion, bundle_id: bundleId, thread_id: threadId, turn_id: turnId,
-    successful_tool_calls: successfulCommands.length, result_sha256: createHash("sha256").update(resultBytes).digest("hex"),
+    successful_tool_calls: successfulToolItems.length, successful_commands: successfulCommands.length,
+    result_sha256: createHash("sha256").update(resultBytes).digest("hex"),
     artifact: join(workspace, "result.json"), final_link: expectedLink,
     commentary_elapsed_ms: commentary, first_tool_elapsed_ms: firstTool, last_tool_elapsed_ms: lastTool,
   };
