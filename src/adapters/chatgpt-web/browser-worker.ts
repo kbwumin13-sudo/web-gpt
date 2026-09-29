@@ -132,6 +132,9 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
 }
 
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
+// A network-attributed tool call can wait for ChatGPT's connector service before it reaches the
+// local broker. During that interval neither a DOM assistant node nor broker progress exists.
+const CHATGPT_WIRE_TOOL_DOM_GRACE_MS = 180_000;
 /** An ordinary reply binds its turn within seconds; an agentic one gets its first step by then. */
 const CHATGPT_UNBOUND_TURN_DIAGNOSTIC_MS = 20_000;
 /**
@@ -3269,6 +3272,7 @@ export class ChatGptBrowserWorker {
     wireComplete?: () => boolean,
     toolBoundaryObserved?: (revision: number) => void,
     wireCommentary?: () => void,
+    wireToolCallObserved?: () => boolean,
   ): Promise<ChatGptAssistantTurnBinding> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3299,7 +3303,8 @@ export class ChatGptBrowserWorker {
       if (Number.isFinite(lastActivityAt)) {
         responseDeadline = Math.min(
           deadline ?? Number.POSITIVE_INFINITY,
-          Math.max(responseDeadline, lastActivityAt + graceMs),
+          Math.max(responseDeadline, lastActivityAt
+            + (wireToolCallObserved?.() ? Math.max(graceMs, CHATGPT_WIRE_TOOL_DOM_GRACE_MS) : graceMs)),
         );
       }
       if (deadline !== undefined && Date.now() >= deadline) {
@@ -5474,6 +5479,7 @@ export class ChatGptBrowserWorker {
           () => completedWireAnswer() !== undefined,
           revision => reportBrowserFact({ type: "tool_boundary_observed", revision }),
           emitNetworkCommentary,
+          () => wireShadow.pendingToolCallSinceSend(),
         );
       } finally {
         clearTimeout(unboundTurnDiagnostic);

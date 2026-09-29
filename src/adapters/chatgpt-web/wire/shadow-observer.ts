@@ -323,6 +323,21 @@ export class ChatGptWireShadowSession {
     return this.lastTurnFrameAt;
   }
 
+  /**
+   * Bounded liveness hint only. A tool call on the single POST opened after this Send can spend
+   * longer at ChatGPT's connector service than the ordinary DOM grace. This does not qualify its
+   * text for publication; currentObservation() retains the stricter input/conversation binding.
+   */
+  pendingToolCallSinceSend(): boolean {
+    if (!this.attached || !this.requestIdsBeforeSend) return false;
+    const candidates = this.conversationStreams();
+    if (candidates.length !== 1) return false;
+    const observation = observeWireStream(candidates[0]!);
+    if (observation.error || observation.endedTurn || observation.toolCallCount === 0) return false;
+    return !this.expectedInputMessageId || observation.inputMessageIds.length === 0
+      || observation.inputMessageIds.includes(this.expectedInputMessageId);
+  }
+
   isAttached(): boolean {
     return this.attached;
   }

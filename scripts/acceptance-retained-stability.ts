@@ -1,5 +1,5 @@
 import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { requireChatGptWebModelRoute } from "../src/chatgpt-web-models";
@@ -10,9 +10,13 @@ import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-eviden
 import { acceptanceRedSquarePng } from "./acceptance-fixtures";
 
 type Tier = "light" | "medium" | "high" | "extra-high";
-type Kind = "remember" | "recall" | "retrieval" | "tool" | "coding" | "image" | "retained-compaction" | "lost-session-compaction";
+type Kind = "remember" | "recall" | "model-switch" | "retrieval" | "tool" | "coding" | "image" | "retained-compaction" | "lost-session-compaction";
 type Step = { tier: Tier; kind: Kind; ownerTier?: Tier };
-const slots: Step[][] = [
+const args = process.argv.slice(2);
+const retrievalProbe = args.includes("--probe-retrieval");
+const lightFreshProbe = args.includes("--probe-light-fresh");
+if (lightFreshProbe && !retrievalProbe) throw new Error("--probe-light-fresh requires --probe-retrieval");
+const stabilitySlots: Step[][] = [
   [{ tier: "light", kind: "remember" }],
   [{ tier: "medium", kind: "remember" }],
   [{ tier: "high", kind: "remember" }],
@@ -21,7 +25,7 @@ const slots: Step[][] = [
   [{ tier: "medium", kind: "coding" }],
   [{ tier: "high", kind: "image" }, { tier: "light", kind: "recall" }],
   [{ tier: "extra-high", kind: "tool" }, { tier: "medium", kind: "recall" }],
-  [{ tier: "high", kind: "retrieval", ownerTier: "light" }],
+  [{ tier: "high", kind: "model-switch", ownerTier: "light" }],
   [{ tier: "extra-high", kind: "recall" }],
   [{ tier: "light", kind: "recall" }, { tier: "medium", kind: "recall" }],
   [{ tier: "medium", kind: "retained-compaction" }],
@@ -30,16 +34,20 @@ const slots: Step[][] = [
   [{ tier: "medium", kind: "recall" }],
   [{ tier: "high", kind: "lost-session-compaction" }],
 ];
-const EXPECTED_ROUNDS = 20;
-const DURATION_MS = 120 * 60_000;
-const SLOT_GAP_MS = DURATION_MS / (slots.length - 1);
-if (slots.flat().length !== EXPECTED_ROUNDS) throw new Error("Retained stability plan must contain exactly 20 turns");
-const args = process.argv.slice(2);
+const slots: Step[][] = retrievalProbe
+  ? [[{ tier: "light", kind: "remember" }], [{ tier: "light", kind: "recall" }],
+    [{ tier: "light", kind: "tool" }],
+    [{ tier: lightFreshProbe ? "light" : "high", kind: "retrieval", ownerTier: "light" }]]
+  : stabilitySlots;
+const EXPECTED_ROUNDS = retrievalProbe ? 4 : 20;
+const DURATION_MS = retrievalProbe ? 0 : 120 * 60_000;
+const SLOT_GAP_MS = retrievalProbe ? 0 : DURATION_MS / (slots.length - 1);
+if (slots.flat().length !== EXPECTED_ROUNDS) throw new Error("Acceptance plan has the wrong turn count");
 if (args.includes("--plan")) {
-  process.stdout.write(`${JSON.stringify({ minutes: 120, rounds: EXPECTED_ROUNDS, slots }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ minutes: DURATION_MS / 60_000, rounds: EXPECTED_ROUNDS, slots }, null, 2)}\n`);
   process.exit(0);
 }
-if (!args.includes("--run")) throw new Error("Pass --plan or --run");
+if (!args.includes("--run") && !retrievalProbe) throw new Error("Pass --plan, --run, or --probe-retrieval");
 const recordFlag = args.indexOf("--record");
 const recordPath = resolve(recordFlag >= 0 ? args[recordFlag + 1] ?? "" : "output/web-recovery-retained-stability.jsonl");
 if (recordFlag >= 0 && (!args[recordFlag + 1] || args[recordFlag + 1]!.startsWith("--"))) throw new Error("--record requires a path");
@@ -67,12 +75,16 @@ const markers: Record<Tier, string> = {
   light: "STABILITY_LIME_618", medium: "STABILITY_COBALT_527",
   high: "STABILITY_GARNET_904", "extra-high": "STABILITY_IVORY_263",
 };
+// This value appears only in the first Light instruction. A later model switch must retrieve it
+// from canonical history; the ordinary marker is repeated in nearby answers and proves nothing.
+const archivedLightToken = `STABILITY_ARCHIVE_${randomBytes(12).toString("hex")}`;
 type Owner = { client: AppServerClient; threadId: string; workspace: string; tier: Tier };
 const owners = new Map<Tier, Owner>();
 let passed = 0;
 const beganAt = Date.now();
 record({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion,
-  bundle_id: bundleId, gateway_bundle_id: gatewayBundleId, expected_rounds: EXPECTED_ROUNDS, duration_minutes: 120 });
+  bundle_id: bundleId, gateway_bundle_id: gatewayBundleId, expected_rounds: EXPECTED_ROUNDS,
+  duration_minutes: DURATION_MS / 60_000, retrieval_probe: retrievalProbe });
 
 async function backendMetrics(): Promise<{ delivered: number; fresh_rounds: number; failed: number; abandoned: number }> {
   const response = await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) });
@@ -126,21 +138,41 @@ async function compact(owner: Owner, kind: "retained-compaction" | "lost-session
 async function runStep(step: Step, slot: number, concurrent: boolean): Promise<void> {
   const owner = await ownerFor(step.ownerTier ?? step.tier);
   const marker = markers[owner.tier];
+  if (lightFreshProbe && step.kind === "retrieval") {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const health = await (await fetch(backendUrl)).json() as {
+        active_http_turns?: number; active_browser_turns?: number;
+      };
+      if (health.active_http_turns === 0 && health.active_browser_turns === 0) break;
+      if (Date.now() >= deadline) throw new Error("Fresh retrieval probe could not drain the prior Web turn");
+      await Bun.sleep(100);
+    }
+    await stopService(config);
+    startService();
+    await waitForBackendReady(config);
+    record({ type: "backend_restart", slot, at: new Date().toISOString(), reason: "fresh_retrieval_probe" });
+  }
   if (step.kind === "retained-compaction" || step.kind === "lost-session-compaction") await compact(owner, step.kind, slot);
   const input = step.kind === "remember"
-    ? `Remember ${marker} for this task. Reply READY_${marker} only.`
+    ? `Remember ${marker} for this task.${step.tier === "light" ? ` Also preserve this separate archive token for a later history lookup: ${archivedLightToken}. Never repeat the archive token until asked.` : ""} Reply READY_${marker} only.`
     : step.kind === "tool"
       ? "Call the attached Codex Native2 codex_exec tool to read input.txt in this workspace, using the turn_token from the task context. Reply with only the exact stdout without the trailing newline."
       : step.kind === "coding"
         ? `Read input.txt, create result.txt containing exactly '${marker}: verified' followed by a newline, then run a command that reads result.txt. Reply VERIFIED_${marker} only after the command succeeds.`
       : step.kind === "image"
         ? "Identify the dominant color of this attached square. Reply RED only."
+        : step.kind === "model-switch"
+          ? "What was the separate archive token in my first instruction? Reply with only that exact archive token, not the ordinary marker."
         : step.kind === "retrieval"
-          ? "Use Codex Native2 codex_context_search to locate my first marker instruction, then codex_context_read to verify the exact marker. Show the actual tool calls; answer with only the marker after both succeed."
+          ? retrievalProbe
+            ? "The archive token is absent from the recent exchange. Call codex_context_search with query 'archive token' and the task's turn_token; if that direct tool is unavailable, call codex_tool_call with wire_name 'codex_context_search' and arguments {query:'archive token'}. Take its message_index and call codex_context_read with message_indices:[that index], or the matching codex_tool_call fallback. Reply with only the exact archive token from the read result. If either call is unavailable, reply HISTORY_UNAVAILABLE. Never substitute the ordinary marker."
+            : "Find the archive token that appeared only in my first instruction. Use Codex Native2 codex_context_search to locate that instruction, then codex_context_read to verify its exact text. Answer with only the archive token after both tools succeed."
         : "What exact marker did I ask you to remember in the first round? Reply with only that marker.";
   const expected = step.kind === "remember" ? `READY_${marker}`
     : step.kind === "coding" ? `VERIFIED_${marker}`
-      : step.kind === "image" ? "RED" : marker;
+      : step.kind === "image" ? "RED"
+        : step.kind === "retrieval" || step.kind === "model-switch" ? archivedLightToken : marker;
   const startedAt = Date.now();
   const turn = await owner.client.request("turn/start", {
     threadId: owner.threadId,
@@ -153,6 +185,12 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
   const outcome = evidence.outcome();
   const answer = visibleFinalText(outcome.answer);
   if (outcome.status !== "completed" || answer !== expected) {
+    record({ type: "round_diagnostic", slot, tier: step.tier, kind: step.kind,
+      thread_id: owner.threadId, turn_id: evidence.turnId, reason: "wrong_final_answer",
+      answer: answer.slice(0, 120), status: outcome.status,
+      turn_error: String((outcome.turn.error as { message?: unknown } | undefined)?.message ?? "").slice(0, 500),
+      tool_items: outcome.toolItems.map(item => ({ type: item.type, status: item.status,
+        command: typeof item.command === "string" ? item.command.slice(0, 120) : undefined })) });
     throw new Error(`Slot ${slot} ${step.tier} ${step.kind} failed exact answer (status=${outcome.status}, chars=${answer.length})`);
   }
   if (step.kind === "tool") {
@@ -165,6 +203,10 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
     const receipts = outcome.toolItems.map(item => JSON.stringify(item));
     if (!receipts.some(receipt => receipt.includes("codex_context_search"))
       || !receipts.some(receipt => receipt.includes("codex_context_read"))) {
+      record({ type: "round_diagnostic", slot, tier: step.tier, thread_id: owner.threadId,
+        turn_id: evidence.turnId, reason: "missing_context_retrieval_receipts",
+        tool_items: outcome.toolItems.map(item => ({ type: item.type, status: item.status,
+          command: typeof item.command === "string" ? item.command.slice(0, 120) : undefined })) });
       throw new Error(`Slot ${slot} did not prove both Runtime history retrieval calls`);
     }
   }
@@ -231,4 +273,4 @@ if (failure) {
   throw failure;
 }
 record({ type: "complete", at: new Date().toISOString(), passed_rounds: passed, elapsed_ms: Date.now() - beganAt, bundle_id: bundleId });
-process.stdout.write(`RETAINED_STABILITY_OK rounds=${passed} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);
+process.stdout.write(`${retrievalProbe ? "RETRIEVAL_PROBE_OK" : "RETAINED_STABILITY_OK"} rounds=${passed} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);

@@ -1226,7 +1226,7 @@ test("a turn whose own stream keeps arriving is not failed for an empty page", a
   } as unknown as Page;
   const realDateNow = Date.now;
   try {
-    for (const scenario of ["appears-after-long-work", "stream-stops"] as const) {
+    for (const scenario of ["appears-after-long-work", "stream-stops", "wire-tool-awaits-connector"] as const) {
       let now = 1_000;
       Date.now = () => now;
       const worker = ChatGptBrowserWorker.forProvider({
@@ -1237,14 +1237,17 @@ test("a turn whose own stream keeps arriving is not failed for an empty page", a
         waitForNewAssistantTurn(
           page: Page, baseline: Baseline, deadline: number | undefined, signal: undefined, progress: undefined,
           graceMs: number, tracker: undefined, recover: undefined, activity: () => number | undefined,
+          relay?: undefined, wireComplete?: undefined, toolBoundary?: undefined, wireCommentary?: undefined,
+          wireToolCallObserved?: () => boolean,
         ): Promise<{ identity: string }>;
         submissionDomState(): Promise<unknown>;
         waitForTurnDomOrExternalProgress(): Promise<void>;
       };
       // Frames arrive every 30s for five minutes, then stop.
-      const streamEnds = 1_000 + 5 * 60_000;
+      const streamEnds = scenario === "wire-tool-awaits-connector" ? 1_000 : 1_000 + 5 * 60_000;
       let lastFrameAt = 1_000;
-      const appearsAt = scenario === "appears-after-long-work" ? streamEnds : Number.POSITIVE_INFINITY;
+      const appearsAt = scenario === "appears-after-long-work" ? streamEnds
+        : scenario === "wire-tool-awaits-connector" ? 1_000 + 90_000 : Number.POSITIVE_INFINITY;
       worker.submissionDomState = async () => ({
         turnIdentities: ["conversation-turn-user", "conversation-turn-assistant"],
         userIdentities: ["conversation-turn-user"],
@@ -1257,9 +1260,12 @@ test("a turn whose own stream keeps arriving is not failed for an empty page", a
       const result = worker.waitForNewAssistantTurn(
         page, { initialTurnIdentities: [], domCache: {} }, undefined, undefined, undefined,
         CHATGPT_RESPONSE_DOM_GRACE_MS, undefined, undefined, () => lastFrameAt,
+        undefined, undefined, undefined, undefined,
+        () => scenario === "wire-tool-awaits-connector",
       );
-      if (scenario === "appears-after-long-work") {
+      if (scenario !== "stream-stops") {
         await expect(result).resolves.toMatchObject({ identity: "conversation-turn-assistant" });
+        if (scenario === "wire-tool-awaits-connector") expect(now).toBeGreaterThan(1_000 + CHATGPT_RESPONSE_DOM_GRACE_MS);
       } else {
         await expect(result).rejects.toThrow("its page never rendered the reply");
         // Failed only once the stream had been silent for the whole grace, not while it worked.

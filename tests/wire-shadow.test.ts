@@ -275,6 +275,28 @@ test("a retained page binds network priority to requests opened after this Send"
   expect(session.currentObservation()?.answer).toBe("current answer");
 });
 
+test("one post-Send tool call extends observation liveness without qualifying network text", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_pending_tool", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  session.beginSubmission();
+  session.bindSubmittedUserIdentity("search:user:input-msg-1");
+  const toolCall = `data: ${JSON.stringify({ p: "", o: "add", v: { message: {
+    id: "tool-msg-1", author: { role: "assistant" }, recipient: "codex_context_search",
+    content: { content_type: "text", parts: ["search"] },
+  } } })}\n\n`;
+  emit({ kind: "request", id: "current", method: "POST", url: "https://chatgpt.com/backend-api/f/conversation", at: 1 });
+  emit({ kind: "response", id: "current", status: 200, at: 2 });
+  emit({ kind: "chunk", id: "current", text: toolCall, at: 3 });
+  expect(session.currentObservation()).toBeUndefined();
+  expect(session.pendingToolCallSinceSend()).toBeTrue();
+
+  emit({ kind: "request", id: "unrelated", method: "POST", url: "https://chatgpt.com/backend-api/f/conversation", at: 4 });
+  emit({ kind: "response", id: "unrelated", status: 200, at: 5 });
+  emit({ kind: "chunk", id: "unrelated", text: toolCall, at: 6 });
+  expect(session.pendingToolCallSinceSend()).toBeFalse();
+});
+
 test("a handed-off stream error cannot become a final answer", async () => {
   const { page, emit, attachTap } = fakePage();
   const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);

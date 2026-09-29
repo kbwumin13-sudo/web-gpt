@@ -394,7 +394,20 @@ export function bootstrapContractMessages(
     );
     if (request >= 0 && messageChars(messages[request]!) <= budget) previous.unshift(messages[request]!);
   }
-  return withCheckpoint([...instructions, ...previous, messages[latestTask]!]);
+  const selected = [...instructions, ...previous, messages[latestTask]!];
+  // A fresh browser conversation can follow a model/effort change in an existing Codex thread.
+  // The most recent exchange gives the model local continuity, but may contain only a shortened
+  // answer to the original task. Keep one small first-task anchor when there is no checkpoint.
+  // This is canonical user text, not a synthesized memory or a second history store.
+  if (!checkpoint && previous.length > 0) {
+    const firstTask = messages.find(message => message.role === "user" || message.role === "agentMessage");
+    if (firstTask && firstTask !== messages[latestTask] && !selected.includes(firstTask)
+      && messageChars(firstTask) <= Math.min(budget, 2_000)) {
+      const included = new Set([...selected, firstTask]);
+      return messages.filter(message => included.has(message));
+    }
+  }
+  return withCheckpoint(selected);
 }
 
 function messageEnvelope(

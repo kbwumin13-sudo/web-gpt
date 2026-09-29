@@ -34,6 +34,23 @@ test("a follow-up carries the exchange it is following up on", () => {
   expect(bodies(selected).at(-1)).toBe("Tell me about this book.");
 });
 
+test("a fresh bootstrap retains a small first-task anchor across later exchanges", () => {
+  const selected = bootstrapContractMessages([
+    text("user", "Original task archive token: ARCHIVE_72f4."),
+    text("assistant", "Ready."),
+    text("user", "Read the local file."),
+    text("toolResult", "large tool output ".repeat(4_000)),
+    text("assistant", "The file contains LIME."),
+    text("user", "What was the original archive token?"),
+  ]);
+  expect(bodies(selected)).toEqual([
+    "Original task archive token: ARCHIVE_72f4.",
+    "Read the local file.",
+    "The file contains LIME.",
+    "What was the original archive token?",
+  ]);
+});
+
 test("tool records stay with retrieval, which is where the bulk of a turn belongs", () => {
   const selected = bootstrapContractMessages([
     text("user", "first"),
