@@ -3,7 +3,7 @@ import { isAbsolute, resolve } from "node:path";
 import type { ChatGptTurnEnvironment } from "./environment";
 
 /** Rotate retained Web caches when this private Runtime prompt contract changes. */
-export const CHATGPT_RUNTIME_CONTRACT_VERSION = 1;
+export const CHATGPT_RUNTIME_CONTRACT_VERSION = 2;
 
 export interface ChatGptTaskScope {
   threadId: string;

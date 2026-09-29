@@ -14,6 +14,9 @@ type Kind = "remember" | "recall" | "model-switch" | "retrieval" | "tool" | "cod
 type Step = { tier: Tier; kind: Kind; ownerTier?: Tier };
 const args = process.argv.slice(2);
 const retrievalProbe = args.includes("--probe-retrieval");
+const modelSwitchProbe = args.includes("--probe-model-switch");
+if (retrievalProbe && modelSwitchProbe) throw new Error("Choose one short probe");
+const shortProbe = retrievalProbe || modelSwitchProbe;
 const lightFreshProbe = args.includes("--probe-light-fresh");
 if (lightFreshProbe && !retrievalProbe) throw new Error("--probe-light-fresh requires --probe-retrieval");
 const stabilitySlots: Step[][] = [
@@ -34,20 +37,20 @@ const stabilitySlots: Step[][] = [
   [{ tier: "medium", kind: "recall" }],
   [{ tier: "high", kind: "lost-session-compaction" }],
 ];
-const slots: Step[][] = retrievalProbe
+const slots: Step[][] = shortProbe
   ? [[{ tier: "light", kind: "remember" }], [{ tier: "light", kind: "recall" }],
     [{ tier: "light", kind: "tool" }],
-    [{ tier: lightFreshProbe ? "light" : "high", kind: "retrieval", ownerTier: "light" }]]
+    [{ tier: lightFreshProbe ? "light" : "high", kind: modelSwitchProbe ? "model-switch" : "retrieval", ownerTier: "light" }]]
   : stabilitySlots;
-const EXPECTED_ROUNDS = retrievalProbe ? 4 : 20;
-const DURATION_MS = retrievalProbe ? 0 : 120 * 60_000;
-const SLOT_GAP_MS = retrievalProbe ? 0 : DURATION_MS / (slots.length - 1);
+const EXPECTED_ROUNDS = shortProbe ? 4 : 20;
+const DURATION_MS = shortProbe ? 0 : 120 * 60_000;
+const SLOT_GAP_MS = shortProbe ? 0 : DURATION_MS / (slots.length - 1);
 if (slots.flat().length !== EXPECTED_ROUNDS) throw new Error("Acceptance plan has the wrong turn count");
 if (args.includes("--plan")) {
   process.stdout.write(`${JSON.stringify({ minutes: DURATION_MS / 60_000, rounds: EXPECTED_ROUNDS, slots }, null, 2)}\n`);
   process.exit(0);
 }
-if (!args.includes("--run") && !retrievalProbe) throw new Error("Pass --plan, --run, or --probe-retrieval");
+if (!args.includes("--run") && !shortProbe) throw new Error("Pass --plan, --run, or a short probe flag");
 const recordFlag = args.indexOf("--record");
 const recordPath = resolve(recordFlag >= 0 ? args[recordFlag + 1] ?? "" : "output/web-recovery-retained-stability.jsonl");
 if (recordFlag >= 0 && (!args[recordFlag + 1] || args[recordFlag + 1]!.startsWith("--"))) throw new Error("--record requires a path");
@@ -84,7 +87,8 @@ let passed = 0;
 const beganAt = Date.now();
 record({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion,
   bundle_id: bundleId, gateway_bundle_id: gatewayBundleId, expected_rounds: EXPECTED_ROUNDS,
-  duration_minutes: DURATION_MS / 60_000, retrieval_probe: retrievalProbe });
+  duration_minutes: DURATION_MS / 60_000,
+  probe: retrievalProbe ? "retrieval" : modelSwitchProbe ? "model-switch" : null });
 
 async function backendMetrics(): Promise<{ delivered: number; fresh_rounds: number; failed: number; abandoned: number }> {
   const response = await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) });
@@ -275,4 +279,4 @@ if (failure) {
   throw failure;
 }
 record({ type: "complete", at: new Date().toISOString(), passed_rounds: passed, elapsed_ms: Date.now() - beganAt, bundle_id: bundleId });
-process.stdout.write(`${retrievalProbe ? "RETRIEVAL_PROBE_OK" : "RETAINED_STABILITY_OK"} rounds=${passed} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);
+process.stdout.write(`${retrievalProbe ? "RETRIEVAL_PROBE_OK" : modelSwitchProbe ? "MODEL_SWITCH_PROBE_OK" : "RETAINED_STABILITY_OK"} rounds=${passed} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);

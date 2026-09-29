@@ -230,14 +230,36 @@ test("Full-mode bootstrap carries current instructions and defers older task his
   const encoded = bootstrap.text.match(/<codex_bootstrap_context_json>\n([\s\S]*?)\n<\/codex_bootstrap_context_json>/)?.[1];
   expect(encoded).toBeString();
   expect(JSON.parse(encoded!)).toEqual({
-    version: 5,
+    version: 6,
     kind: "bootstrap",
     system: [`system-bootstrap-${"x".repeat(8_000)}`],
     messages: [
       { role: "developer", content: `old developer context ${"d".repeat(8_000)}` },
       { role: "user", content: "perform the current task" },
     ],
+    relevant_history: [],
+    active_request: { source_position: 1, role: "user", content: "perform the current task" },
   });
+});
+
+test("fresh bootstrap identifies the active request and repeats matching canonical history", () => {
+  const parsed = request("high");
+  parsed.context.messages = [
+    { role: "user", content: "The archive token is ARCHIVE_72f4.", timestamp: 1 },
+    { role: "assistant", content: [{ type: "text", text: "READY" }], timestamp: 2 },
+    { role: "user", content: "Read input.txt and report its marker.", timestamp: 3 },
+    { role: "assistant", content: [{ type: "text", text: "LIME" }], timestamp: 4 },
+    { role: "user", content: "What was the archive token?", timestamp: 5 },
+  ];
+  const compiled = compileChatGptWebPrompt(parsed,
+    { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    "turn_12345678901234567890123456789012", { bootstrapContract: true });
+  const envelope = JSON.parse(compiled.text.match(/<codex_bootstrap_context_json>\n([^\n]+)\n<\/codex_bootstrap_context_json>/)?.[1] ?? "null") as {
+    version: number; active_request?: { content?: string }; relevant_history?: Array<{ content: string }>;
+  };
+  expect(envelope.version).toBe(6);
+  expect(envelope.active_request?.content).toBe("What was the archive token?");
+  expect(envelope.relevant_history?.[0]?.content).toBe("The archive token is ARCHIVE_72f4.");
 });
 
 test("Pro preserves the same native Codex delegation contract as Extra High", () => {

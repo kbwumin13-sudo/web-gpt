@@ -340,7 +340,7 @@ const CONTEXT_SEARCH_CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana
  * bigrams and a query written as one clause still has something to match on. Single characters are
  * dropped from both languages because they match nearly every message and rank nothing.
  */
-function contextSearchTerms(query: string): string[] {
+export function contextSearchTerms(query: string): string[] {
   const words = new Set<string>();
   const bigrams = new Set<string>();
   for (const token of query.split(/[\s\p{P}\p{S}]+/u)) {

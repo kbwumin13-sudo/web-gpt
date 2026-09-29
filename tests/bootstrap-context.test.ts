@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   BOOTSTRAP_RECENT_EXCHANGE_MAX_CHARS,
   bootstrapContractMessages,
+  relevantBootstrapHistory,
 } from "../src/adapters/chatgpt-web/prompt";
 import type { CodexMessage } from "../src/types";
 
@@ -65,6 +66,20 @@ test("a short cache miss carries a middle-turn fact without copying tool output"
   ]);
   expect(bodies(selected)).toContain("The archive key is MIDDLE_89ac; do not repeat it yet.");
   expect(roles(selected)).not.toContain("toolResult");
+});
+
+test("a prior user fact matching the active request is repeated intact near that request", () => {
+  const selected = relevantBootstrapHistory([
+    text("user", "Remember LIME. The separate archive token is ARCHIVE_72f4."),
+    text("assistant", "READY_LIME"),
+    text("user", "Read input.txt and reply with its marker."),
+    text("toolResult", "LIME"),
+    text("assistant", "LIME"),
+    text("user", "What was the separate archive token in my first instruction?"),
+  ]);
+  expect(selected[0]).toEqual({ source_position: 0, role: "user",
+    content: "Remember LIME. The separate archive token is ARCHIVE_72f4." });
+  expect(selected).not.toContainEqual(expect.objectContaining({ role: "toolResult" }));
 });
 
 test("tool records stay with retrieval, which is where the bulk of a turn belongs", () => {

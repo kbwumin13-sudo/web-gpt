@@ -155,7 +155,10 @@ bootstrap budget, it carries that complete canonical dialogue. Larger tasks reta
 request, previous exchange, a small first-task anchor, and the latest readable checkpoint. Tool
 results and any other omitted records remain in the Runtime broker for on-demand retrieval through
 `codex_context_search` and `codex_context_read`, which are registered connector tools declared
-read-only. The `codex_tool_call` dispatch that carried them before remains as a compatibility path,
+read-only. The bootstrap also identifies `active_request` and repeats at most two complete
+lexically relevant earlier user/assistant messages as role-labelled references next to it; this
+selection uses the canonical history already held by the Runtime and grants no new authority.
+The `codex_tool_call` dispatch that carried retrieval before remains as a compatibility path,
 because ChatGPT caches a connector's tool list under its identity and a conversation on the earlier
 schema cannot see a newly attached tool. The installed connector's action snapshot must be checked
 with a real tool receipt before claiming that its model can read omitted history. A new bootstrap

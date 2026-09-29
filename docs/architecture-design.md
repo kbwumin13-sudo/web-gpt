@@ -145,7 +145,8 @@ recovery — not the system's primary communication protocol.
 Status: the continuation and first-packet halves are implemented for Runtime-backed Full mode. A
 normal first turn or cache miss sends `<codex_bootstrap_context_json>`. Short canonical dialogue
 fits in-band; a larger task carries the latest exchange, a bounded first-task anchor, and its
-readable checkpoint. The Runtime keeps omitted records behind `codex_context_search` and
+readable checkpoint. The packet marks `active_request` and repeats at most two complete relevant
+old user/assistant messages with their original roles. The Runtime keeps omitted records behind `codex_context_search` and
 `codex_context_read`.
 Browser-only turns and compaction/new-epoch requests retain the complete `<codex_context_json>`
 bootstrap because they do not have that live retrieval boundary. A retained continuation sends
