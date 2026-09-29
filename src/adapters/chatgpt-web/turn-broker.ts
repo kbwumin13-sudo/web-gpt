@@ -1265,8 +1265,9 @@ export class TurnBroker implements TurnBrokerOwner {
         return found;
       }
       if (request.contextAction === "read") {
+        const opened = contextRead(channel.context, arguments_, channel.contextReferences);
         recordChatGptContextRetrieval(channel.traceId, "read");
-        return contextRead(channel.context, arguments_, channel.contextReferences);
+        return opened;
       }
       throw new Error("Codex context retrieval action is invalid");
     }

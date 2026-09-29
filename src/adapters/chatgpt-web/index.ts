@@ -82,6 +82,7 @@ import {
   type ChatGptRetainedIneligibleCause,
 } from "./retained-telemetry";
 import { memoryReadCapabilityNames, recordMemoryRetrievalAvailability } from "./memory-capabilities";
+import { bindChatGptContextTurn } from "./context-telemetry";
 
 function brokerSocketPath(provider: CodexProviderConfig): string {
   const configured = provider.chatgptWeb?.brokerSocketPath?.trim();
@@ -511,6 +512,7 @@ export function createChatGptWebAdapter(
       ? { localTools: true }
       : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
     const identity = extractChatGptTurnIdentity(parsed);
+    if (identity.turnId) bindChatGptContextTurn(traceId, identity.turnId);
     if (environment && identity.threadId) {
       authority.attachBinding(chatGptSessionBinding(
         chatGptTaskScope(identity.threadId, executionNamespace, environment),

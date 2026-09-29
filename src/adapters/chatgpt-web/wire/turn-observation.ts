@@ -39,6 +39,11 @@ interface MessageState {
   hiddenByMessage: boolean;
   hiddenByMetadata: boolean;
   recipient?: string;
+  authorName?: string;
+  connectorPayloadShape?: string;
+  connectorTarget?: string;
+  invokedAction?: string;
+  toolResponseText?: string;
   contentType?: string;
   parts: string[];
   /**
@@ -59,6 +64,8 @@ export interface ChatGptWireObservation {
   commentaryBlocks?: readonly { id: string; text: string; complete: boolean }[];
   /** Messages addressed to a tool rather than to the user. */
   toolCallCount: number;
+  /** Bounded, content-free routing facts. A generic tool call is not proof of a Native2 action. */
+  toolRoutes?: readonly ChatGptWireToolRoute[];
   /** The server marked a message as ending the turn. */
   endedTurn: boolean;
   /** The stream reached its terminal sentinel or its completion envelope. */
@@ -71,6 +78,84 @@ export interface ChatGptWireObservation {
   counts: ChatGptConversationEventCounts;
   /** Patches whose target or operation this fold does not understand. Zero means the schema is covered. */
   unappliedDeltas: number;
+}
+
+export interface ChatGptWireToolRoute {
+  kind: "call" | "result";
+  recipient: "connector" | "functions.exec" | "other";
+  /** A payload shape is only a hint; an action is confirmed by a tool result's resource URI. */
+  payloadShape?: "codex_exec" | "query" | "context_read" | "other";
+  targetWireName?: string;
+  action?: string;
+  status?: "finished_successfully" | "failed" | "other";
+  errorClass?: "schema" | "auth" | "unavailable" | "delivery" | "safety_blocked" | "other";
+}
+
+const NATIVE_ACTIONS = [
+  "codex_exec", "codex_write_stdin", "codex_apply_patch", "codex_view_image",
+  "codex_tool_inventory", "codex_tool_call", "codex_context_search", "codex_context_read",
+] as const;
+
+function knownAction(uri: unknown): string | undefined {
+  if (typeof uri !== "string") return undefined;
+  return NATIVE_ACTIONS.find(name => new RegExp(`(?:^|/)${name}(?:$|[/?#])`).test(uri));
+}
+
+function connectorPayload(payload: unknown): { shape?: MessageState["connectorPayloadShape"]; target?: string } {
+  if (typeof payload !== "string" || payload.length > 200_000) return {};
+  try {
+    const value: unknown = JSON.parse(payload);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const record = value as Record<string, unknown>;
+    const target = typeof record.wire_name === "string" && NATIVE_ACTIONS.includes(record.wire_name as typeof NATIVE_ACTIONS[number])
+      ? record.wire_name : undefined;
+    if (typeof record.cmd === "string" && typeof record.turn_token === "string") return { shape: "codex_exec", target };
+    // Inventory and context search share these fields, so this is deliberately not an action name.
+    if (typeof record.query === "string" && typeof record.turn_token === "string") return { shape: "query", target };
+    if (Array.isArray(record.message_indices) && typeof record.turn_token === "string") return { shape: "context_read", target };
+    return { shape: "other", target };
+  } catch { return {}; }
+}
+
+function actionFromCallText(text: unknown): string | undefined {
+  if (typeof text !== "string" || text.length > 200_000) return undefined;
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    return knownAction((value as Record<string, unknown>).path);
+  } catch { return undefined; }
+}
+
+function toolErrorClass(text: string | undefined): ChatGptWireToolRoute["errorClass"] {
+  if (!text || text.length > 200_000) return undefined;
+  if (/^此工具调用被 OpenAI 的安全检查屏蔽/.test(text.trim())
+    || /^This tool call was blocked by OpenAI'?s safety check/i.test(text.trim())) return "safety_blocked";
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return undefined; }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  // ChatGPT's app result often wraps a textual MCP failure as {text: "Error ..."}.
+  // Inspect only an explicit error prefix; a normal command's stdout is arbitrary user content.
+  const wrappedError = typeof record.text === "string"
+    && /^(?:Error\b|MCP error\b|Tool (?:call|invocation) failed\b)/i.test(record.text.trim())
+    ? record.text.trim() : undefined;
+  if (record.isError !== true && record.error === undefined && record.code === undefined && !wrappedError) return undefined;
+  const error = record.error && typeof record.error === "object" && !Array.isArray(record.error)
+    ? record.error as Record<string, unknown> : undefined;
+  const code = [error?.code, record.code, typeof record.error === "string" ? record.error : undefined, wrappedError]
+    .find(candidate => typeof candidate === "string");
+  if (typeof code !== "string") return "other";
+  if (/schema|argument|validation|parameter/i.test(code)) return "schema";
+  if (/auth|forbidden|permission|credential/i.test(code)) return "auth";
+  if (/unavailable|not_found|unknown_tool|unsupported/i.test(code)) return "unavailable";
+  if (/timeout|network|connection|tunnel|transport/i.test(code)) return "delivery";
+  return "other";
+}
+
+function routeRecipient(recipient: string | undefined): ChatGptWireToolRoute["recipient"] {
+  if (recipient === "api_tool.call_tool") return "connector";
+  if (recipient === "functions.exec") return "functions.exec";
+  return "other";
 }
 
 function emptyMessage(): MessageState {
@@ -121,17 +206,27 @@ function messageFromValue(value: unknown): MessageState | undefined {
     : undefined;
   const metadata = record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
     ? record.metadata as Record<string, unknown> : undefined;
+  const invokedResource = metadata?.invoked_resource && typeof metadata.invoked_resource === "object"
+    && !Array.isArray(metadata.invoked_resource) ? metadata.invoked_resource as Record<string, unknown> : undefined;
+  const connector = connectorPayload(metadata?.connector_tool_payload);
+  const invokedAction = knownAction(invokedResource?.resource_uri)
+    ?? actionFromCallText(author?.role === "assistant" ? content?.text : undefined);
   const parts = Array.isArray(content?.parts)
     ? content.parts.filter((part): part is string => typeof part === "string")
     : [];
   return {
     ...(typeof record.id === "string" ? { id: record.id } : {}),
     ...(typeof author?.role === "string" ? { role: author.role } : {}),
+    ...(typeof author?.name === "string" ? { authorName: author.name } : {}),
     ...(typeof record.channel === "string" ? { channel: record.channel } : {}),
     hidden: record.is_hidden === true || metadata?.is_visually_hidden_from_conversation === true,
     hiddenByMessage: record.is_hidden === true,
     hiddenByMetadata: metadata?.is_visually_hidden_from_conversation === true,
     ...(typeof record.recipient === "string" ? { recipient: record.recipient } : {}),
+    ...(connector.shape ? { connectorPayloadShape: connector.shape } : {}),
+    ...(connector.target ? { connectorTarget: connector.target } : {}),
+    ...(invokedAction ? { invokedAction } : {}),
+    ...(typeof content?.text === "string" && author?.role === "tool" ? { toolResponseText: content.text } : {}),
     ...(typeof content?.content_type === "string" ? { contentType: content.content_type } : {}),
     parts,
     priorSegments: [],
@@ -187,6 +282,24 @@ function applyMessageField(message: MessageState, path: string, value: unknown):
     message.recipient = value;
     return true;
   }
+  if (path === "/message/metadata/connector_tool_payload") {
+    const connector = connectorPayload(value);
+    message.connectorPayloadShape = connector.shape;
+    message.connectorTarget = connector.target;
+    return true;
+  }
+  if (path === "/message/metadata/invoked_resource" && value && typeof value === "object" && !Array.isArray(value)) {
+    message.invokedAction = knownAction((value as Record<string, unknown>).resource_uri);
+    return true;
+  }
+  if (path === "/message/content/text" && typeof value === "string" && message.role === "tool") {
+    message.toolResponseText = value;
+    return true;
+  }
+  if (path === "/message/content/text" && typeof value === "string" && message.role === "assistant") {
+    message.invokedAction = actionFromCallText(value);
+    return true;
+  }
   // Timestamps, metadata, and other bookkeeping share these paths. They are understood well enough
   // to be ignored deliberately rather than counted as a gap in the schema.
   return MESSAGE_PATH.test(path);
@@ -225,6 +338,11 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
           parts: message.parts.length > 0 ? message.parts : existing.parts,
           role: message.role ?? existing.role,
           channel: message.channel ?? existing.channel,
+          authorName: message.authorName ?? existing.authorName,
+          connectorPayloadShape: message.connectorPayloadShape ?? existing.connectorPayloadShape,
+          connectorTarget: message.connectorTarget ?? existing.connectorTarget,
+          invokedAction: message.invokedAction ?? existing.invokedAction,
+          toolResponseText: message.toolResponseText ?? existing.toolResponseText,
           hiddenByMessage: message.hiddenByMessage || existing.hiddenByMessage,
           hiddenByMetadata: message.hiddenByMetadata || existing.hiddenByMetadata,
           hidden: message.hidden || existing.hidden,
@@ -305,13 +423,30 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
   const commentaryBlocks: Array<{ id: string; text: string; complete: boolean }> = [];
   const messageIds: string[] = [];
   let toolCallCount = 0;
+  const toolRoutes: ChatGptWireToolRoute[] = [];
   let endedTurn = false;
   for (const [position, message] of messages.entries()) {
     if (message.id) messageIds.push(message.id);
+    if (toolRoutes.length < 32 && message.role === "tool" && message.authorName) {
+      const errorClass = toolErrorClass(message.toolResponseText ?? message.parts.join(""));
+      toolRoutes.push({ kind: "result", recipient: routeRecipient(message.authorName),
+        ...(message.invokedAction ? { action: message.invokedAction } : {}),
+        status: message.status === "finished_successfully" ? "finished_successfully"
+          : message.status === "finished_unsuccessfully" ? "failed" : "other",
+        ...(errorClass ? { errorClass } : {}),
+      });
+    }
     const finalToUser = message.role === "assistant" && message.recipient === USER_RECIPIENT
       && (message.channel === undefined || message.channel === "final")
       && !message.hidden && !isReasoning(message);
     if (message.endTurn && finalToUser) endedTurn = true;
+    if (isToolCall(message) && toolRoutes.length < 32) {
+      toolRoutes.push({ kind: "call", recipient: routeRecipient(message.recipient),
+        ...(message.connectorPayloadShape ? { payloadShape: message.connectorPayloadShape as ChatGptWireToolRoute["payloadShape"] } : {}),
+        ...(message.connectorTarget ? { targetWireName: message.connectorTarget } : {}),
+        ...(message.invokedAction ? { action: message.invokedAction } : {}),
+      });
+    }
     if (message.hidden) continue;
     if (isToolCall(message)) {
       toolCallCount += 1;
@@ -348,6 +483,7 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     reasoning: reasoning.join("\n\n"),
     commentaryBlocks,
     toolCallCount,
+    toolRoutes,
     endedTurn,
     sawDone,
     ...(error === undefined ? {} : { error }),

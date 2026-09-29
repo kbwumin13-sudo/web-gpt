@@ -678,6 +678,16 @@ test("the shadow log reports measurements rather than conversation text", () => 
   expect(line).toContain("comparison=agreed");
   expect(line).toContain("wireChars=15");
   expect(line).not.toContain("secret answer");
+  const blocked = chatGptWireShadowLog("trace_2", {
+    comparison: "agreed", wireChars: 19, domChars: 19,
+    observation: { ...observeWireStream(stream), toolRoutes: [
+      { kind: "call", recipient: "connector", action: "codex_tool_call", targetWireName: "codex_context_search" },
+      { kind: "result", recipient: "connector", status: "finished_successfully", errorClass: "safety_blocked" },
+    ] },
+  });
+  expect(blocked).toContain('"errorClass":"safety_blocked"');
+  expect(blocked).toContain('"targetWireName":"codex_context_search"');
+  expect(blocked).not.toContain("secret answer");
 });
 
 function streamOf(sse: string, status = 200): ChatGptWireStream {

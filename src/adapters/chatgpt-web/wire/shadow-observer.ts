@@ -576,6 +576,9 @@ export function chatGptWireShadowLog(traceId: string, result: ChatGptWireShadowR
       `toolCalls=${result.observation.toolCallCount}`,
       `endedTurn=${result.observation.endedTurn}`,
     );
+    if (result.observation.toolRoutes?.length) {
+      parts.push(`toolRoutes=${JSON.stringify(result.observation.toolRoutes)}`);
+    }
   }
   if (result.transcriptPath) parts.push(`transcript=${result.transcriptPath}`);
   return parts.join(" ");

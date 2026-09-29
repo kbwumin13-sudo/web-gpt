@@ -23,6 +23,7 @@ import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersed
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
+import { bindChatGptContextTurn, chatGptContextRetrievalReceipt } from "../src/adapters/chatgpt-web/context-telemetry";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
 import { defaultBrokerEndpoint } from "../src/config";
@@ -3249,6 +3250,7 @@ describe("ChatGPT outer-native harness v4", () => {
   test("exposes canonical Codex history through Runtime-owned context retrieval", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-context-retrieval-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
+    bindChatGptContextTurn("context-retrieval", "turn_context_retrieval");
     const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
     environment.tools = [];
     const token = await broker.register(environment, 60_000, "context-retrieval", {
@@ -3319,6 +3321,15 @@ describe("ChatGPT outer-native harness v4", () => {
         ],
       });
       expect(JSON.stringify(read)).not.toContain("turn_old_123456789012345678901234");
+      expect(chatGptContextRetrievalReceipt("turn_context_retrieval")).toEqual({
+        searches: 2, reads: 1, searches_with_matches: 2,
+      });
+      const staleRead = await call("codex_context_read", {
+        turn_token: token,
+        message_indices: [999],
+      });
+      expect(staleRead.isError).toBeTrue();
+      expect(chatGptContextRetrievalReceipt("turn_context_retrieval")?.reads).toBe(1);
     } finally {
       await client.close().catch(() => {});
       broker.revoke(token);

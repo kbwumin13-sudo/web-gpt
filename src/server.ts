@@ -6,7 +6,7 @@ import { chatGptWireTelemetrySnapshot } from "./adapters/chatgpt-web/wire/shadow
 import { cloudflareRetryPauseActive, webReadinessSnapshot } from "./web-readiness";
 import { memoryRetrievalSnapshot } from "./adapters/chatgpt-web/memory-capabilities";
 import { chatGptCapabilityTelemetrySnapshot } from "./adapters/chatgpt-web/capability-telemetry";
-import { chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
+import { chatGptContextRetrievalReceipt, chatGptContextTelemetrySnapshot } from "./adapters/chatgpt-web/context-telemetry";
 import { chatGptCompactionTelemetrySnapshot } from "./adapters/chatgpt-web/compaction-telemetry";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
@@ -912,6 +912,9 @@ export function startServer(
           // The compact bootstrap leaves earlier records to retrieval. These say how often that
           // was bet on and how often the bet was actually collected.
           context_retrieval: chatGptContextTelemetrySnapshot(),
+          ...(url.searchParams.has("context_turn_id") ? {
+            context_turn_receipt: chatGptContextRetrievalReceipt(url.searchParams.get("context_turn_id") ?? "") ?? null,
+          } : {}),
           // What a turn spends finding out what it can do. `tool_inventory_gateway_execs` is the
           // part a native Codex turn never pays: an outer command run to read a tool registry.
           capability_traffic: chatGptCapabilityTelemetrySnapshot(),

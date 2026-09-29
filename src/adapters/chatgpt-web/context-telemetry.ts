@@ -73,6 +73,31 @@ interface OpenTurn {
 const MAX_TRACKED_TURNS = 256;
 const openTurns = new Map<string, OpenTurn>();
 
+export interface ChatGptContextRetrievalReceipt {
+  searches: number;
+  reads: number;
+  searches_with_matches: number;
+}
+
+/** No history content or token is retained; the native turn ID is the acceptance correlation key. */
+const recentReceipts = new Map<string, { traceId: string; receipt: ChatGptContextRetrievalReceipt }>();
+
+export function bindChatGptContextTurn(traceId: string, turnId: string): void {
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(turnId)) return;
+  const existing = recentReceipts.get(turnId);
+  if (existing?.traceId === traceId) return;
+  recentReceipts.set(turnId, { traceId, receipt: { searches: 0, reads: 0, searches_with_matches: 0 } });
+  if (recentReceipts.size > MAX_TRACKED_TURNS) {
+    const oldest = recentReceipts.keys().next();
+    if (!oldest.done) recentReceipts.delete(oldest.value);
+  }
+}
+
+export function chatGptContextRetrievalReceipt(turnId: string): ChatGptContextRetrievalReceipt | undefined {
+  const receipt = recentReceipts.get(turnId)?.receipt;
+  return receipt && { ...receipt };
+}
+
 function trackTurn(traceId: string, open: OpenTurn): OpenTurn {
   openTurns.set(traceId, open);
   if (openTurns.size > MAX_TRACKED_TURNS) {
@@ -105,6 +130,7 @@ export function resetChatGptContextTelemetry(): void {
   searchZeroMatches = 0;
   searchWithoutFollowupRead = 0;
   openTurns.clear();
+  recentReceipts.clear();
 }
 
 /** A turn was sent a packet that left `omitted` earlier records behind. */
@@ -125,10 +151,18 @@ export function recordChatGptContextRetrieval(
   action: "search" | "read",
   matches?: number,
 ): void {
+  const scoped = [...recentReceipts.values()].find(entry => entry.traceId === traceId)?.receipt;
   if (action === "search") {
     searches += 1;
     if (matches === 0) searchZeroMatches += 1;
-  } else reads += 1;
+    if (scoped) {
+      scoped.searches += 1;
+      if (typeof matches === "number" && matches > 0) scoped.searches_with_matches += 1;
+    }
+  } else {
+    reads += 1;
+    if (scoped) scoped.reads += 1;
+  }
   // A turn sent a complete packet can still search, and whether that search led anywhere is the
   // same question. It has no omission to report, so it is tracked with `omitted` at zero.
   const open = openTurns.get(traceId)

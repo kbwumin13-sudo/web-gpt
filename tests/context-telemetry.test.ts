@@ -1,6 +1,8 @@
 import { beforeEach, expect, test } from "bun:test";
 import {
+  bindChatGptContextTurn,
   chatGptContextLog,
+  chatGptContextRetrievalReceipt,
   chatGptContextTelemetrySnapshot,
   recordChatGptContextOmitted,
   recordChatGptContextRetrieval,
@@ -9,6 +11,21 @@ import {
 
 beforeEach(() => {
   resetChatGptContextTelemetry();
+});
+
+test("retrieval receipts are scoped to one native turn and contain no history content", () => {
+  bindChatGptContextTurn("trace_a", "turn_aaaa1111");
+  bindChatGptContextTurn("trace_b", "turn_bbbb2222");
+  recordChatGptContextRetrieval("trace_a", "search", 2);
+  recordChatGptContextRetrieval("trace_a", "read");
+  recordChatGptContextRetrieval("trace_b", "search", 0);
+  expect(chatGptContextRetrievalReceipt("turn_aaaa1111")).toEqual({
+    searches: 1, reads: 1, searches_with_matches: 1,
+  });
+  expect(chatGptContextRetrievalReceipt("turn_bbbb2222")).toEqual({
+    searches: 1, reads: 0, searches_with_matches: 0,
+  });
+  expect(chatGptContextRetrievalReceipt("turn_missing")).toBeUndefined();
 });
 
 test("a turn handed an incomplete packet that never read the rest is counted", () => {

@@ -144,6 +144,78 @@ test("progress narration before a tool call is not part of the answer", () => {
   expect(observation.unappliedDeltas).toBe(0);
 });
 
+test("tool routing separates generic exec from a confirmed Native2 result without retaining arguments", () => {
+  const observation = observe(
+    addMessage({ id: "explore", author: { role: "assistant" }, recipient: "functions.exec",
+      content: { content_type: "code", parts: ["private program"] } }),
+    addMessage({ id: "call", author: { role: "assistant" }, recipient: "api_tool.call_tool",
+      metadata: { connector_tool_payload: JSON.stringify({ turn_token: "private-token", cmd: "private command" }) },
+      content: { content_type: "code", parts: [] } }),
+    addMessage({ id: "receipt", author: { role: "tool", name: "api_tool.call_tool" }, recipient: "all",
+      metadata: { invoked_resource: { resource_uri: "/asdk_app/private/link/private/codex_exec" } },
+      content: { content_type: "code", text: JSON.stringify({ text: "private output" }) },
+      status: "finished_successfully" }),
+    addMessage({ id: "final", author: { role: "assistant" }, recipient: "all", channel: "final",
+      content: { content_type: "text", parts: ["done"] } }),
+    finish(),
+  );
+  expect(observation.toolCallCount).toBe(2);
+  expect(observation.toolRoutes).toEqual([
+    { kind: "call", recipient: "functions.exec" },
+    { kind: "call", recipient: "connector", payloadShape: "codex_exec" },
+    { kind: "result", recipient: "connector", action: "codex_exec", status: "finished_successfully" },
+  ]);
+  expect(JSON.stringify(observation.toolRoutes)).not.toContain("private");
+});
+
+test("three generic Web tool messages do not count as three Native2 actions", () => {
+  const observation = observe(...["one", "two", "three"].map(id => addMessage({ id,
+    author: { role: "assistant" }, recipient: "functions.exec",
+    content: { content_type: "code", parts: ["private script"] },
+  })));
+  expect(observation.toolCallCount).toBe(3);
+  expect(observation.toolRoutes).toEqual(Array.from({ length: 3 }, () => ({
+    kind: "call", recipient: "functions.exec",
+  })));
+});
+
+test("a failed connector result reports a bounded error class, not its raw message", () => {
+  const observation = observe(addMessage({ id: "receipt", author: { role: "tool", name: "api_tool.call_tool" },
+    recipient: "all", content: { content_type: "code", text: JSON.stringify({
+      error: { code: "invalid_arguments", message: "private parameter value" },
+    }) }, status: "finished_successfully" }));
+  expect(observation.toolRoutes).toEqual([{ kind: "result", recipient: "connector",
+    status: "finished_successfully", errorClass: "schema" }]);
+  expect(JSON.stringify(observation.toolRoutes)).not.toContain("private");
+  const wrapped = observe(addMessage({ id: "wrapped", author: { role: "tool", name: "api_tool.call_tool" },
+    recipient: "all", content: { content_type: "code",
+      text: JSON.stringify({ text: "Error calling tool: invalid schema for private value" }) },
+    status: "finished_successfully" }));
+  expect(wrapped.toolRoutes?.[0]?.errorClass).toBe("schema");
+  expect(JSON.stringify(wrapped.toolRoutes)).not.toContain("private");
+});
+
+test("cloud safety rejection is distinct from successful MCP delivery even when the envelope finished", () => {
+  const observation = observe(
+    addMessage({ id: "call", author: { role: "assistant" }, recipient: "api_tool.call_tool",
+      metadata: { connector_tool_payload: JSON.stringify({
+        turn_token: "private-token", wire_name: "codex_context_search", arguments: { query: "private archive" },
+      }) },
+      content: { content_type: "code", text: JSON.stringify({ path: "/asdk_app/private/codex_tool_call",
+        args: { turn_token: "private-token" } }) }, status: "finished_successfully" }),
+    addMessage({ id: "blocked", author: { role: "tool", name: "api_tool.call_tool" }, recipient: "all",
+      content: { content_type: "text", parts: ["此工具调用被 OpenAI 的安全检查屏蔽。请仔细检查你发送的内容。"] },
+      status: "finished_successfully" }),
+  );
+  expect(observation.toolRoutes).toEqual([
+    { kind: "call", recipient: "connector", payloadShape: "other",
+      action: "codex_tool_call", targetWireName: "codex_context_search" },
+    { kind: "result", recipient: "connector", status: "finished_successfully",
+      errorClass: "safety_blocked" },
+  ]);
+  expect(JSON.stringify(observation.toolRoutes)).not.toContain("private");
+});
+
 /** Closing a segment: the model pauses to call a tool and will keep appending to this message. */
 const pauseSegment = () => ({ p: "/message/end_turn", o: "replace", v: false });
 

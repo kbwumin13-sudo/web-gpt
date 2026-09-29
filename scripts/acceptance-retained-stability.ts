@@ -15,8 +15,10 @@ type Step = { tier: Tier; kind: Kind; ownerTier?: Tier };
 const args = process.argv.slice(2);
 const retrievalProbe = args.includes("--probe-retrieval");
 const modelSwitchProbe = args.includes("--probe-model-switch");
-if (retrievalProbe && modelSwitchProbe) throw new Error("Choose one short probe");
-const shortProbe = retrievalProbe || modelSwitchProbe;
+const lightToolProbe = args.includes("--probe-light-tool");
+const crossThreadToolProbe = args.includes("--probe-cross-thread-tool");
+if ([retrievalProbe, modelSwitchProbe, lightToolProbe, crossThreadToolProbe].filter(Boolean).length > 1) throw new Error("Choose one short probe");
+const shortProbe = retrievalProbe || modelSwitchProbe || lightToolProbe || crossThreadToolProbe;
 const lightFreshProbe = args.includes("--probe-light-fresh");
 if (lightFreshProbe && !retrievalProbe) throw new Error("--probe-light-fresh requires --probe-retrieval");
 const stabilitySlots: Step[][] = [
@@ -37,12 +39,18 @@ const stabilitySlots: Step[][] = [
   [{ tier: "medium", kind: "recall" }],
   [{ tier: "high", kind: "lost-session-compaction" }],
 ];
-const slots: Step[][] = shortProbe
-  ? [[{ tier: "light", kind: "remember" }], [{ tier: "light", kind: "recall" }],
+const slots: Step[][] = crossThreadToolProbe
+  ? [[{ tier: "light", kind: "remember" }], [{ tier: "medium", kind: "remember" }],
+    [{ tier: "high", kind: "remember" }], [{ tier: "extra-high", kind: "remember" }],
+    [{ tier: "light", kind: "tool" }]]
+  : lightToolProbe
+  ? [[{ tier: "light", kind: "remember" }], [{ tier: "light", kind: "tool" }]]
+  : shortProbe
+    ? [[{ tier: "light", kind: "remember" }], [{ tier: "light", kind: "recall" }],
     [{ tier: "light", kind: "tool" }],
     [{ tier: lightFreshProbe ? "light" : "high", kind: modelSwitchProbe ? "model-switch" : "retrieval", ownerTier: "light" }]]
   : stabilitySlots;
-const EXPECTED_ROUNDS = shortProbe ? 4 : 20;
+const EXPECTED_ROUNDS = crossThreadToolProbe ? 5 : lightToolProbe ? 2 : shortProbe ? 4 : 20;
 const DURATION_MS = shortProbe ? 0 : 120 * 60_000;
 const SLOT_GAP_MS = shortProbe ? 0 : DURATION_MS / (slots.length - 1);
 if (slots.flat().length !== EXPECTED_ROUNDS) throw new Error("Acceptance plan has the wrong turn count");
@@ -88,7 +96,8 @@ const beganAt = Date.now();
 record({ type: "start", at: new Date(beganAt).toISOString(), version: config.releaseVersion,
   bundle_id: bundleId, gateway_bundle_id: gatewayBundleId, expected_rounds: EXPECTED_ROUNDS,
   duration_minutes: DURATION_MS / 60_000,
-  probe: retrievalProbe ? "retrieval" : modelSwitchProbe ? "model-switch" : null });
+  probe: retrievalProbe ? "retrieval" : modelSwitchProbe ? "model-switch"
+    : crossThreadToolProbe ? "cross-thread-tool" : lightToolProbe ? "light-tool" : null });
 
 async function backendMetrics(): Promise<{ delivered: number; fresh_rounds: number; failed: number; abandoned: number }> {
   const response = await fetch(backendUrl, { signal: AbortSignal.timeout(3_000) });
@@ -206,13 +215,18 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
     if (!read) throw new Error(`Slot ${slot} ${step.tier} has no successful exact file-read receipt`);
   }
   if (step.kind === "retrieval") {
-    const receipts = outcome.toolItems.map(item => JSON.stringify(item));
-    if (!receipts.some(receipt => receipt.includes("codex_context_search"))
-      || !receipts.some(receipt => receipt.includes("codex_context_read"))) {
+    // These MCP actions are served inside TurnBroker and do not create app-server tool items.
+    const response = await fetch(`${backendUrl}?context_turn_id=${encodeURIComponent(evidence.turnId)}`,
+      { signal: AbortSignal.timeout(3_000) });
+    if (!response.ok) throw new Error(`Context receipt health returned HTTP ${response.status}`);
+    const health = await response.json() as { context_turn_receipt?: {
+      searches?: number; reads?: number; searches_with_matches?: number;
+    } | null };
+    const receipt = health.context_turn_receipt;
+    if (!receipt || (receipt.searches_with_matches ?? 0) < 1 || (receipt.reads ?? 0) < 1) {
       record({ type: "round_diagnostic", slot, tier: step.tier, thread_id: owner.threadId,
         turn_id: evidence.turnId, reason: "missing_context_retrieval_receipts",
-        tool_items: outcome.toolItems.map(item => ({ type: item.type, status: item.status,
-          command: typeof item.command === "string" ? item.command.slice(0, 120) : undefined })) });
+        broker_receipt: receipt ?? null });
       throw new Error(`Slot ${slot} did not prove both Runtime history retrieval calls`);
     }
   }
@@ -279,4 +293,5 @@ if (failure) {
   throw failure;
 }
 record({ type: "complete", at: new Date().toISOString(), passed_rounds: passed, elapsed_ms: Date.now() - beganAt, bundle_id: bundleId });
-process.stdout.write(`${retrievalProbe ? "RETRIEVAL_PROBE_OK" : modelSwitchProbe ? "MODEL_SWITCH_PROBE_OK" : "RETAINED_STABILITY_OK"} rounds=${passed} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);
+process.stdout.write(`${retrievalProbe ? "RETRIEVAL_PROBE_OK" : modelSwitchProbe ? "MODEL_SWITCH_PROBE_OK"
+  : crossThreadToolProbe ? "CROSS_THREAD_TOOL_PROBE_OK" : lightToolProbe ? "LIGHT_TOOL_PROBE_OK" : "RETAINED_STABILITY_OK"} rounds=${passed} elapsedMs=${Date.now() - beganAt} bundleId=${bundleId}\n`);
