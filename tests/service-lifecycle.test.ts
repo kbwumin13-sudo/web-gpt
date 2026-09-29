@@ -75,6 +75,10 @@ describe("service drain lifecycle", () => {
       expect(candidateRollbackSafe(statePath)).toBeTrue();
       writeFileSync(statePath, JSON.stringify({ version: 1, records: [], intents: [{ executionKey: "turn-1", createdAt: 1 }] }));
       expect(candidateRollbackSafe(statePath)).toBeFalse();
+      writeFileSync(statePath, JSON.stringify({ version: 1, records: [], handoffs: [
+        { executionKey: "turn-1", sourceEpoch: "epoch-one", createdAt: 1 },
+      ] }));
+      expect(candidateRollbackSafe(statePath)).toBeFalse();
       writeFileSync(statePath, JSON.stringify({ version: 1, records: [], intents: "redacted" }));
       expect(candidateRollbackSafe(statePath)).toBeFalse();
       writeFileSync(statePath, JSON.stringify({ version: 2, records: [], intents: [] }));

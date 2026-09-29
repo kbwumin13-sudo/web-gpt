@@ -93,11 +93,16 @@ export class AppServerClient {
     }
   }
 
-  async waitForTurn(evidence: InstalledTurnEvidence, timeoutMs = 180_000): Promise<void> {
+  async waitForTurn(
+    evidence: InstalledTurnEvidence,
+    timeoutMs = 180_000,
+    onNotification?: (message: { method?: string; params?: unknown }) => void,
+  ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       let completed = false;
       for (const message of this.notifications.splice(0)) {
+        onNotification?.(message);
         if (evidence.observe(message)) completed = true;
       }
       if (completed) return;

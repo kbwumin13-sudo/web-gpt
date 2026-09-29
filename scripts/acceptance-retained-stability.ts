@@ -9,8 +9,8 @@ import { AppServerClient } from "./smoke-installed";
 import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-evidence";
 
 type Tier = "light" | "medium" | "high" | "extra-high";
-type Kind = "remember" | "recall" | "tool" | "coding" | "image" | "retained-compaction" | "lost-session-compaction";
-type Step = { tier: Tier; kind: Kind };
+type Kind = "remember" | "recall" | "retrieval" | "tool" | "coding" | "image" | "retained-compaction" | "lost-session-compaction";
+type Step = { tier: Tier; kind: Kind; ownerTier?: Tier };
 const slots: Step[][] = [
   [{ tier: "light", kind: "remember" }],
   [{ tier: "medium", kind: "remember" }],
@@ -20,7 +20,7 @@ const slots: Step[][] = [
   [{ tier: "medium", kind: "coding" }],
   [{ tier: "high", kind: "image" }, { tier: "light", kind: "recall" }],
   [{ tier: "extra-high", kind: "tool" }, { tier: "medium", kind: "recall" }],
-  [{ tier: "high", kind: "recall" }],
+  [{ tier: "high", kind: "retrieval", ownerTier: "light" }],
   [{ tier: "extra-high", kind: "recall" }],
   [{ tier: "light", kind: "recall" }, { tier: "medium", kind: "recall" }],
   [{ tier: "medium", kind: "retained-compaction" }],
@@ -122,8 +122,8 @@ async function compact(owner: Owner, kind: "retained-compaction" | "lost-session
 }
 
 async function runStep(step: Step, slot: number, concurrent: boolean): Promise<void> {
-  const owner = await ownerFor(step.tier);
-  const marker = markers[step.tier];
+  const owner = await ownerFor(step.ownerTier ?? step.tier);
+  const marker = markers[owner.tier];
   if (step.kind === "retained-compaction" || step.kind === "lost-session-compaction") await compact(owner, step.kind, slot);
   const input = step.kind === "remember"
     ? `Remember ${marker} for this task. Reply READY_${marker} only.`
@@ -131,15 +131,18 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
       ? "Call the attached Codex Native2 codex_exec tool to read input.txt in this workspace, using the turn_token from the task context. Reply with only the exact stdout without the trailing newline."
       : step.kind === "coding"
         ? `Read input.txt, create result.txt containing exactly '${marker}: verified' followed by a newline, then run a command that reads result.txt. Reply VERIFIED_${marker} only after the command succeeds.`
-        : step.kind === "image"
-          ? "Identify the dominant color of this attached square. Reply RED only."
-          : "What exact marker did I ask you to remember in the first round? Reply with only that marker.";
+      : step.kind === "image"
+        ? "Identify the dominant color of this attached square. Reply RED only."
+        : step.kind === "retrieval"
+          ? "Use Codex Native2 codex_context_search to locate my first marker instruction, then codex_context_read to verify the exact marker. Show the actual tool calls; answer with only the marker after both succeed."
+        : "What exact marker did I ask you to remember in the first round? Reply with only that marker.";
   const expected = step.kind === "remember" ? `READY_${marker}`
     : step.kind === "coding" ? `VERIFIED_${marker}`
       : step.kind === "image" ? "RED" : marker;
   const startedAt = Date.now();
   const turn = await owner.client.request("turn/start", {
     threadId: owner.threadId,
+    model: `chatgpt-web/${step.tier}`,
     input: [{ type: "text", text: input }, ...(step.kind === "image" ? [{ type: "localImage", path: join(owner.workspace, "red.png"), detail: "high" }] : [])],
   }) as { turn?: { id?: unknown } };
   if (typeof turn.turn?.id !== "string") throw new Error(`${step.tier} turn/start returned no ID`);
@@ -155,6 +158,13 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
       && item.exitCode === 0 && typeof item.command === "string" && item.command.includes("input.txt")
       && typeof item.aggregatedOutput === "string" && item.aggregatedOutput.includes(marker));
     if (!read) throw new Error(`Slot ${slot} ${step.tier} has no successful exact file-read receipt`);
+  }
+  if (step.kind === "retrieval") {
+    const receipts = outcome.toolItems.map(item => JSON.stringify(item));
+    if (!receipts.some(receipt => receipt.includes("codex_context_search"))
+      || !receipts.some(receipt => receipt.includes("codex_context_read"))) {
+      throw new Error(`Slot ${slot} did not prove both Runtime history retrieval calls`);
+    }
   }
   if (step.kind === "coding") {
     if (readFileSync(join(owner.workspace, "result.txt"), "utf8") !== `${marker}: verified\n`
@@ -175,7 +185,8 @@ async function runStep(step: Step, slot: number, concurrent: boolean): Promise<v
   }
   passed += 1;
   record({ type: "round", slot, at: new Date(startedAt).toISOString(), ended_at: new Date().toISOString(),
-    tier: step.tier, kind: step.kind, thread_id: owner.threadId, turn_id: evidence.turnId,
+    tier: step.tier, kind: step.kind, owner_tier: owner.tier,
+    model_switched: owner.tier !== step.tier, thread_id: owner.threadId, turn_id: evidence.turnId,
     answer_sha256: createHash("sha256").update(answer).digest("hex"), status: "passed", bundle_id: bundleId });
 }
 

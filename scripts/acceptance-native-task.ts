@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { loadConfig } from "../src/config";
+import { atomicWriteFile, loadConfig } from "../src/config";
 import { AppServerClient } from "./smoke-installed";
 import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-evidence";
 
@@ -24,7 +24,8 @@ writeFileSync(join(workspace, "input.csv"), "name,score\nAda,14\nBo,21\nCy,9\nDi
 const client = new AppServerClient(executable);
 let threadId: string | undefined;
 let turnId: string | undefined;
-let stderr = "";
+let passedReport: Record<string, unknown> | undefined;
+let failure: unknown;
 try {
   await client.request("initialize", { clientInfo: { name: "codex-web-native-task-acceptance", version: "1" },
     capabilities: { experimentalApi: true } });
@@ -42,14 +43,27 @@ try {
     "5. Read process.py. 6. Run process.py. 7. Read result.json. 8. Run a programmatic assertion that",
     "the total is 85 and names are Di,Bo,Ada,Eve,Cy. 9. Compute the SHA-256 of result.json.",
     "10. List both output files. You may make further separate calls if needed.",
-    "Reply DONE_85 only after the script ran, assertion passed, and both files exist.",
+    "Show a short commentary update before the first tool and after the last tool. After verification,",
+    "reply with DONE_85 followed by a Markdown link labelled result.json whose target is the real absolute result.json path.",
   ].join("\n");
   const turn = await client.request("turn/start", { threadId,
     input: [{ type: "text", text: prompt }] }) as { turn?: { id?: unknown } };
   if (typeof turn.turn?.id !== "string") throw new Error("Native task has no turn ID");
   turnId = turn.turn.id;
   const evidence = new InstalledTurnEvidence(threadId, turnId);
-  await client.waitForTurn(evidence, 600_000);
+  const startedAt = Date.now();
+  const timeline: Array<{ kind: "commentary" | "tool"; elapsed_ms: number }> = [];
+  await client.waitForTurn(evidence, 600_000, notification => {
+    const params = notification.params as { threadId?: unknown; turnId?: unknown;
+      item?: { type?: unknown; phase?: unknown } } | undefined;
+    if (!params || params.threadId !== threadId || params.turnId !== turnId) return;
+    if (notification.method !== "item/completed") return;
+    if (params.item?.type === "agentMessage" && params.item.phase === "commentary") {
+      timeline.push({ kind: "commentary", elapsed_ms: Date.now() - startedAt });
+    } else if (params.item?.type === "commandExecution") {
+      timeline.push({ kind: "tool", elapsed_ms: Date.now() - startedAt });
+    }
+  });
   const outcome = evidence.outcome();
   const successfulCommands = outcome.toolItems.filter(item => item.type === "commandExecution"
     && item.status === "completed" && item.exitCode === 0);
@@ -58,21 +72,42 @@ try {
   };
   const validResult = result.total === 85
     && Array.isArray(result.names) && result.names.join(",") === "Di,Bo,Ada,Eve,Cy";
-  if (outcome.status !== "completed" || visibleFinalText(outcome.answer) !== "DONE_85"
+  const answer = visibleFinalText(outcome.answer);
+  const expectedLink = `[result.json](<${join(workspace, "result.json")}>)`;
+  const firstTool = timeline.find(item => item.kind === "tool")?.elapsed_ms;
+  const lastTool = timeline.findLast(item => item.kind === "tool")?.elapsed_ms;
+  const commentary = timeline.filter(item => item.kind === "commentary").map(item => item.elapsed_ms);
+  const progressOrdered = firstTool !== undefined && lastTool !== undefined
+    && commentary.some(at => at <= firstTool && at <= 90_000)
+    && commentary.some(at => at >= lastTool);
+  if (outcome.status !== "completed" || !answer.startsWith("DONE_85")
+    || !answer.includes(expectedLink) || !progressOrdered
     || successfulCommands.length < 10 || !existsSync(join(workspace, "process.py")) || !validResult) {
-    throw new Error(`Installed native task failed: status=${outcome.status}, commands=${successfulCommands.length}, validResult=${validResult}, answer=${JSON.stringify(outcome.answer.slice(0, 120))}`);
+    throw new Error(`Installed native task failed: status=${outcome.status}, commands=${successfulCommands.length}, validResult=${validResult}, progressOrdered=${progressOrdered}, answer=${JSON.stringify(outcome.answer.slice(0, 120))}`);
   }
   const resultBytes = readFileSync(join(workspace, "result.json"));
-  const report = {
+  passedReport = {
     status: "passed", version: config.releaseVersion, bundle_id: bundleId, thread_id: threadId, turn_id: turnId,
     successful_tool_calls: successfulCommands.length, result_sha256: createHash("sha256").update(resultBytes).digest("hex"),
-    artifact: join(workspace, "result.json"),
+    artifact: join(workspace, "result.json"), final_link: expectedLink,
+    commentary_elapsed_ms: commentary, first_tool_elapsed_ms: firstTool, last_tool_elapsed_ms: lastTool,
   };
-  writeFileSync(join(workspace, "acceptance.json"), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
-  process.stdout.write(`NATIVE_TASK_OK ${JSON.stringify(report)}\n`);
+} catch (error) {
+  failure = error;
 } finally {
-  stderr = await client.close();
-  if (/stream disconnected - retrying sampling request/.test(stderr)) {
-    throw new Error(`Native task required an implicit sampling retry (thread=${threadId}, turn=${turnId})`);
-  }
+  try {
+    const stderr = await client.close();
+    if (/stream disconnected - retrying sampling request/.test(stderr)) {
+      failure ??= new Error(`Native task required an implicit sampling retry (thread=${threadId}, turn=${turnId})`);
+    }
+  } catch (error) { failure ??= error; }
 }
+if (failure || !passedReport) {
+  const failed = { status: "failed", version: config.releaseVersion, bundle_id: bundleId,
+    thread_id: threadId ?? null, turn_id: turnId ?? null,
+    error: failure instanceof Error ? failure.message.slice(0, 500) : String(failure ?? "No validated result") };
+  atomicWriteFile(join(workspace, "acceptance.json"), `${JSON.stringify(failed, null, 2)}\n`, { mode: 0o600 });
+  throw failure ?? new Error("Native task produced no validated result");
+}
+atomicWriteFile(join(workspace, "acceptance.json"), `${JSON.stringify(passedReport, null, 2)}\n`, { mode: 0o600 });
+process.stdout.write(`NATIVE_TASK_OK ${JSON.stringify(passedReport)}\n`);

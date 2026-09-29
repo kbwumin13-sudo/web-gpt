@@ -143,6 +143,11 @@ to 256 results for seven days. Atomic snapshots contain the answer and visible t
 reasoning, and recovery requires the exact provider-scoped execution key. A saved result is not
 proof that Codex received it; this cache does not infer a client acknowledgement or inject answers
 into a different turn. It cannot recover Web content the bridge never observed.
+New records also carry the trusted TaskScope; an exact-key replay with a different cwd or permission
+scope is rejected. Legacy V1 final records still load, but a tool-capable replay without recorded
+scope fails closed. An accepted handoff replaces one unresolved physical Send with a durable
+authorization for a different compaction epoch; the old epoch cannot be submitted again, and an
+unconsumed authorization blocks downgrade to a runtime that does not understand it.
 
 Automatic Full-mode first turns and normal cache misses receive a compact
 `<codex_bootstrap_context_json>` envelope containing the current task message. The omitted canonical
@@ -256,8 +261,10 @@ SSE and WebSocket response records without altering page networking. The stream 
 and unversioned: unknown frames, unapplied patches, truncated captures, and ambiguous stream
 ownership are recorded, not interpreted as an answer.
 
-A network reply belongs to the current turn only after request, conversation, topic and Web turn
-observations agree. The fold keeps visible assistant `commentary` apart from the final user message;
+A network reply belongs to the current turn only after its request opened after this Send, the
+submitted user message ID matches the stream's `input_message`, and the conversation and any
+handoff topic/Web turn agree. Multiple competing POSTs, missing identities, or an incomplete handoff
+fall back to the DOM. The fold keeps visible assistant `commentary` apart from the final user message;
 hidden content, system text, and tool payloads cannot finish a turn. A complete, attributed final
 message can settle before an assistant DOM node appears. The broker's completion fence still has to
 commit before the Runtime accepts it. The network text preserves Markdown and local artifact links
@@ -329,7 +336,7 @@ Before an automatic Send, the Runtime durably records its execution intent and a
 helper only after that write succeeds. A crash with an intent but no recorded final is an unknown
 outcome, so the same native instruction cannot be submitted again automatically. A completed final
 remains replayable under its exact execution key. Accepted compaction handoffs remain independent of
-a later browser error. A short, tool-free continuation may produce a missing final after completed
+a later browser error, and their authorized successor Send has a separate compaction epoch. A short, tool-free continuation may produce a missing final after completed
 tool results; no new local tool work is authorized in that continuation.
 
 Logical completion and physical browser release are separate. A release failure preserves a
