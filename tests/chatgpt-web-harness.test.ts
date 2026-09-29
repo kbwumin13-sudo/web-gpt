@@ -442,7 +442,9 @@ describe("ChatGPT outer-native harness v4", () => {
       await adapter.runTurn!(second, { headers: new Headers() }, () => {});
 
       expect(browserMessages).toBe(2);
-      expect(conversationKeys[0]).toBe(chatGptConversationKey(first, chatGptWebExecutionNamespace(provider))!);
+      expect(conversationKeys[0]).toBe(chatGptConversationKey(
+        first, chatGptWebExecutionNamespace(provider), extractChatGptTurnEnvironment(first),
+      )!);
       expect(conversationKeys[1]).toBe(conversationKeys[0]);
       expect(tokens[1]).not.toBe(tokens[0]);
       expect(preparedPrompts[0]).toContain("Inspect the project");
@@ -489,7 +491,7 @@ describe("ChatGPT outer-native harness v4", () => {
     };
 
     const request = rawWireRequest(environmentXml);
-    const traceId = chatGptWebTraceId(provider, request);
+    const traceId = chatGptWebTraceId(provider, request, extractChatGptTurnEnvironment(request));
     const adapter = createChatGptWebAdapter(provider);
     const firstEvents: AdapterEvent[] = [];
     try {
@@ -1200,7 +1202,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("a submitted retained turn can retry by resuming the same conversation", async () => {
+  test("a submitted retained turn with unknown effects cannot send the same instruction again", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-retained-retry-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -1218,14 +1220,12 @@ describe("ChatGPT outer-native harness v4", () => {
     const originalRun = worker.run.bind(worker);
     let browserStarts = 0;
     let firstPrompt = "";
-    let retryPrompt = "";
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
       const prepared = browserStarts === 1
         ? await turn.prepare()
         : await turn.prepareResume!();
       if (browserStarts === 1) firstPrompt = prepared.text;
-      else retryPrompt = prepared.text;
       prepared.release();
       turn.onSendActivated?.();
       turn.onSubmitted?.();
@@ -1246,7 +1246,7 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(firstEvents.at(-1)).toMatchObject({
         type: "error",
         code: "chatgpt_submitted_turn_failed",
-        retryable: true,
+        retryable: false,
       });
 
       const recovered: AdapterEvent[] = [];
@@ -1255,11 +1255,9 @@ describe("ChatGPT outer-native harness v4", () => {
         { headers: new Headers() },
         event => recovered.push(event),
       );
-      expect(browserStarts).toBe(2);
-      expect(retryPrompt).toContain("<codex_resume_context_json>");
-      expect(retryPrompt).not.toContain(environmentXml);
-      expect(retryPrompt.length).toBeLessThan(firstPrompt.length * 0.7);
-      expect(recovered.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(browserStarts).toBe(1);
+      expect(firstPrompt).toContain("<codex_bootstrap_context_json>");
+      expect(recovered.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submitted_turn_failed", retryable: false });
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       chatGptTurnSessions.clear();
@@ -1267,7 +1265,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("a retained conversation that keeps failing is abandoned for a fresh bootstrap", async () => {
+  test("a retained conversation failure never rebuilds the same accepted native instruction", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-retained-rebuild-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -1290,11 +1288,7 @@ describe("ChatGPT outer-native harness v4", () => {
       prepared.release();
       turn.onSendActivated?.();
       turn.onSubmitted?.();
-      // The conversation keeps erroring: resuming it again can never converge.
-      if (browserStarts <= 2) throw new Error("ChatGPT response observation temporarily stopped");
-      const answer = "Recovered from a rebuilt ChatGPT conversation";
-      turn.onTextDelta(answer);
-      return answer;
+      throw new Error("ChatGPT response observation temporarily stopped");
     };
     const rebuildLogs: string[] = [];
     const originalInfo = console.info;
@@ -1312,24 +1306,13 @@ describe("ChatGPT outer-native harness v4", () => {
           { headers: new Headers() },
           event => events.push(event),
         );
-        expect(events.at(-1)).toMatchObject({ code: "chatgpt_submitted_turn_failed", retryable: true });
-        // One transient failure still reconnects, so the first retry must not rebuild.
+        expect(events.at(-1)).toMatchObject({
+          code: "chatgpt_submitted_turn_failed",
+          retryable: false,
+        });
         expect(rebuildLogs).toEqual([]);
       }
-
-      const rebuilt: AdapterEvent[] = [];
-      await createChatGptWebAdapter(provider).runTurn!(
-        request,
-        { headers: new Headers() },
-        event => rebuilt.push(event),
-      );
-
-      expect(browserStarts).toBe(3);
-      expect(rebuildLogs).toHaveLength(1);
-      expect(rebuildLogs[0]).toContain("after 2 failed attempts");
-      // An unreachable Launcher costs the rebuild but must not fail the turn.
-      expect(rebuildLogs[0]).toContain("skipped");
-      expect(rebuilt.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(browserStarts).toBe(1);
     } finally {
       console.info = originalInfo;
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
@@ -1421,7 +1404,6 @@ describe("ChatGPT outer-native harness v4", () => {
     let browserStarts = 0;
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
-      turn.onSendActivated?.();
       throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests. Try again in a few minutes.", {
         status: 429,
         errorType: "rate_limit_error",
@@ -1449,6 +1431,38 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(browserStarts).toBe(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a rate-limit report after Send activation cannot replay the same native instruction", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-rate-limit-after-send-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rate-limit-after-send-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let starts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      starts += 1;
+      await turn.onSendActivated?.();
+      throw new ChatGptWebAdapterError("Rate limit after sending the prompt", {
+        status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true,
+      });
+    };
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(rawWireRequest(environmentXml),
+          { headers: new Headers() }, event => events.push(event));
+        expect(events.at(-1)).toMatchObject({ type: "error", code: "submission_outcome_unknown", retryable: false });
+      }
+      expect(starts).toBe(1);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
       await TurnBroker.forSocket(socketPath).close();
     }
   });
@@ -1653,9 +1667,9 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(compiled.text).not.toContain(imageUrl);
     expect(compiled.text).toContain('"attachment_ref":"codex-input-image-1"');
     expect(compiled.text).toContain('"version":3');
-    expect(compiled.text).toContain("use the attached Codex Native tools directly according to their declared descriptions and schemas");
-    expect(compiled.text).toContain("Use actual Codex Native results as evidence");
-    expect(compiled.text).toContain("Write the user-facing final answer only after the last required tool result has settled");
+    expect(compiled.text).toContain("Use attached tools directly for local work; inspect their declared schemas");
+    expect(compiled.text).toContain("report actual results, not instructions for the user to run");
+    expect(compiled.text).toContain("Finish after required tool results settle");
     expect(compiled.text.match(/turn_123456789012345678901234/g)).toHaveLength(1);
     expect(compiled.text).not.toContain("codex_bind_turn");
     expect(compiled.text).not.toContain("binding_id");
@@ -2698,7 +2712,7 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(turn.capabilities.localToolsEnabled).toBe(true);
       const prepared = await turn.prepare();
       try {
-        expect(prepared.text).toContain("For local work required by the task, use the attached Codex Native tools directly");
+        expect(prepared.text).toContain("For local tasks, create, edit, run, and verify with tools");
         expect(prepared.text).not.toContain("with no Codex Native bridge");
         const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
         if (!token) throw new Error("turn token missing from compiled Pro prompt");
@@ -3739,7 +3753,7 @@ describe("ChatGPT outer-native harness v4", () => {
       );
       await browserFinished;
       expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
-      expect(events.at(-1)).toMatchObject({ type: "error", code: "upstream_server_error" });
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "submission_outcome_unknown" });
     } finally {
       worker.run = originalRun;
       chatGptTurnSessions.clear();
@@ -3772,6 +3786,7 @@ describe("ChatGPT outer-native harness v4", () => {
       try {
         const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
         if (!token) throw new Error("missing test turn token");
+        await turn.onSendActivated?.();
         turn.onSubmitted?.();
         const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
         const invocation = callTurnBroker<BrokerToolResult>(socketPath, {
@@ -3889,6 +3904,10 @@ describe("ChatGPT outer-native harness v4", () => {
         }
         replacementToken = token;
         replacementAbortSignal = turn.abortSignal;
+        const revision = await turn.completionFence?.begin();
+        if (revision === undefined || !await turn.completionFence?.commit(revision)) {
+          throw new Error("replacement final did not cross the broker completion fence");
+        }
         turn.onTextDelta("replacement completed");
         return "replacement completed";
       } finally {

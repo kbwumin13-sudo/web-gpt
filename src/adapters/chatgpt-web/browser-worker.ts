@@ -156,12 +156,6 @@ export const CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT = [
   "Finish the requested final answer now using the available results.",
   "If a requested detail is still unavailable, state that limitation briefly instead of using another tool.",
 ].join(" ");
-export const CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT = [
-  "Continue the current request from where you stopped.",
-  "No tool call completed before the interruption.",
-  "Use the attached tools only as needed to finish the original request.",
-  "Then provide the requested final answer.",
-].join(" ");
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
@@ -1291,7 +1285,12 @@ export interface BrowserTurn {
   /** Stable visible ChatGPT prose between status/tool rows. */
   onCommentary?: (text: string, continuation?: boolean) => void;
   /** Append-only, structurally stable Markdown chunks. */
-  onTextDelta: (delta: string) => void;
+  onTextDelta: (delta: string, source?: "wire" | "dom") => void;
+  /** Confirm that this turn's browser surface was actually released, independently of its answer. */
+  onPhysicalRelease?: (result: { released: boolean; reason?: string }) => void;
+  /** Ordered, attributed observations for the daemon's sole turn authority. */
+  onBrowserFact?: (fact: { browserEpoch: number; sourceSequence: number;
+    event: import("./web-turn-authority").WebBrowserFact }) => void;
   /** Proven current-turn MCP activity; never response content or completion. */
   externalProgress?: ChatGptTurnProgressReader;
   /** Atomically fences browser completion against concurrent MCP claims in the turn broker. */
@@ -1329,6 +1328,8 @@ interface ChatGptAssistantTurnBinding {
   identity: string;
   locator: Locator;
   acceptedTurnIdentities: readonly string[];
+  /** A complete, attributed network reply arrived before ChatGPT rendered an assistant node. */
+  wireOnly?: true;
 }
 
 interface ChatGptSubmissionDomState {
@@ -1747,7 +1748,7 @@ export function chatGptExternalProgressSuppressesDomHealth(
 }
 
 export interface ChatGptStoppedTurnContinuationPlan {
-  kind: "resume_before_tools" | "finish_after_tools";
+  kind: "finish_after_tools";
   effort: ChatGptWebModelMode["effort"];
   prompt: string;
   useLocalTools: boolean;
@@ -1764,21 +1765,14 @@ export function chatGptStoppedTurnContinuationPlan(options: {
     || options.visibleText.length > 0
     || options.progress === undefined
     || options.progress.activeToolCalls > 0) return undefined;
-  if (options.progress.lastToolBatchRevision > 0) {
-    if (options.postToolAlreadyUsed) return undefined;
-    return {
-      kind: "finish_after_tools",
-      effort: "high",
-      prompt: CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT,
-      useLocalTools: false,
-    };
-  }
-  if (options.preToolAlreadyUsed) return undefined;
+  // Before the first completed tool batch, another message could repeat the original work.
+  // Only a tool-free final-answer request is safe after an accepted prompt.
+  if (options.progress.lastToolBatchRevision === 0 || options.postToolAlreadyUsed) return undefined;
   return {
-    kind: "resume_before_tools",
-    effort: "max",
-    prompt: CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT,
-    useLocalTools: true,
+    kind: "finish_after_tools",
+    effort: "high",
+    prompt: CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT,
+    useLocalTools: false,
   };
 }
 
@@ -3039,6 +3033,7 @@ export class ChatGptBrowserWorker {
     initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0,
     completionTracker?: ChatGptCompletionTracker,
     agentCommentary?: ChatGptAgentCommentaryRelay,
+    toolBoundaryObserved?: (revision: number) => void,
   ): Promise<ChatGptSubmissionEvidence> {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     for (;;) {
@@ -3051,6 +3046,7 @@ export class ChatGptBrowserWorker {
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
         await agentCommentary?.flushBeforeTool(page);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
+        toolBoundaryObserved?.(progress.lastToolBatchRevision);
       } else {
         await agentCommentary?.observe(page);
       }
@@ -3270,6 +3266,9 @@ export class ChatGptBrowserWorker {
     recoverObservation?: ChatGptObservationRecovery,
     turnStreamActivityAt?: () => number | undefined,
     agentCommentary?: ChatGptAgentCommentaryRelay,
+    wireComplete?: () => boolean,
+    toolBoundaryObserved?: (revision: number) => void,
+    wireCommentary?: () => void,
   ): Promise<ChatGptAssistantTurnBinding> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3281,6 +3280,15 @@ export class ChatGptBrowserWorker {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       if (observationPage.isClosed()) throw chatGptBrowserTabClosedError();
+      wireCommentary?.();
+      if (wireComplete?.() && (externalProgress?.snapshot().activeToolCalls ?? 0) === 0) {
+        return {
+          identity: "wire-only-response",
+          locator: observationPage.locator("body"),
+          acceptedTurnIdentities: observationBaseline.initialTurnIdentities,
+          wireOnly: true,
+        };
+      }
       let progress = externalProgress?.snapshot();
       // Proven activity pushes the grace forward: a native tool call, or a frame on this turn's own
       // stream. The second matters once the model works like an agent: between two tool calls it
@@ -3370,6 +3378,7 @@ export class ChatGptBrowserWorker {
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
         await agentCommentary?.flushBeforeTool(observationPage);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
+        toolBoundaryObserved?.(progress.lastToolBatchRevision);
       }
       if (identity) {
         await agentCommentary?.close(observationPage);
@@ -3864,6 +3873,7 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
     agentCommentary?: ChatGptAgentCommentaryRelay,
+    toolBoundaryObserved?: (revision: number) => void,
   ): Promise<ChatGptSubmissionEvidence> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3878,6 +3888,7 @@ export class ChatGptBrowserWorker {
           initialToolBatchRevision,
           completionTracker,
           agentCommentary,
+          toolBoundaryObserved,
         );
         return evidence;
       } catch (error) {
@@ -3918,6 +3929,7 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
     agentCommentary?: ChatGptAgentCommentaryRelay,
+    toolBoundaryObserved?: (revision: number) => void,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -3958,6 +3970,7 @@ export class ChatGptBrowserWorker {
       completionTracker,
       recoverObservation,
       agentCommentary,
+      toolBoundaryObserved,
     );
     submissionLifecycle?.onSubmitted?.();
     return evidence;
@@ -4851,6 +4864,7 @@ export class ChatGptBrowserWorker {
       throw error;
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      let releaseFailure: Error | undefined;
       try {
         const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
           phase: "end",
@@ -4867,13 +4881,17 @@ export class ChatGptBrowserWorker {
         });
         if (release.cancelledByUser) throw chatGptBrowserTabClosedError();
       } catch (controlError) {
+        releaseFailure = controlError instanceof Error ? controlError : new Error(String(controlError));
         if (controlError instanceof ChatGptWebAdapterError && controlError.code === "client_cancelled") {
           throw controlError;
         }
-        if (!originalError) throw controlError;
         console.error(
-          `[chatgpt-web] launcher turn-end notification failed after browser error: ${controlError instanceof Error ? controlError.message : String(controlError)}`,
+          `[chatgpt-web] launcher turn-end notification failed: ${releaseFailure.message}`,
         );
+      } finally {
+        turn.onPhysicalRelease?.(releaseFailure
+          ? { released: false, reason: releaseFailure.message }
+          : { released: true });
       }
     }
   }
@@ -4904,11 +4922,48 @@ export class ChatGptBrowserWorker {
     const prepared = await prepare();
     const diagnosticsRoot = this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns");
     const diagnostics = new ChatGptBrowserDiagnostics(turn.traceId, diagnosticsRoot, this.config.appName);
-    // Watches the same turn over ChatGPT's own transport. It has one power over the outcome, and
-    // only in the direction of recovery: when the DOM reads no answer at all — the silent failure
-    // this layer was built to catch — a complete wire reading is returned in its place. Every turn
-    // where the DOM produced text is decided exactly as before.
+    // The attributed, complete network reply is the primary final Markdown source. The DOM still
+    // operates the page and supplies an answer when the network projection is unavailable.
     const wireShadow = new ChatGptWireShadowSession(turn.traceId, join(dirname(diagnosticsRoot), "wire-transcripts"));
+    let browserEpoch = 0;
+    let sourceSequence = 0;
+    const reportBrowserFact = (event: import("./web-turn-authority").WebBrowserFact): void => {
+      turn.onBrowserFact?.({ browserEpoch, sourceSequence: ++sourceSequence, event });
+    };
+    const completedWireAnswer = (): string | undefined => {
+      if (turn.captureLunaCheckpoint) return undefined;
+      const observation = wireShadow.currentObservation();
+      // ChatGPT citation placeholders require a content-reference renderer not represented in
+      // plain Markdown. Let the DOM projection handle those rather than emitting private glyphs.
+      return observation?.endedTurn && observation.sawDone && observation.answer.trim()
+        && !/[\uE200-\uE20F]/u.test(observation.answer)
+        ? observation.answer : undefined;
+    };
+    const wireCommentaryDelivered = new Map<string, string>();
+    const domCommentaryDelivered = new Set<string>();
+    let latestDomCommentary = "";
+    const emitDomCommentary = (value: string, continuation?: boolean): void => {
+      if (wireShadow.currentObservation()?.commentaryBlocks?.length) return;
+      latestDomCommentary = continuation ? latestDomCommentary + value : value;
+      domCommentaryDelivered.add(latestDomCommentary);
+      turn.onCommentary?.(value, continuation);
+    };
+    const emitNetworkCommentary = (): void => {
+      for (const block of wireShadow.currentObservation()?.commentaryBlocks ?? []) {
+        if (!block.complete) continue;
+        const previous = wireCommentaryDelivered.get(block.id) ?? "";
+        if (block.text === previous) continue;
+        if (!block.text.startsWith(previous)) {
+          throw new Error("ChatGPT changed wire commentary after it was relayed to Codex");
+        }
+        wireCommentaryDelivered.set(block.id, block.text);
+        if (domCommentaryDelivered.has(block.text)) continue;
+        const domPrefix = !previous && latestDomCommentary && block.text.startsWith(latestDomCommentary)
+          ? latestDomCommentary : "";
+        const suffix = block.text.slice(Math.max(previous.length, domPrefix.length));
+        if (suffix) turn.onCommentary?.(suffix, previous.length > 0 || domPrefix.length > 0);
+      }
+    };
     const concludeWireShadow = (answer: string, failed: boolean): ChatGptWireShadowResult => {
       const result = wireShadow.conclude({ answer, failed });
       if (result.comparison !== "not_observed") console.info(chatGptWireShadowLog(turn.traceId, result));
@@ -5079,6 +5134,10 @@ export class ChatGptBrowserWorker {
         turnConnection = connection.browser;
         page = connection.page;
         diagnosticPage = page;
+        browserEpoch += 1;
+        sourceSequence = 0;
+        reportBrowserFact({ type: "browser_rebound", browserEpoch });
+        await wireShadow.attach(page);
         cloudflareWatch.observe(page);
         console.warn(
           `[chatgpt-web] browser turn ${turn.traceId} rebound its existing launcher page after a stalled DOM probe`,
@@ -5336,7 +5395,8 @@ export class ChatGptBrowserWorker {
       await diagnostics.capture(page, "file-attachment-complete");
       let submittedPageUrl = page.url();
       let completionTracker = new ChatGptCompletionTracker();
-      const agentCommentary = await ChatGptAgentCommentaryRelay.open(page, turn.onCommentary);
+      const agentCommentary = await ChatGptAgentCommentaryRelay.open(page,
+        turn.onCommentary ? emitDomCommentary : undefined);
       const finalSubmissionEvidence = await this.runStage(
         turn.traceId,
         "send",
@@ -5359,6 +5419,7 @@ export class ChatGptBrowserWorker {
             }
             : undefined,
           agentCommentary,
+          revision => reportBrowserFact({ type: "tool_boundary_observed", revision }),
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
@@ -5386,6 +5447,9 @@ export class ChatGptBrowserWorker {
             : undefined,
           () => wireShadow.lastTurnActivityAt(),
           agentCommentary,
+          () => completedWireAnswer() !== undefined,
+          revision => reportBrowserFact({ type: "tool_boundary_observed", revision }),
+          emitNetworkCommentary,
         );
       } finally {
         clearTimeout(unboundTurnDiagnostic);
@@ -5400,12 +5464,27 @@ export class ChatGptBrowserWorker {
       let sentAt = Date.now();
       let visibleTrace = new ChatGptVisibleTraceTracker();
       let markdownBuffer = new ChatGptMarkdownBuffer();
+      let domCommitted = "";
+      let publishedAnswer = "";
+      let answerSource: "wire" | "dom" | undefined;
       const checkpointStream = turn.captureLunaCheckpoint
         ? new ChatGptLunaCheckpointStream()
         : undefined;
-      const emitMarkdownDelta = (delta: string): void => {
+      const emitMarkdownDelta = (delta: string, source: "wire" | "dom" = "dom"): void => {
         const visible = checkpointStream ? checkpointStream.push(delta) : delta;
-        if (visible) turn.onTextDelta(visible);
+        if (visible) turn.onTextDelta(visible, source);
+      };
+      const publishAnswer = (answer: string, source: "wire" | "dom"): void => {
+        if (!answer.startsWith(publishedAnswer)) {
+          throw new ChatGptWebAdapterError(
+            `ChatGPT ${source} answer conflicts with already streamed ${answerSource ?? "unknown"} Markdown`,
+            { status: 502, errorType: "server_error", code: "browser_stream_inconsistent", retryable: false },
+          );
+        }
+        const delta = answer.slice(publishedAnswer.length);
+        if (delta) emitMarkdownDelta(delta, source);
+        publishedAnswer = answer;
+        answerSource = source;
       };
       const throwMarkdownConsistencyError = (error: unknown): never => {
         if (!(error instanceof ChatGptMarkdownConsistencyError)) throw error;
@@ -5428,7 +5507,6 @@ export class ChatGptBrowserWorker {
       let observedThisIteration = false;
       let completionFenceRevision: number | undefined;
       let canonicalNavigationReloaded = false;
-      let stoppedPreToolContinuationUsed = false;
       let stoppedPostToolContinuationUsed = false;
       const continueAfterStoppedTurn = async (
         reason: "stopped_thinking" | "empty_final_timeout",
@@ -5439,13 +5517,12 @@ export class ChatGptBrowserWorker {
           effort: requestedMode.effort,
           progress,
           visibleText,
-          preToolAlreadyUsed: stoppedPreToolContinuationUsed,
+          preToolAlreadyUsed: false,
           postToolAlreadyUsed: stoppedPostToolContinuationUsed,
         });
         if (!plan || (reason === "empty_final_timeout" && plan.kind !== "finish_after_tools")) return false;
 
-        if (plan.kind === "resume_before_tools") stoppedPreToolContinuationUsed = true;
-        else stoppedPostToolContinuationUsed = true;
+        stoppedPostToolContinuationUsed = true;
         console.warn(
           `[chatgpt-web] browser turn ${turn.traceId} is requesting one bounded same-conversation continuation`
           + ` kind=${plan.kind} effort=${plan.effort} reason=${reason}`,
@@ -5508,7 +5585,8 @@ export class ChatGptBrowserWorker {
         await diagnostics.capture(page, "tool-final-continuation-attached");
         submittedPageUrl = page.url();
         completionTracker = new ChatGptCompletionTracker();
-        const continuationCommentary = await ChatGptAgentCommentaryRelay.open(page, turn.onCommentary);
+        const continuationCommentary = await ChatGptAgentCommentaryRelay.open(page,
+          turn.onCommentary ? emitDomCommentary : undefined);
         await this.runStage(
           turn.traceId,
           "tool_final_continuation_send",
@@ -5548,10 +5626,14 @@ export class ChatGptBrowserWorker {
             : undefined,
           () => wireShadow.lastTurnActivityAt(),
           continuationCommentary,
+          () => completedWireAnswer() !== undefined,
+          revision => reportBrowserFact({ type: "tool_boundary_observed", revision }),
+          emitNetworkCommentary,
         );
         submissionBaseline = continuationBaseline;
         visibleTrace = new ChatGptVisibleTraceTracker();
         markdownBuffer = new ChatGptMarkdownBuffer();
+        domCommitted = "";
         domHealthTracker = new ChatGptTurnDomHealthTracker();
         responseDomCache.key = undefined;
         responseDomCache.snapshot = undefined;
@@ -5564,6 +5646,30 @@ export class ChatGptBrowserWorker {
         return true;
       };
       for (;;) {
+        emitNetworkCommentary();
+        const networkAnswer = completedWireAnswer();
+        if (responseTurn.wireOnly && networkAnswer === undefined) {
+          throw new Error("The completed Web stream was lost before the browser owner could settle it");
+        }
+        if (networkAnswer && (turn.externalProgress?.snapshot().activeToolCalls ?? 0) === 0) {
+          const webConversationId = wireShadow.currentObservation()?.conversationId;
+          reportBrowserFact({ type: "final_candidate", answer: networkAnswer, source: "wire",
+            ...(webConversationId ? { webConversationId } : {}) });
+          if (turn.completionFence) {
+            const revision = await turn.completionFence.begin();
+            if (revision === undefined) {
+              await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+              continue;
+            }
+            if (completedWireAnswer() !== networkAnswer || !await turn.completionFence.commit(revision)) {
+              await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+              continue;
+            }
+          }
+          publishAnswer(networkAnswer, "wire");
+          finalText = networkAnswer;
+          break;
+        }
         // The heartbeat is a consumer callback, so it stays outside the observation-fault region:
         // a defect in the caller must not be retried as though the page could not be read.
         if (Date.now() - lastHeartbeat >= 10_000) {
@@ -5680,6 +5786,7 @@ export class ChatGptBrowserWorker {
             snapshot.visibleText,
           );
           await turn.externalProgress.acknowledgeToolBatch(externalProgressSnapshot.lastToolBatchRevision);
+          reportBrowserFact({ type: "tool_boundary_observed", revision: externalProgressSnapshot.lastToolBatchRevision });
         }
         const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
           externalProgressSnapshot,
@@ -5712,11 +5819,17 @@ export class ChatGptBrowserWorker {
               return throwMarkdownConsistencyError(error);
             }
           })();
+          domCommitted += textDelta;
           for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
-            if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
+            if (trace.kind === "commentary") emitDomCommentary(trace.text, trace.continuation === true);
             else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
           }
-          if (textDelta) emitMarkdownDelta(textDelta);
+          // Hold the DOM's final-text projection while the page-external stream can still supply
+          // the original Markdown, including links the renderer's text extraction may omit.
+          if (textDelta && (!wireShadow.isAttached() || checkpointStream)) {
+            if (checkpointStream) emitMarkdownDelta(textDelta);
+            else publishAnswer(domCommitted, "dom");
+          }
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
@@ -5781,7 +5894,7 @@ export class ChatGptBrowserWorker {
             if (!final.markdown && snapshot.visibleText) {
               throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
             }
-            if (final.delta) emitMarkdownDelta(final.delta);
+            if (final.delta && checkpointStream) emitMarkdownDelta(final.delta);
             if (checkpointStream) {
               const completed = checkpointStream.finishOptional(snapshot.visibleText);
               if (completed.visibleRemainder) turn.onTextDelta(completed.visibleRemainder);
@@ -5789,7 +5902,13 @@ export class ChatGptBrowserWorker {
               else console.warn(`[chatgpt-web] browser turn ${turn.traceId} completed without a Luna rolling checkpoint; preserving full native history`);
               finalText = completed.answer;
             } else {
-              finalText = final.markdown;
+              finalText = completedWireAnswer() ?? final.markdown;
+              const webConversationId = finalText === final.markdown
+                ? undefined : wireShadow.currentObservation()?.conversationId;
+              reportBrowserFact({ type: "final_candidate", answer: finalText,
+                source: finalText === final.markdown ? "dom" : "wire",
+                ...(webConversationId ? { webConversationId } : {}) });
+              publishAnswer(finalText, finalText === final.markdown ? "dom" : "wire");
             }
             break;
           }
@@ -5888,13 +6007,9 @@ export class ChatGptBrowserWorker {
       );
       const contextLine = chatGptContextLog(turn.traceId);
       if (contextLine) console.info(contextLine);
-      const wire = concludeWireShadow(finalText, false);
-      if (wire.rescuedAnswer !== undefined && finalText.length === 0) {
-        // The observer is complete enough to replace an empty DOM read. Feed it through the same
-        // append-only channel before returning so the Responses stream and terminal answer agree.
-        emitMarkdownDelta(wire.rescuedAnswer);
-        finalText = wire.rescuedAnswer;
-      }
+      // Network candidates enter through the attributed observation and completion-fence path
+      // above. A late diagnostic conclusion must never publish a second, unfenced answer.
+      concludeWireShadow(finalText, false);
       if (managedRetentionEnabled && turn.conversationKey && !page.isClosed()) {
         this.managedRetainedPages.set(turn.conversationKey, page);
         retainManagedPage = true;
@@ -5973,19 +6088,25 @@ export class ChatGptBrowserWorker {
     } finally {
       cloudflareWatch.dispose();
       prepared.release();
+      let releaseFailure: Error | undefined;
       if (turnConnection) {
         await turnConnection.close().catch(error => {
+          releaseFailure = error instanceof Error ? error : new Error(String(error));
           console.error(
             `[chatgpt-web] failed to release launcher browser connection for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
           );
         });
       } else if (managedPage && !managedPage.isClosed() && !retainManagedPage) {
         await managedPage.close().catch(error => {
+          releaseFailure = error instanceof Error ? error : new Error(String(error));
           console.error(
             `[chatgpt-web] failed to close managed browser tab for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
           );
         });
       }
+      if (!launcherSurfaceId) turn.onPhysicalRelease?.(releaseFailure
+        ? { released: false, reason: releaseFailure.message }
+        : { released: true });
     }
   }
 }

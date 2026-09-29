@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
-import { ChatGptAgentCommentaryRelay, CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT, CHATGPT_STOPPED_THINKING_LABELS, CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT, ChatGptCompletionTracker, chatGptCanonicalConversationNavigation, chatGptExternalProgressSuppressesDomHealth, chatGptStoppedTurnContinuationPlan, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptAgentCommentaryRelay, CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, CHATGPT_STOPPED_THINKING_LABELS, CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT, ChatGptCompletionTracker, chatGptCanonicalConversationNavigation, chatGptExternalProgressSuppressesDomHealth, chatGptStoppedTurnContinuationPlan, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -928,6 +928,33 @@ test("submission observation recovery resumes with rebound locators and is stric
     },
   )).rejects.toThrow("submission DOM remained unresponsive after 2 same-page rebinds");
   expect(boundedRecoveries).toBe(2);
+});
+
+test("a complete wire reply settles an accepted turn before its assistant DOM appears", async () => {
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as {
+    waitForNewAssistantTurn(...args: unknown[]): Promise<{ wireOnly?: true; identity: string }>;
+  };
+  let domProbes = 0;
+  let wireCommentary = 0;
+  const page = {
+    isClosed: () => false,
+    locator: (selector: string) => {
+      expect(selector).toBe("body");
+      return {};
+    },
+  } as unknown as Page;
+  worker.waitForNewAssistantTurn = worker.waitForNewAssistantTurn.bind({
+    submissionDomState: () => { domProbes += 1; throw new Error("DOM must not be needed"); },
+  });
+  const binding = await worker.waitForNewAssistantTurn(
+    page, { initialTurnIdentities: [], domCache: {} }, undefined,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    () => true, undefined, () => { wireCommentary += 1; },
+  );
+  expect(binding.wireOnly).toBeTrue();
+  expect(binding.identity).toBe("wire-only-response");
+  expect(domProbes).toBe(0);
+  expect(wireCommentary).toBe(1);
 });
 
 test("an accepted turn rebinds the missing assistant observation and acknowledges a tool batch that arrives during recovery", async () => {
@@ -3852,7 +3879,7 @@ test("Pro gets one final-answer continuation only after all observed tool calls 
   expect(CHATGPT_STOPPED_TOOL_CONTINUATION_PROMPT).toContain("Do not call any tools again");
 });
 
-test("Pro gets one bounded same-conversation recovery when it stops before the first tool call", () => {
+test("Pro does not send another local-work prompt after stopping before its first tool call", () => {
   const noTools = {
     revision: 0,
     lastToolBatchRevision: 0,
@@ -3865,12 +3892,7 @@ test("Pro gets one bounded same-conversation recovery when it stops before the f
     visibleText: "",
     preToolAlreadyUsed: false,
     postToolAlreadyUsed: false,
-  })).toEqual({
-    kind: "resume_before_tools",
-    effort: "max",
-    prompt: CHATGPT_STOPPED_PRE_TOOL_CONTINUATION_PROMPT,
-    useLocalTools: true,
-  });
+  })).toBeUndefined();
   expect(chatGptStoppedTurnContinuationPlan({
     effort: "max",
     progress: noTools,

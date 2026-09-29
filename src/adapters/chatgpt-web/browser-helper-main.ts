@@ -286,7 +286,13 @@ async function run(message: RunMessage): Promise<void> {
       ...(continuation ? { continuation: true } : {}),
     }),
     onCommentary: (text, continuation) => writeProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-    onTextDelta: text => writeProtocol({ type: "event", id: message.id, event: "text", text }),
+    onTextDelta: (text, source) => writeProtocol({ type: "event", id: message.id, event: "text", text,
+      ...(source ? { source } : {}) }),
+    onPhysicalRelease: result => writeProtocol({
+      type: "event", id: message.id, event: "physical_release", ...result,
+    }),
+    onBrowserFact: fact => writeProtocol({ type: "event", id: message.id, event: "turn_fact",
+      browserEpoch: fact.browserEpoch, sourceSequence: fact.sourceSequence, fact: fact.event }),
     ...(message.turn.captureLunaCheckpoint ? {
       captureLunaCheckpoint: true,
       onLunaCheckpoint: captured => writeProtocol({
@@ -517,4 +523,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack"] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack", "physical-release-v1", "turn-authority-v1"] });

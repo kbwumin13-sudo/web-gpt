@@ -3,7 +3,7 @@ import { observeWireStream, type ChatGptWireObservation } from "./turn-observati
 import { buildWireTranscript, wireTranscriptsEnabled, writeWireTranscript } from "./transcript-store";
 import { ChatGptWireCollector, type ChatGptWireStream } from "./wire-collector";
 import { attachChatGptWireTap } from "./cdp-wire-tap";
-import { resumedConversationStream, STREAM_HANDOFF } from "./handoff";
+import { handoffBinding, resumeHandoffStream, STREAM_HANDOFF } from "./handoff";
 import { decodeSseStream, type SseFrame } from "./sse-frames";
 import { parseConversationFrame } from "./conversation-events";
 import { observeConversationEvents } from "./turn-observation";
@@ -90,8 +90,8 @@ export interface ChatGptWireTelemetrySnapshot {
   /**
    * Turns whose conversation stream ended in a `stream_handoff` envelope. ChatGPT closes that
    * stream after naming a `resume_sse_endpoint` and a `subscribe_ws_topic`, and the answer
-   * continues on whichever the page took — which this build does not yet follow, so these turns
-   * are observed as empty. The count is how often that costs an observation.
+   * continues on whichever the page took. This count includes both followed and unresolved
+   * handoffs; `handoffs_followed` counts the ones bound to a complete WS continuation.
    */
   handoffs_observed: number;
   /**
@@ -218,7 +218,7 @@ export function requestPath(url: string): string {
  * socket or other backend requests says nothing about whether the turn is still being generated.
  */
 function carriesTurnProgress(stream: ChatGptWireStream, frame: SseFrame): boolean {
-  if (stream.framing === "message") return frame.data.includes("conversation-turn-stream");
+  if (stream.framing === "message") return false;
   return stream.method.toUpperCase() === "POST" && conversationPath(stream.url);
 }
 
@@ -292,7 +292,15 @@ export class ChatGptWireShadowSession {
   private lastTurnFrameAt: number | undefined;
   private readonly collector = new ChatGptWireCollector({
     onFrame: (stream, frame) => {
-      if (carriesTurnProgress(stream, frame)) this.lastTurnFrameAt = Date.now();
+      if (carriesTurnProgress(stream, frame)) {
+        this.lastTurnFrameAt = Date.now();
+      } else if (stream.method === "WS" && frame.data.includes("conversation-turn-stream")) {
+        const chosen = this.conversationStream();
+        const binding = chosen && handoffBinding(chosen.frames);
+        if (binding && resumeHandoffStream(`${JSON.stringify(frame.data)}\n`, binding).stream) {
+          this.lastTurnFrameAt = Date.now();
+        }
+      }
     },
   });
   private attached = false;
@@ -313,6 +321,10 @@ export class ChatGptWireShadowSession {
    */
   lastTurnActivityAt(): number | undefined {
     return this.lastTurnFrameAt;
+  }
+
+  isAttached(): boolean {
+    return this.attached;
   }
 
   /** Install the observer. Never throws: shadow observation must not be able to fail a turn. */
@@ -354,6 +366,21 @@ export class ChatGptWireShadowSession {
     return attributed.at(-1);
   }
 
+  /** Validated current-turn network projection, before any DOM comparison or terminal decision. */
+  currentObservation(): ChatGptWireObservation | undefined {
+    if (!this.attached || this.collector.counts().evictedWithFrames > 0 || (this.overflowed?.() ?? 0) > 0) {
+      return undefined;
+    }
+    const stream = this.conversationStream();
+    if (!stream || stream.frames.length === 0) return undefined;
+    const direct = observeWireStream(stream);
+    if (direct.error !== undefined || direct.counts.unrecognized > 0 || direct.unappliedDeltas > 0) return undefined;
+    if (direct.counts.controlTypes.includes(STREAM_HANDOFF)) {
+      return this.followHandoff(stream);
+    }
+    return direct;
+  }
+
   /**
    * The turn as it continued after a handoff, or undefined when no stream carried it.
    *
@@ -362,17 +389,23 @@ export class ChatGptWireShadowSession {
    * completely is discarded rather than returned: a partial observation that looks whole is worse
    * than the honest empty one, because everything downstream trusts it the same way.
    */
-  private followHandoff(chosen: ChatGptWireStream | undefined, conversationId?: string): ChatGptWireObservation | undefined {
+  private followHandoff(chosen: ChatGptWireStream | undefined): ChatGptWireObservation | undefined {
+    if (!chosen) return undefined;
+    const binding = handoffBinding(chosen.frames);
+    if (!binding) return undefined;
+    const matches: ChatGptWireObservation[] = [];
     for (const candidate of this.collector.snapshot()) {
-      if (candidate.id === chosen?.id || candidate.frames.length === 0) continue;
-      const sse = resumedConversationStream(candidate.raw, conversationId);
+      if (candidate.id === chosen.id || candidate.method !== "WS" || candidate.frames.length === 0) continue;
+      const resumed = resumeHandoffStream(candidate.raw, binding);
+      if (resumed.conflict) return undefined;
+      const sse = resumed.stream;
       if (sse.length === 0) continue;
       const observation = observeConversationEvents(decodeSseStream(sse).map(parseConversationFrame));
       if (observation.counts.unrecognized > 0 || observation.unappliedDeltas > 0) continue;
-      if (!observation.endedTurn || observation.answer.length === 0) continue;
-      return observation;
+      if (!observation.endedTurn || !observation.sawDone || observation.answer.length === 0) continue;
+      matches.push(observation);
     }
-    return undefined;
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   /**
@@ -428,7 +461,7 @@ export class ChatGptWireShadowSession {
     // holds open, carrying the same event-stream text in topic messages. Reassembling it is what
     // makes those turns observable at all; without it the request is four frames and no answer.
     const resumed = direct?.counts.controlTypes.includes(STREAM_HANDOFF) === true && direct.answer.length === 0
-      ? this.followHandoff(stream, direct.conversationId)
+      ? this.followHandoff(stream)
       : undefined;
     if (resumed) handoffsFollowed += 1;
     const observation = resumed ?? direct;

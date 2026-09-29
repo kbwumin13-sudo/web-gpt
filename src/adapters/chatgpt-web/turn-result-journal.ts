@@ -38,6 +38,11 @@ interface StoredTurnResultRecord {
   createdAt: number;
 }
 
+interface StoredSendIntent {
+  executionKey: string;
+  createdAt: number;
+}
+
 /**
  * A bounded journal for terminal Responses results, optionally persisted as a private snapshot.
  *
@@ -46,6 +51,7 @@ interface StoredTurnResultRecord {
  */
 export class TurnResultJournal {
   private records = new Map<string, TurnResultRecord>();
+  private intents = new Map<string, StoredSendIntent>();
   private statePath: string | undefined;
   private writeSnapshot: (path: string, data: string) => void;
 
@@ -67,15 +73,18 @@ export class TurnResultJournal {
     }
     const previousPath = this.statePath;
     const previousRecords = this.records;
+    const previousIntents = this.intents;
     const previousWriteSnapshot = this.writeSnapshot;
     this.statePath = statePath;
     this.writeSnapshot = writeSnapshot;
     this.records = new Map();
+    this.intents = new Map();
     try {
       if (statePath) this.load();
     } catch (error) {
       this.statePath = previousPath;
       this.records = previousRecords;
+      this.intents = previousIntents;
       this.writeSnapshot = previousWriteSnapshot;
       throw error;
     }
@@ -110,8 +119,32 @@ export class TurnResultJournal {
       createdAt: Date.now(),
     };
     records.set(executionKey, record);
-    this.commit(records);
+    const intents = new Map(this.intents);
+    intents.delete(executionKey);
+    this.commit(records, intents);
     return { kind: "recorded", record };
+  }
+
+  /** Persist before allowing a normal browser Send; an unknown post-crash result must not replay. */
+  beginSend(executionKey: string): "recorded" | "duplicate" {
+    if (!executionKey.trim()) throw new Error("Turn send execution key is required");
+    if (this.records.has(executionKey)) throw new Error("Completed Codex turn cannot be sent again");
+    if (this.intents.has(executionKey)) return "duplicate";
+    if (this.intents.size >= this.maxEntries) {
+      throw new Error("Turn send intent journal is full; unresolved submissions were preserved");
+    }
+    const intents = new Map(this.intents);
+    intents.set(executionKey, { executionKey, createdAt: Date.now() });
+    this.commit(new Map(this.records), intents);
+    return "recorded";
+  }
+
+  hasUnresolvedSend(executionKey: string): boolean {
+    return this.intents.has(executionKey) && !this.records.has(executionKey);
+  }
+
+  unresolvedSendCount(): number {
+    return this.intents.size;
   }
 
   get(executionKey: string): TurnResultRecord | undefined {
@@ -135,7 +168,7 @@ export class TurnResultJournal {
   }
 
   clear(): void {
-    this.commit(new Map());
+    this.commit(new Map(), new Map());
   }
 
   private load(): void {
@@ -149,7 +182,7 @@ export class TurnResultJournal {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("Turn result journal snapshot is invalid");
     }
-    const snapshot = parsed as { version?: unknown; records?: unknown };
+    const snapshot = parsed as { version?: unknown; records?: unknown; intents?: unknown };
     if (snapshot.version !== 1 || !Array.isArray(snapshot.records)) {
       throw new Error("Turn result journal snapshot is invalid");
     }
@@ -163,14 +196,33 @@ export class TurnResultJournal {
       records.set(record.executionKey, record);
     }
     pruneRecords(records, this.ttlMs);
+    if (snapshot.intents !== undefined && (!Array.isArray(snapshot.intents)
+      || snapshot.intents.length > this.maxEntries)) {
+      throw new Error("Turn result journal snapshot is invalid");
+    }
+    const intents = new Map<string, StoredSendIntent>();
+    for (const value of snapshot.intents ?? []) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Turn result journal snapshot is invalid");
+      }
+      const intent = value as Partial<StoredSendIntent>;
+      if (typeof intent.executionKey !== "string" || !intent.executionKey.trim()
+        || typeof intent.createdAt !== "number" || !Number.isFinite(intent.createdAt)
+        || intents.has(intent.executionKey) || records.has(intent.executionKey)) {
+        throw new Error("Turn result journal snapshot is invalid");
+      }
+      intents.set(intent.executionKey, { executionKey: intent.executionKey, createdAt: intent.createdAt });
+    }
     this.records = records;
+    this.intents = intents;
   }
 
-  private commit(records: Map<string, TurnResultRecord>): void {
+  private commit(records: Map<string, TurnResultRecord>, intents = this.intents): void {
     if (this.statePath) {
       const snapshot = JSON.stringify({
         version: 1,
         records: [...records.values()].map(storedRecord),
+        ...(intents.size > 0 ? { intents: [...intents.values()] } : {}),
       });
       try {
         this.writeSnapshot(this.statePath, snapshot);
@@ -179,6 +231,7 @@ export class TurnResultJournal {
       }
     }
     this.records = records;
+    this.intents = intents;
   }
 
   private prune(now = Date.now()): void {

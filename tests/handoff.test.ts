@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { parseConversationFrame } from "../src/adapters/chatgpt-web/wire/conversation-events";
-import { resumedConversationStream } from "../src/adapters/chatgpt-web/wire/handoff";
+import { handoffBinding, resumeHandoffStream, resumedConversationStream } from "../src/adapters/chatgpt-web/wire/handoff";
 import { decodeSseStream } from "../src/adapters/chatgpt-web/wire/sse-frames";
 import { observeConversationEvents } from "../src/adapters/chatgpt-web/wire/turn-observation";
 
@@ -72,8 +72,8 @@ test("another conversation sharing the socket is left out", () => {
     item("1789721328179-0", "theirs", "conv_2"),
   );
   expect(resumedConversationStream(raw, "conv_1")).toBe("mine");
-  // Without a conversation to match, everything of this shape is taken.
-  expect(resumedConversationStream(raw)).toBe("minetheirs");
+  // Without a conversation to match, two groups must not be merged.
+  expect(resumedConversationStream(raw)).toBe("");
 });
 
 test("traffic that is not a turn stream contributes nothing", () => {
@@ -90,4 +90,27 @@ test("traffic that is not a turn stream contributes nothing", () => {
 test("a batch of messages in one socket frame is expanded", () => {
   const raw = `${JSON.stringify(JSON.stringify([item("1-0", "a"), item("1-1", "b")]))}\n`;
   expect(resumedConversationStream(raw)).toBe("ab");
+});
+
+test("handoff binds the offered topic to a Web exchange, never a Codex turn", () => {
+  const binding = handoffBinding(decodeSseStream(`data: ${JSON.stringify({
+    type: "stream_handoff", conversation_id: "conv_1", turn_exchange_id: "turn_1",
+    options: [{ type: "subscribe_ws_topic", topic_id: "conversation-turn-16528610-5" }],
+  })}\n\n`))!;
+  const other = { ...item("1-0", "other"), payload: { type: "conversation-turn-stream", payload: {
+    type: "stream-item", conversation_id: "conv_1", turn_id: "other-web-turn", encoded_item: "other",
+  } } };
+  const raw = socket(other, item("2-0", "answer"), item("2-0", "answer"));
+  expect(resumeHandoffStream(raw, binding)).toMatchObject({ stream: "", conflict: true });
+  expect(resumeHandoffStream(socket(item("2-0", "answer")), {
+    ...binding, turnExchangeId: "exchange-different-from-web-turn",
+  })).toMatchObject({ stream: "answer", conflict: false, webTurnId: "turn_1" });
+  expect(resumeHandoffStream(raw, { ...binding, topicIds: ["absent"] }).stream).toBe("");
+  expect(handoffBinding(decodeSseStream('data: {"type":"stream_handoff","conversation_id":"conv_1"}\n\n'))).toBeUndefined();
+});
+
+test("same offset with different bytes fails closed", () => {
+  const binding = { conversationId: "conv_1", topicIds: ["conversation-turn-16528610-5"], turnExchangeId: "turn_1" };
+  expect(resumeHandoffStream(socket(item("1-0", "first"), item("1-0", "second")), binding))
+    .toMatchObject({ stream: "", conflict: true });
 });

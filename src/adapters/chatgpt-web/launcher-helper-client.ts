@@ -6,6 +6,7 @@ import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../lau
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
+import type { WebBrowserFact } from "./web-turn-authority";
 import {
   parseChatGptLunaCheckpoint,
   type ChatGptLunaCheckpoint,
@@ -21,12 +22,15 @@ interface PendingTurn {
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
+  physicalReleaseObserved?: boolean;
 }
 
 type HelperMessage =
   | { type: "ready"; features?: string[] }
-  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
+  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; source?: "wire" | "dom" }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
+  | { type: "event"; id: string; event: "physical_release"; released: boolean; reason?: string }
+  | { type: "event"; id: string; event: "turn_fact"; browserEpoch: number; sourceSequence: number; fact: WebBrowserFact }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number }
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
@@ -63,6 +67,36 @@ function parseHelperMessage(line: string): HelperMessage {
   }
   if (message.type === "event") {
     const event = message.event;
+    if (event === "turn_fact") {
+      const fact = message.fact;
+      if (!Number.isSafeInteger(message.browserEpoch) || (message.browserEpoch as number) < 0
+        || !Number.isSafeInteger(message.sourceSequence) || (message.sourceSequence as number) <= 0
+        || !fact || typeof fact !== "object" || Array.isArray(fact)) {
+        throw new Error("Launcher browser helper turn fact is invalid");
+      }
+      const detail = fact as Record<string, unknown>;
+      const valid = detail.type === "browser_rebound"
+        ? detail.browserEpoch === message.browserEpoch
+        : detail.type === "tool_boundary_observed"
+          ? Number.isSafeInteger(detail.revision) && (detail.revision as number) > 0
+          : detail.type === "final_candidate"
+            ? typeof detail.answer === "string" && detail.answer.length <= 5_000_000
+              && (detail.source === "wire" || detail.source === "dom")
+              && (detail.webConversationId === undefined
+                || (typeof detail.webConversationId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(detail.webConversationId)))
+            : false;
+      if (!valid) throw new Error("Launcher browser helper turn fact is invalid");
+      return { type: "event", id: message.id, event, browserEpoch: message.browserEpoch as number,
+        sourceSequence: message.sourceSequence as number, fact: detail as WebBrowserFact };
+    }
+    if (event === "physical_release") {
+      if (typeof message.released !== "boolean"
+        || (message.reason !== undefined && typeof message.reason !== "string")) {
+        throw new Error("Launcher browser helper physical release result is invalid");
+      }
+      return { type: "event", id: message.id, event, released: message.released,
+        ...(typeof message.reason === "string" ? { reason: message.reason } : {}) };
+    }
     if (event === "multipart_stage_acknowledged") {
       if (!Number.isSafeInteger(message.stageIndex) || (message.stageIndex as number) <= 0) {
         throw new Error("Launcher browser helper multipart stage index is invalid");
@@ -108,6 +142,7 @@ function parseHelperMessage(line: string): HelperMessage {
     }
     const text = message.text;
     const continuation = message.continuation;
+    const source = message.source;
     if (event === "prepared_selected") {
       if (typeof message.reused !== "boolean") {
         throw new Error("Launcher browser helper prompt selection is invalid");
@@ -123,12 +158,16 @@ function parseHelperMessage(line: string): HelperMessage {
     if (continuation !== undefined && typeof continuation !== "boolean") {
       throw new Error("Launcher browser helper continuation flag is invalid");
     }
+    if (source !== undefined && (event !== "text" || (source !== "wire" && source !== "dom"))) {
+      throw new Error("Launcher browser helper output source is invalid");
+    }
     return {
       type: "event",
       id: message.id,
       event: event as "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text",
       ...(text !== undefined ? { text: text as string } : {}),
       ...(continuation !== undefined ? { continuation: continuation as boolean } : {}),
+      ...(source === "wire" || source === "dom" ? { source } : {}),
     };
   }
   if (message.type === "result") {
@@ -212,6 +251,12 @@ export class LauncherBrowserHelperClient {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     await this.ensureChild();
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    if (turn.onPhysicalRelease && !this.helperFeatures.has("physical-release-v1")) {
+      throw new Error("Launcher browser helper does not support physical release acknowledgement");
+    }
+    if (turn.onBrowserFact && !this.helperFeatures.has("turn-authority-v1")) {
+      throw new Error("Launcher browser helper does not support turn authority observations");
+    }
     if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
       throw new Error(
         "Launcher browser helper does not support multipart acknowledgement forwarding; update or restart the launcher",
@@ -488,7 +533,27 @@ export class LauncherBrowserHelperClient {
           pending,
         ));
       }
-      else if (message.event === "submitted") pending.turn.onSubmitted?.();
+      else if (message.event === "submitted") {
+        try { pending.turn.onSubmitted?.(); }
+        catch (error) { this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending); }
+      }
+      else if (message.event === "physical_release") {
+        pending.physicalReleaseObserved = true;
+        try {
+          pending.turn.onPhysicalRelease?.({ released: message.released,
+            ...(message.reason ? { reason: message.reason } : {}) });
+        } catch (error) {
+          this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending);
+        }
+      }
+      else if (message.event === "turn_fact") {
+        try {
+          pending.turn.onBrowserFact?.({ browserEpoch: message.browserEpoch,
+            sourceSequence: message.sourceSequence, event: message.fact });
+        } catch (error) {
+          this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending);
+        }
+      }
       else if (message.event === "multipart_stage_acknowledged") {
         const multipart = pending.prepared?.multipart;
         if (!multipart
@@ -547,17 +612,30 @@ export class LauncherBrowserHelperClient {
         pending.turn.onLunaCheckpoint({ checkpoint: message.checkpoint, answerHash: message.answerHash });
       }
       else if (message.event === "reasoning" && message.text) {
-        pending.turn.onReasoningSummary?.(message.text, message.continuation === true);
+        try { pending.turn.onReasoningSummary?.(message.text, message.continuation === true); }
+        catch (error) { this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending); }
       }
-      else if (message.event === "commentary" && message.text) pending.turn.onCommentary?.(message.text, message.continuation === true);
-      else if (message.event === "text" && message.text) pending.turn.onTextDelta(message.text);
+      else if (message.event === "commentary" && message.text) {
+        try { pending.turn.onCommentary?.(message.text, message.continuation === true); }
+        catch (error) { this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending); }
+      }
+      else if (message.event === "text" && message.text) {
+        try { pending.turn.onTextDelta(message.text, message.source); }
+        catch (error) { this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending); }
+      }
       return;
     }
     if (message.type === "result") {
+      if (!pending.physicalReleaseObserved) pending.turn.onPhysicalRelease?.({
+        released: false, reason: "Launcher helper returned before confirming physical release",
+      });
       this.finish(message.id);
       if (pending.localFailure) pending.reject(pending.localFailure);
       else pending.resolve(message.text);
     } else if (message.type === "error") {
+      if (!pending.physicalReleaseObserved) pending.turn.onPhysicalRelease?.({
+        released: false, reason: "Launcher helper failed before confirming physical release",
+      });
       const error = message.status !== undefined
         ? new ChatGptWebAdapterError(message.message, {
           status: message.status,
@@ -661,14 +739,19 @@ export class LauncherBrowserHelperClient {
         status: "failed",
         message: "Launcher browser helper exited before completing the turn",
       }).then(
-        () => this.finishWithError(id, pending.localFailure ?? error),
-        controlError => this.finishWithError(
-          id,
-          new AggregateError(
+        () => {
+          pending.physicalReleaseObserved = true;
+          pending.turn.onPhysicalRelease?.({ released: true });
+          this.finishWithError(id, pending.localFailure ?? error);
+        },
+        controlError => {
+          pending.physicalReleaseObserved = true;
+          pending.turn.onPhysicalRelease?.({ released: false, reason: String(controlError) });
+          this.finishWithError(id, new AggregateError(
             [pending.localFailure ?? error, controlError instanceof Error ? controlError : new Error(String(controlError))],
             `Launcher browser helper exited and failed to release turn ${id}`,
-          ),
-        ),
+          ));
+        },
       );
     }
   }

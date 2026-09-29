@@ -27,9 +27,12 @@ test("daemon streams browser lifecycle through the real helper process", async (
       await turn.onMultipartStageAcknowledged?.(2);
       await turn.onSendActivated();
       turn.onSubmitted();
+      turn.onBrowserFact?.({ browserEpoch: 0, sourceSequence: 1,
+        event: { type: "final_candidate", answer: "done", source: "wire" } });
       turn.onReasoningSummary("Reading project");
       turn.onReasoningSummary(" files", true);
       turn.onTextDelta("done");
+      turn.onPhysicalRelease?.({ released: true });
       if (turn.captureLunaCheckpoint) turn.onLunaCheckpoint({
         answerHash: "a".repeat(64),
         checkpoint: {
@@ -83,6 +86,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
   let sendActivated = false;
   let submitted = false;
   let released = false;
+  const physicalReleases: boolean[] = [];
+  const browserFacts: unknown[] = [];
   const client = new LauncherBrowserHelperClient(config);
   try {
     const result = await client.run({
@@ -100,6 +105,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
       onSubmitted: () => { submitted = true; },
       onReasoningSummary: (text, continuation) => reasoning.push({ text, continuation: continuation === true }),
       onTextDelta: text => deltas.push(text),
+      onPhysicalRelease: result => { physicalReleases.push(result.released); },
+      onBrowserFact: fact => { browserFacts.push(fact); },
       captureLunaCheckpoint: true,
       onLunaCheckpoint: checkpoint => checkpoints.push(checkpoint),
     });
@@ -111,6 +118,9 @@ test("daemon streams browser lifecycle through the real helper process", async (
     expect(deltas).toEqual(["done"]);
     expect(sendActivated).toBe(true);
     expect(submitted).toBe(true);
+    expect(physicalReleases).toEqual([true]);
+    expect(browserFacts).toEqual([{ browserEpoch: 0, sourceSequence: 1,
+      event: { type: "final_candidate", answer: "done", source: "wire" } }]);
     expect(acknowledgedStages).toEqual([1, 2]);
     expect(checkpoints).toEqual([{
       answerHash: "a".repeat(64),

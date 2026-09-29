@@ -109,6 +109,21 @@ test("a turn the page read as empty is answered from the observed stream", async
   expect(chatGptWireTelemetrySnapshot().dom_rescues).toBe(1);
 });
 
+test("a complete attributed network answer remains available before DOM rendering", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_network_first", temporaryDirectory(), attachTap);
+  expect(session.currentObservation()).toBeUndefined();
+  await session.attach(page);
+  emitStream(emit, answerStream("[result](</absolute/output file.txt>)"));
+  expect(session.currentObservation()).toMatchObject({
+    answer: "[result](</absolute/output file.txt>)",
+    endedTurn: true,
+    sawDone: true,
+    unappliedDeltas: 0,
+  });
+  expect(session.conclude({ answer: "result", failed: false }).comparison).toBe("length_mismatch");
+});
+
 test("a failed turn carries what ChatGPT said, so the page's guess is not the only account", async () => {
   // The page can see that the surface is unusable but not why. One real failure was an upstream
   // capacity limit read as an expired login.
@@ -192,7 +207,7 @@ test("a handed-off turn is followed onto the socket and observed there", async (
     emit({ kind: "chunk", id: "ws", text: streamItem(`100-${index}`, encoded), at: 2 + index });
   }
   emitStream(emit, [
-    JSON.stringify({ type: "stream_handoff", conversation_id: "conv_1", options: [{ type: "subscribe_ws_topic" }] }),
+    JSON.stringify({ type: "stream_handoff", conversation_id: "conv_1", turn_exchange_id: "t1", options: [{ type: "subscribe_ws_topic", topic_id: "conversation-turn-1" }] }),
     "[DONE]",
   ].map(payload => `data: ${payload}\n\n`).join(""));
 
@@ -200,6 +215,23 @@ test("a handed-off turn is followed onto the socket and observed there", async (
   expect(result.comparison).toBe("agreed");
   expect(result.observation?.answer).toBe("resumed answer");
   expect(chatGptWireTelemetrySnapshot()).toMatchObject({ handoffs_observed: 1, handoffs_followed: 1, exact: 1 });
+});
+
+test("a conflicting WS offset cannot rescue a handed-off turn", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://ws.chatgpt.com/p4/ws/user/u1", at: 1 });
+  const item = (encoded: string) => JSON.stringify({ type: "message", topic_id: "topic-1", offset: "1-0", payload: {
+    type: "conversation-turn-stream", payload: { type: "stream-item", conversation_id: "c1", turn_id: "exchange-1", encoded_item: encoded },
+  } });
+  const answer = `data: ${JSON.stringify({ p: "", o: "add", v: { message: { id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: ["one"] } } } })}\n\n`;
+  emit({ kind: "chunk", id: "ws", text: item(answer), at: 2 });
+  emit({ kind: "chunk", id: "ws", text: item(answer.replace("one", "two")), at: 3 });
+  emitStream(emit, `data: ${JSON.stringify({ type: "stream_handoff", conversation_id: "c1", turn_exchange_id: "exchange-1", options: [{ type: "subscribe_ws_topic", topic_id: "topic-1" }] })}\n\n`);
+  const result = session.conclude({ answer: "", failed: true });
+  expect(result.rescuedAnswer).toBeUndefined();
+  expect(chatGptWireTelemetrySnapshot().handoffs_followed).toBe(0);
 });
 
 test("a continuation the fold cannot read completely is not passed off as the turn", async () => {
@@ -635,8 +667,11 @@ test("only this turn's own stream counts as proof that the turn is still being g
   expect(session.lastTurnActivityAt()).toBeGreaterThanOrEqual(before);
 
   // After a handoff the turn continues as conversation-turn stream items on the socket.
+  emit({ kind: "chunk", id: "w1", text: `data: ${JSON.stringify({ type: "stream_handoff", conversation_id: "c1", turn_exchange_id: "web-1", options: [{ type: "subscribe_ws_topic", topic_id: "topic-1" }] })}\n\n`, at: 6 });
   const handedOff = session.lastTurnActivityAt()!;
   await new Promise(resolve => setTimeout(resolve, 5));
-  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "message", payload: { type: "conversation-turn-stream" } }), at: 7 });
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "message", topic_id: "other-topic", offset: "1-0", payload: { type: "conversation-turn-stream", payload: { type: "stream-item", conversation_id: "c1", turn_id: "web-1", encoded_item: "data: [DONE]\\n\\n" } } }), at: 7 });
+  expect(session.lastTurnActivityAt()).toBe(handedOff);
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "message", topic_id: "topic-1", offset: "1-1", payload: { type: "conversation-turn-stream", payload: { type: "stream-item", conversation_id: "c1", turn_id: "web-1", encoded_item: "data: [DONE]\\n\\n" } } }), at: 8 });
   expect(session.lastTurnActivityAt()).toBeGreaterThan(handedOff);
 });

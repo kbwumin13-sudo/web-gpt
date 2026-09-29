@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
-import { chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
+import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import { chatGptCompactionEpochFingerprint } from "./conversation-key";
+import { WebTurnAuthority } from "./web-turn-authority";
 import {
   chatGptTurnUserRevisionHistory,
   extractChatGptCompactionSourceRevision,
@@ -305,6 +306,8 @@ export class ChatGptTurnSession {
     completed: boolean;
     failure?: Error;
   }>();
+  readonly authority: WebTurnAuthority;
+  readonly restoredFromJournal: boolean;
 
   constructor(
     readonly runtime: ChatGptTurnRuntime,
@@ -313,12 +316,16 @@ export class ChatGptTurnSession {
     readonly nativeTurnId?: string,
     readonly nativeThreadId?: string,
     readonly instruction?: string,
+    authority?: WebTurnAuthority,
+    restoredFromJournal = false,
   ) {
+    this.authority = authority ?? new WebTurnAuthority(nativeTurnId ?? traceId ?? this.sessionId);
+    this.restoredFromJournal = restoredFromJournal;
     this.attachedConversationKey = runtime.conversationKey;
     this.physicalSettlement = runtime.physicalSettlement.then(
-      () => { this.settledPhysical = true; },
+      () => { this.settledPhysical = true; this.authority.dispatch({ type: "released" }); },
       error => {
-        this.settledPhysical = true;
+        this.authority.dispatch({ type: "release_failed", reason: String(error) });
         throw error;
       },
     );
@@ -327,6 +334,17 @@ export class ChatGptTurnSession {
       .catch(error => ({ type: "error", error: error instanceof Error ? error : new Error(String(error)) }) as ChatGptBrowserOutcome)
       .then(outcome => {
       this.settledBrowserOutcome = outcome;
+      if (outcome.type === "error") {
+        this.authority.dispatch({ type: "failed", reason: outcome.error.message });
+      } else if (this.authority.snapshot().submission === "accepted"
+        && this.authority.snapshot().toolCalls.length === 0) {
+        this.authority.dispatch({ type: "final_candidate", answer: outcome.answer,
+          source: runtime.manualControl ? "manual" : this.authority.outputSource() ?? "dom" });
+        if (runtime.mode === "read-only" || runtime.manualControl) {
+          this.authority.dispatch({ type: "fence_begun", revision: 0 });
+          this.authority.dispatch({ type: "fence_committed", revision: 0, committed: true });
+        }
+      }
       return outcome;
     });
   }
@@ -344,7 +362,8 @@ export class ChatGptTurnSession {
       text,
       cancel() {},
     };
-    const session = new ChatGptTurnSession(runtime);
+    const session = new ChatGptTurnSession(runtime, undefined, undefined, undefined, undefined, undefined,
+      new WebTurnAuthority(record.executionKey), true);
     session.setFinalReasoning([...record.reasoning]);
     session.setFinalEvents([...record.events]);
     return session;
@@ -412,6 +431,9 @@ export class ChatGptTurnSession {
   markResultDelivered(callId: string): void {
     if (!this.outstandingById.delete(callId)) throw new Error(`ChatGPT bridge tool result does not match an outstanding call: ${callId}`);
     this.deliveredResultIds.add(callId);
+    if (this.authority.snapshot().toolCalls.includes(callId)) {
+      this.authority.dispatch({ type: "tool_result", callId });
+    }
     if (this.outstandingById.size === 0) {
       this.outstandingReasoning = [];
       this.outstandingPrelude = [];
@@ -491,6 +513,7 @@ export class ChatGptTurnSession {
   }
 
   cancel(reason?: Error): void {
+    this.authority.dispatch({ type: "cancelled", reason: reason?.message ?? "turn retired" });
     this.runtime.cancel(reason);
   }
 
@@ -542,7 +565,7 @@ export class ChatGptTurnSessions {
 
   getOrCreate(
     key: string,
-    start: () => ChatGptTurnRuntime,
+    start: (authority: WebTurnAuthority) => ChatGptTurnRuntime,
     traceId?: string,
     ownerKey?: string,
     nativeTurnId?: string,
@@ -562,6 +585,12 @@ export class ChatGptTurnSessions {
       this.entries.set(key, session);
       return session;
     }
+    if (chatGptTurnResultJournal.hasUnresolvedSend(key)) {
+      throw new ChatGptWebAdapterError(
+        "The previous ChatGPT submission may have run before this backend restarted. Inspect its workspace effects before starting a new Codex turn; the same turn will not be sent again.",
+        { status: 409, errorType: "invalid_request_error", code: "submission_outcome_unknown", retryable: false },
+      );
+    }
     const active = [...this.entries.values()].filter(session => session.isActive()).length;
     if (active >= MAX_CHATGPT_BROWSER_TABS) {
       throw new Error(
@@ -569,7 +598,8 @@ export class ChatGptTurnSessions {
       );
     }
     if (this.entries.size >= this.maxEntries) throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
-    const session = new ChatGptTurnSession(start(), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction);
+    const authority = new WebTurnAuthority(key);
+    const session = new ChatGptTurnSession(start(authority), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction, authority);
     this.entries.set(key, session);
     const conversationKey = session.conversationKey();
     if (conversationKey) this.conversationHeads.set(conversationKey, session);
@@ -579,7 +609,7 @@ export class ChatGptTurnSessions {
   async getOrCreateAfterOwnerRetirement(
     key: string,
     ownerKey: string,
-    start: () => ChatGptTurnRuntime,
+    start: (authority: WebTurnAuthority) => ChatGptTurnRuntime,
     traceId?: string,
     signal?: AbortSignal,
     nativeTurnId?: string,
@@ -874,7 +904,7 @@ export class ChatGptTurnSessions {
   private prune(): void {
     const cutoff = Date.now() - this.ttlMs;
     for (const [key, session] of this.entries) {
-      if (session.isActive() || session.lastUsedAt() >= cutoff) continue;
+      if (session.isActive() || !session.isPhysicallySettled() || session.lastUsedAt() >= cutoff) continue;
       session.cancel();
       this.entries.delete(key);
       this.forgetConversationHead(session);
@@ -897,7 +927,7 @@ export class ChatGptTurnSessions {
     this.retirements.set(key, retirement);
     void retirement.then(() => {
       if (this.retirements.get(key) === retirement) this.retirements.delete(key);
-    });
+    }).catch(() => {});
     if (session.ownerKey) {
       const previous = this.ownerRetirements.get(session.ownerKey);
       const ownerRetirement = previous
@@ -908,7 +938,7 @@ export class ChatGptTurnSessions {
         if (this.ownerRetirements.get(session.ownerKey!) === ownerRetirement) {
           this.ownerRetirements.delete(session.ownerKey!);
         }
-      });
+      }).catch(() => {});
     }
     if (conversationKey) {
       const previous = this.conversationRetirements.get(conversationKey);

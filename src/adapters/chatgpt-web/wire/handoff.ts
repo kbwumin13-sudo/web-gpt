@@ -1,113 +1,129 @@
-/**
- * Following a turn that ChatGPT moved off its conversation request.
- *
- * A turn can end its `POST /backend-api/f/conversation` after four frames, the last of them an
- * envelope naming where it continues:
- *
- *     {"type":"stream_handoff","conversation_id":"…","turn_exchange_id":"…",
- *      "options":[{"type":"resume_sse_endpoint","topic_id":"…"},
- *                 {"type":"subscribe_ws_topic","topic_id":"…"}]}
- *
- * The page takes one of the two. Observed live, it subscribes on the WebSocket it already holds
- * open, and the turn arrives there as topic messages that each carry a slice of the very same
- * event-stream text the HTTP response would have carried:
- *
- *     {"type":"message","topic_id":"conversation-turn-…","offset":"1789721328178-0",
- *      "payload":{"type":"conversation-turn-stream",
- *                 "payload":{"type":"stream-item","conversation_id":"…","turn_id":"…",
- *                            "encoded_item":"event: delta\ndata: {…}\n\n"}}}
- *
- * So there is no second protocol to model: unwrapping the envelopes and concatenating
- * `encoded_item` reproduces the stream, and the existing decoder and fold read it unchanged. On the
- * turn this was decoded from, that reassembly yielded 480 frames, no unrecognised shapes, no
- * unapplied patches, and an answer identical to the one the page displayed.
- *
- * The socket is shared: it also carries `conversations`, `app_notifications` and subscription
- * replies. Items are therefore matched on the conversation the handoff named rather than on the
- * topic id, which the envelope and the messages express differently.
- */
+/** Reassemble a handed-off SSE stream from page-external WebSocket records. */
+import type { SseFrame } from "./sse-frames";
 
-/** The envelope type that moves a turn off its conversation request. */
 export const STREAM_HANDOFF = "stream_handoff";
 
-interface StreamItem {
-  /** Redis-stream style `<milliseconds>-<sequence>`, not a number. */
-  offset: string;
-  conversationId?: string;
-  encoded: string;
+type RecordValue = Record<string, unknown>;
+const record = (value: unknown): value is RecordValue => value !== null && typeof value === "object" && !Array.isArray(value);
+const nonempty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+
+export interface HandoffBinding {
+  conversationId: string;
+  /** Web topic IDs explicitly offered by this handoff. */
+  topicIds: readonly string[];
+  /** An exchange ID is Web-owned; it is never a Codex turn ID. */
+  turnExchangeId?: string;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-/** `<milliseconds>-<sequence>`; a malformed offset sorts first rather than throwing. */
-function offsetOrder(offset: string): [number, number] {
-  const [milliseconds, sequence] = offset.split("-");
-  return [Number(milliseconds) || 0, Number(sequence) || 0];
-}
-
-function streamItem(message: unknown): StreamItem | undefined {
-  if (!isRecord(message) || message.type !== "message") return undefined;
-  const outer = message.payload;
-  if (!isRecord(outer) || outer.type !== "conversation-turn-stream") return undefined;
-  const item = outer.payload;
-  if (!isRecord(item) || item.type !== "stream-item") return undefined;
-  const encoded = item.encoded_item;
-  if (typeof encoded !== "string" || encoded.length === 0) return undefined;
+/** Only the handoff envelope can authorize a WS topic. Missing or conflicting envelopes do not bind. */
+export function handoffBinding(frames: readonly SseFrame[]): HandoffBinding | undefined {
+  const handoffs: RecordValue[] = [];
+  for (const frame of frames) {
+    try {
+      const value: unknown = JSON.parse(frame.data);
+      if (record(value) && value.type === STREAM_HANDOFF) handoffs.push(value);
+    } catch { /* Other SSE frames carry deltas or [DONE]. */ }
+  }
+  if (handoffs.length !== 1) return undefined;
+  const handoff = handoffs[0]!;
+  if (!nonempty(handoff.conversation_id) || !nonempty(handoff.turn_exchange_id) || !Array.isArray(handoff.options)) return undefined;
+  const topicIds = handoff.options.filter(record)
+    .filter(option => option.type === "subscribe_ws_topic" && nonempty(option.topic_id))
+    .map(option => option.topic_id as string);
+  if (topicIds.length === 0) return undefined;
   return {
-    offset: typeof message.offset === "string" ? message.offset : "",
-    ...(typeof item.conversation_id === "string" ? { conversationId: item.conversation_id } : {}),
-    encoded,
+    conversationId: handoff.conversation_id,
+    topicIds: [...new Set(topicIds)],
+    turnExchangeId: handoff.turn_exchange_id,
   };
 }
 
-/** Every stream item inside one recorded socket message, which may itself be a batch. */
+interface StreamItem {
+  topicId: string;
+  conversationId: string;
+  turnId?: string;
+  offset: string;
+  encoded: string;
+}
+
+function streamItem(value: unknown): StreamItem | undefined {
+  if (!record(value) || value.type !== "message" || !nonempty(value.topic_id) || !nonempty(value.offset)) return undefined;
+  const outer = value.payload;
+  if (!record(outer) || outer.type !== "conversation-turn-stream") return undefined;
+  const item = outer.payload;
+  if (!record(item) || item.type !== "stream-item" || !nonempty(item.conversation_id) || !nonempty(item.encoded_item)) return undefined;
+  return {
+    topicId: value.topic_id,
+    conversationId: item.conversation_id,
+    ...(nonempty(item.turn_id) ? { turnId: item.turn_id } : {}),
+    offset: value.offset,
+    encoded: item.encoded_item,
+  };
+}
+
 function itemsOfMessage(line: string): StreamItem[] {
-  let decoded: unknown;
   try {
-    // Message framing records one JSON-encoded message per line.
-    decoded = JSON.parse(line);
-  } catch {
-    return [];
-  }
-  let payload: unknown = decoded;
-  if (typeof decoded === "string") {
-    try {
-      payload = JSON.parse(decoded);
-    } catch {
-      return [];
-    }
-  }
-  const messages = Array.isArray(payload) ? payload : [payload];
-  return messages.map(streamItem).filter((item): item is StreamItem => item !== undefined);
+    let value: unknown = JSON.parse(line);
+    if (typeof value === "string") value = JSON.parse(value);
+    return (Array.isArray(value) ? value : [value]).map(streamItem).filter((item): item is StreamItem => item !== undefined);
+  } catch { return []; }
+}
+
+const offsetPattern = /^(\d+)-(\d+)$/;
+function compareOffsets(a: string, b: string): number {
+  const left = offsetPattern.exec(a);
+  const right = offsetPattern.exec(b);
+  if (!left || !right) return !left && !right ? a.localeCompare(b) : left ? 1 : -1;
+  const milliseconds = BigInt(left[1]!) - BigInt(right[1]!);
+  if (milliseconds !== 0n) return milliseconds < 0n ? -1 : 1;
+  const sequence = BigInt(left[2]!) - BigInt(right[2]!);
+  return sequence === 0n ? 0 : sequence < 0n ? -1 : 1;
+}
+
+export interface ResumedStream {
+  stream: string;
+  /** A collision invalidates the whole candidate, including any apparent final answer. */
+  conflict: boolean;
+  /** Explicit Web turn identity found on the selected topic, when supplied. */
+  webTurnId?: string;
 }
 
 /**
- * The event-stream text a socket carried for one conversation, or an empty string when it carried
- * none of it.
- *
- * Ordering is by the server's own offsets rather than by arrival. The two agreed on the recorded
- * turn, but agreement observed once is not a guarantee, and reassembling a patch stream out of
- * order would corrupt it silently — every patch would still apply.
+ * A bound handoff requires its offered topic and conversation, with exactly one Web turn on that
+ * topic. `turn_exchange_id` and WebSocket `turn_id` name different protocol fields; equality is not
+ * assumed. Browser authority still has to associate this evidence with its own Codex turn.
  */
-export function resumedConversationStream(raw: string, conversationId?: string): string {
-  const items: StreamItem[] = [];
-  for (const line of raw.split("\n")) {
-    if (line.length === 0) continue;
-    for (const item of itemsOfMessage(line)) {
-      // An unidentified conversation is kept: the socket only carries turn streams under this
-      // shape, and refusing them would lose a turn to a field that happened to be absent.
-      if (conversationId !== undefined && item.conversationId !== undefined && item.conversationId !== conversationId) {
-        continue;
-      }
-      items.push(item);
-    }
+export function resumeHandoffStream(raw: string, binding: HandoffBinding): ResumedStream {
+  const items = raw.split("\n").flatMap(line => line ? itemsOfMessage(line) : [])
+    .filter(item => item.conversationId === binding.conversationId && binding.topicIds.includes(item.topicId));
+  const ids = [...new Set(items.map(item => item.turnId).filter(nonempty))];
+  if (ids.length > 1) return { stream: "", conflict: true };
+  const webTurnId = ids[0];
+  if (!webTurnId || items.some(item => item.turnId === undefined)) return { stream: "", conflict: false };
+  const selected = items.filter(item => item.turnId === webTurnId);
+  if (selected.length === 0) return { stream: "", conflict: false };
+  const offsets = new Map<string, string>();
+  for (const item of selected) {
+    const previous = offsets.get(item.offset);
+    if (previous !== undefined && previous !== item.encoded) return { stream: "", conflict: true };
+    offsets.set(item.offset, item.encoded);
   }
-  items.sort((left, right) => {
-    const [leftMs, leftSeq] = offsetOrder(left.offset);
-    const [rightMs, rightSeq] = offsetOrder(right.offset);
-    return leftMs === rightMs ? leftSeq - rightSeq : leftMs - rightMs;
-  });
-  return items.map(item => item.encoded).join("");
+  return {
+    stream: [...offsets].sort(([a], [b]) => compareOffsets(a, b)).map(([, encoded]) => encoded).join(""),
+    conflict: false,
+    ...(webTurnId ? { webTurnId } : {}),
+  };
+}
+
+/** Legacy diagnostic selection: only a single conversation/topic/Web-turn group can be returned. */
+export function resumedConversationStream(raw: string, conversationId?: string): string {
+  const items = raw.split("\n").flatMap(line => line ? itemsOfMessage(line) : [])
+    .filter(item => conversationId === undefined || item.conversationId === conversationId);
+  const groups = new Map<string, HandoffBinding>();
+  for (const item of items) {
+    const key = JSON.stringify([item.conversationId, item.topicId, item.turnId]);
+    groups.set(key, { conversationId: item.conversationId, topicIds: [item.topicId], ...(item.turnId ? { turnExchangeId: item.turnId } : {}) });
+  }
+  if (groups.size !== 1) return "";
+  return resumeHandoffStream(raw, [...groups.values()][0]!).stream;
 }

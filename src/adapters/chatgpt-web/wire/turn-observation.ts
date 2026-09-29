@@ -33,6 +33,8 @@ const PARTS_PATH = /^\/message\/content\/parts\/(\d+)$/;
 interface MessageState {
   id?: string;
   role?: string;
+  channel?: string;
+  hidden: boolean;
   recipient?: string;
   contentType?: string;
   parts: string[];
@@ -50,6 +52,8 @@ export interface ChatGptWireObservation {
   answer: string;
   /** Reasoning and status commentary, which native Codex renders separately from the answer. */
   reasoning: string;
+  /** Visible commentary blocks; hidden reasoning and tool payloads are excluded. */
+  commentaryBlocks?: readonly { id: string; text: string; complete: boolean }[];
   /** Messages addressed to a tool rather than to the user. */
   toolCallCount: number;
   /** The server marked a message as ending the turn. */
@@ -66,7 +70,7 @@ export interface ChatGptWireObservation {
 }
 
 function emptyMessage(): MessageState {
-  return { parts: [], priorSegments: [], endTurn: false };
+  return { parts: [], priorSegments: [], endTurn: false, hidden: false };
 }
 
 /**
@@ -110,12 +114,16 @@ function messageFromValue(value: unknown): MessageState | undefined {
   const content = record.content && typeof record.content === "object" && !Array.isArray(record.content)
     ? record.content as Record<string, unknown>
     : undefined;
+  const metadata = record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
+    ? record.metadata as Record<string, unknown> : undefined;
   const parts = Array.isArray(content?.parts)
     ? content.parts.filter((part): part is string => typeof part === "string")
     : [];
   return {
     ...(typeof record.id === "string" ? { id: record.id } : {}),
     ...(typeof author?.role === "string" ? { role: author.role } : {}),
+    ...(typeof record.channel === "string" ? { channel: record.channel } : {}),
+    hidden: record.is_hidden === true || metadata?.is_visually_hidden_from_conversation === true,
     ...(typeof record.recipient === "string" ? { recipient: record.recipient } : {}),
     ...(typeof content?.content_type === "string" ? { contentType: content.content_type } : {}),
     parts,
@@ -127,12 +135,24 @@ function messageFromValue(value: unknown): MessageState | undefined {
 
 /** Apply a field replacement inside the current message. Unknown fields are not an error; they are data this fold does not need. */
 function applyMessageField(message: MessageState, path: string, value: unknown): boolean {
+  if (path === "/message/author/role" && typeof value === "string") {
+    message.role = value;
+    return true;
+  }
+  if (path === "/message/channel" && typeof value === "string") {
+    message.channel = value;
+    return true;
+  }
+  if ((path === "/message/is_hidden" || path === "/message/metadata/is_visually_hidden_from_conversation") && typeof value === "boolean") {
+    message.hidden = value;
+    return true;
+  }
   if (path === "/message/status" && typeof value === "string") {
     message.status = value;
     return true;
   }
   if (path === "/message/end_turn") {
-    if (value === true) message.endTurn = true;
+    if (typeof value === "boolean") message.endTurn = value;
     // `false` closes a segment rather than a message. ChatGPT keeps appending a turn's narration
     // and its answer to the same `parts[0]`, marking each pause with `end_turn: false` while it
     // calls a tool, and only the text after the last pause is the answer. Closing the segment here
@@ -158,7 +178,7 @@ function isReasoning(message: MessageState): boolean {
 }
 
 function isToolCall(message: MessageState): boolean {
-  return message.recipient !== undefined && message.recipient !== USER_RECIPIENT;
+  return message.role === "assistant" && message.recipient !== undefined && message.recipient !== USER_RECIPIENT;
 }
 
 /** Fold a sequence of events. Exported separately from the stream form so a transcript replays through it. */
@@ -174,18 +194,18 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
   let stickyOperation: ChatGptPatch["operation"] = "append";
 
   const applyPatch = (patch: ChatGptPatch): void => {
-    if (patch.operation === "add" && patch.path === "") {
-      const message = messageFromValue(patch.value);
-      if (!message) {
-        unappliedDeltas += 1;
-        return;
-      }
+    const announcedMessage = patch.path === "" ? messageFromValue(patch.value) : undefined;
+    if (announcedMessage) {
+      const message = announcedMessage;
       // The same message id can be re-announced; continue it rather than starting a duplicate.
       const existing = message.id ? messages.find(candidate => candidate.id === message.id) : undefined;
       if (existing) {
         Object.assign(existing, {
           ...message,
           parts: message.parts.length > 0 ? message.parts : existing.parts,
+          role: message.role ?? existing.role,
+          channel: message.channel ?? existing.channel,
+          hidden: message.hidden || existing.hidden,
           // A re-announcement restates the message, not the segments it already closed.
           priorSegments: existing.priorSegments,
         });
@@ -241,6 +261,15 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
       for (const patch of event.patches) applyPatch(patch);
       continue;
     }
+    // A full `{message}` value announces a new document root even when this private protocol
+    // omits p/o. Treating it as the previous field's sticky append loses the final answer.
+    if (event.framePath === undefined && event.frameOperation === undefined
+      && messageFromValue(event.patches[0]!.value)) {
+      applyPatch({ path: "", operation: "add", value: event.patches[0]!.value });
+      stickyPath = "";
+      stickyOperation = "add";
+      continue;
+    }
     const path = event.framePath ?? stickyPath;
     const operation = event.frameOperation ?? stickyOperation;
     applyPatch({ path, operation, value: event.patches[0]!.value });
@@ -250,12 +279,17 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
 
   const spoken: MessageState[] = [];
   const reasoning: string[] = [];
+  const commentaryBlocks: Array<{ id: string; text: string; complete: boolean }> = [];
   const messageIds: string[] = [];
   let toolCallCount = 0;
   let endedTurn = false;
-  for (const message of messages) {
+  for (const [position, message] of messages.entries()) {
     if (message.id) messageIds.push(message.id);
-    if (message.endTurn) endedTurn = true;
+    const finalToUser = message.role === "assistant" && message.recipient === USER_RECIPIENT
+      && (message.channel === undefined || message.channel === "final")
+      && !message.hidden && !isReasoning(message);
+    if (message.endTurn && finalToUser) endedTurn = true;
+    if (message.hidden) continue;
     if (isToolCall(message)) {
       toolCallCount += 1;
       continue;
@@ -263,16 +297,33 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     // Closed segments are the progress narration the model spoke before each tool call. They are
     // commentary rather than the answer, and Codex renders commentary separately, so they are kept
     // there instead of being dropped.
-    if (message.role === "assistant") reasoning.push(...message.priorSegments.filter(segment => segment.length > 0));
+    if (message.role === "assistant" && message.contentType !== "thoughts") reasoning.push(...message.priorSegments.filter(segment => segment.length > 0));
+    if (message.role === "assistant" && message.channel === "commentary") {
+      for (const [segmentIndex, segment] of message.priorSegments.entries()) {
+        if (!segment) continue;
+        commentaryBlocks.push({ id: `${message.id ?? `position:${position}`}:segment:${segmentIndex}`,
+          text: segment, complete: true });
+      }
+    }
     const text = message.parts.join("");
     if (text.length === 0) continue;
-    if (isReasoning(message)) reasoning.push(text);
-    else if (message.role === "assistant") spoken.push(message);
+    if (message.contentType === "thoughts") continue;
+    if (message.contentType === "reasoning_recap") {
+      reasoning.push(text);
+      continue;
+    }
+    if (message.role === "assistant" && message.channel === "commentary") {
+      reasoning.push(text);
+      commentaryBlocks.push({ id: message.id ?? `position:${position}`, text,
+        complete: message.status === "finished_successfully" || position < messages.length - 1 });
+    }
+    else if (finalToUser) spoken.push(message);
   }
 
   return {
     answer: answerOf(spoken),
     reasoning: reasoning.join("\n\n"),
+    commentaryBlocks,
     toolCallCount,
     endedTurn,
     sawDone,

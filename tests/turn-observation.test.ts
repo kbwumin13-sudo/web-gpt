@@ -69,6 +69,47 @@ test("the shape of a real turn folds into its answer", () => {
   expect(observation.unappliedDeltas).toBe(0);
 });
 
+test("an implicit new message root after a tool remains a final answer with its Markdown links", () => {
+  const observation = observe(
+    addMessage({ id: "n1", author: { role: "assistant" }, channel: "commentary", recipient: "all",
+      content: { content_type: "text", parts: ["Checking the file"] } }),
+    finishWithoutEndingTurn(),
+    addMessage({ id: "tool1", author: { role: "tool" }, recipient: "all",
+      content: { content_type: "text", parts: [""] } }),
+    append(0, "tool receipt"),
+    // Recorded Web turns sometimes omit p/o on a new message root; its value still declares a
+    // complete new message. Reusing the previous sticky patch target loses the final message.
+    { v: { message: { id: "f1", author: { role: "assistant" }, channel: "final", recipient: "all",
+      content: { content_type: "text", parts: [""] } } } },
+    append(0, "[file](</tmp/artifact.txt>)"),
+    finish(),
+    "[DONE]",
+  );
+  expect(observation.answer).toBe("[file](</tmp/artifact.txt>)");
+  expect(observation.reasoning).toContain("Checking the file");
+  expect(observation.commentaryBlocks).toContainEqual({
+    id: "n1:segment:0", text: "Checking the file", complete: true,
+  });
+  expect(observation.endedTurn).toBeTrue();
+  expect(observation.unappliedDeltas).toBe(0);
+});
+
+test("visible wire commentary is separate from final text and hidden reasoning", () => {
+  const observation = observe(
+    addMessage({ id: "c1", author: { role: "assistant" }, channel: "commentary", recipient: "all",
+      status: "finished_successfully", content: { content_type: "text", parts: ["Reading the project"] } }),
+    addMessage({ id: "hidden", author: { role: "assistant" }, channel: "commentary", recipient: "all",
+      metadata: { is_visually_hidden_from_conversation: true },
+      content: { content_type: "text", parts: ["private reasoning"] } }),
+    addMessage({ id: "f1", author: { role: "assistant" }, channel: "final", recipient: "all",
+      content: { content_type: "text", parts: ["[file](/tmp/output.txt)"] } }),
+    finish(), "[DONE]",
+  );
+  expect(observation.commentaryBlocks).toEqual([{ id: "c1", text: "Reading the project", complete: true }]);
+  expect(observation.answer).toBe("[file](/tmp/output.txt)");
+  expect(observation.reasoning).not.toContain("private reasoning");
+});
+
 /** The completion patch ChatGPT sends for a message that is *not* the end of the turn. */
 const finishWithoutEndingTurn = () => ({
   p: "",
@@ -199,8 +240,40 @@ test("reasoning is kept apart from the answer by content type, not by position",
   // `m3` is the narration before the second tool call, not half of the answer. This assertion used
   // to read "answer one\n\nanswer two", which is the shape that overstated every real turn.
   expect(observation.answer).toBe("answer two");
-  expect(observation.reasoning).toBe("considering");
+  expect(observation.reasoning).toBe("");
   expect(observation.toolCallCount).toBe(2);
+});
+
+test("only visible assistant final-to-user may end a turn", () => {
+  for (const message of [
+    { id: "system", author: { role: "system" }, recipient: "all", content: { content_type: "text", parts: ["secret"] } },
+    { id: "tool", author: { role: "tool" }, recipient: "all", content: { content_type: "text", parts: ["tool output"] } },
+    { id: "commentary", author: { role: "assistant" }, channel: "commentary", recipient: "all", content: { content_type: "text", parts: ["checking"] } },
+    { id: "hidden", author: { role: "assistant" }, channel: "final", recipient: "all", metadata: { is_visually_hidden_from_conversation: true }, content: { content_type: "text", parts: ["hidden answer"] } },
+  ]) {
+    const reading = observe(addMessage(message), finish(), "[DONE]");
+    expect(reading.endedTurn).toBeFalse();
+    expect(reading.answer).toBe("");
+  }
+});
+
+test("patched role, channel and hidden flag govern the final fold", () => {
+  const reading = observe(
+    addMessage({ id: "m1", author: { role: "assistant" }, recipient: "all", content: { content_type: "text", parts: ["status"] } }),
+    { p: "/message/channel", o: "replace", v: "commentary" },
+    finish(),
+    addMessage({ id: "m2", author: { role: "assistant" }, channel: "final", recipient: "all", content: { content_type: "text", parts: ["private"] } }),
+    { p: "/message/is_hidden", o: "replace", v: true },
+    finish(),
+    addMessage({ id: "m3", author: { role: "system" }, recipient: "all", content: { content_type: "text", parts: ["answer"] } }),
+    { p: "/message/author/role", o: "replace", v: "assistant" },
+    { p: "/message/channel", o: "replace", v: "final" },
+    finish(),
+  );
+  expect(reading.reasoning).toBe("status");
+  expect(reading.answer).toBe("answer");
+  expect(reading.endedTurn).toBeTrue();
+  expect(reading.answer).not.toContain("private");
 });
 
 test("a re-announced message continues rather than duplicating", () => {

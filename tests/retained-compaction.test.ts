@@ -23,6 +23,7 @@ import {
 import { CompactionTransactionStore } from "../src/adapters/chatgpt-web/compaction-transaction";
 import {
   chatGptConversationKey,
+  chatGptConversationKeyComponents,
   retainedConversationResumeRequest,
 } from "../src/adapters/chatgpt-web/conversation-key";
 import {
@@ -146,6 +147,27 @@ test("one browser conversation spans native turns and rotates only at compaction
     }),
   };
   expect(chatGptConversationKey(otherThread, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
+  const trustedEnvironment = {
+    cwd: "/tmp/project-a",
+    roots: ["/tmp/project-a"],
+    writableRoots: ["/tmp/project-a"],
+    sandboxPolicy: { type: "dangerFullAccess" as const },
+    tools: [],
+  };
+  expect(chatGptConversationKey(before, "provider", trustedEnvironment))
+    .not.toBe(chatGptConversationKey(before, "provider", {
+      ...trustedEnvironment,
+      cwd: "/tmp/project-b",
+      roots: ["/tmp/project-b"],
+      writableRoots: ["/tmp/project-b"],
+    }));
+  expect(chatGptConversationKeyComponents(before, trustedEnvironment)?.workspace)
+    .not.toBe(chatGptConversationKeyComponents(before, {
+      ...trustedEnvironment,
+      cwd: "/tmp/project-b",
+      roots: ["/tmp/project-b"],
+      writableRoots: ["/tmp/project-b"],
+    })?.workspace);
   expect(retainedConversationResumeRequest(before)?.context.messages).toEqual([
     { role: "user", content: "Continue with the next step", timestamp: 3 },
   ]);
@@ -1200,6 +1222,68 @@ test("turn result journal treats identical results as idempotent and preserves c
   expect(duplicate.kind).toBe("duplicate");
   expect(conflict.kind).toBe("conflict");
   expect(journal.get("k")?.answer).toBe("summary");
+});
+
+test("a durable send intent prevents crash recovery from treating an unknown turn as unsent", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-send-intent-"));
+  const statePath = join(root, "turn-results.json");
+  try {
+    const original = new TurnResultJournal(60_000, 256, { statePath });
+    expect(original.beginSend("execution_unknown")).toBe("recorded");
+    expect(original.beginSend("execution_unknown")).toBe("duplicate");
+    const restored = new TurnResultJournal(60_000, 256, { statePath });
+    expect(restored.hasUnresolvedSend("execution_unknown")).toBeTrue();
+    expect(restored.get("execution_unknown")).toBeUndefined();
+    restored.record("execution_unknown", "Verified final", [{ type: "text_delta", text: "Verified final" }]);
+    const completed = new TurnResultJournal(60_000, 256, { statePath });
+    expect(completed.hasUnresolvedSend("execution_unknown")).toBeFalse();
+    expect(completed.get("execution_unknown")?.answer).toBe("Verified final");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a restored unknown submission is never started again by a new browser session owner", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-unknown-send-"));
+  const statePath = join(root, "turn-results.json");
+  try {
+    configureChatGptTurnResultJournal(statePath);
+    chatGptTurnResultJournal.beginSend("execution_after_crash");
+    configureChatGptTurnResultJournal(undefined);
+    configureChatGptTurnResultJournal(statePath);
+    const sessions = new ChatGptTurnSessions();
+    let starts = 0;
+    expect(() => sessions.getOrCreate("execution_after_crash", () => {
+      starts += 1;
+      throw new Error("browser must not start");
+    })).toThrow(/may have run before this backend restarted/);
+    expect(starts).toBe(0);
+  } finally {
+    configureChatGptTurnResultJournal(undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a completed answer does not let a new owner reuse an unacknowledged browser surface", async () => {
+  const sessions = new ChatGptTurnSessions();
+  const answer = "Published answer";
+  const old = sessions.getOrCreate("execution-release-failed", () => ({
+    mode: "read-only",
+    browser: Promise.resolve(answer),
+    physicalSettlement: Promise.reject(new Error("launcher end acknowledgement missing")),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel() {},
+  }), "trace_release_failed", "same-owner");
+  expect(await old.browserOutcome).toEqual({ type: "final", answer });
+  await expect(old.physicalSettlement).rejects.toThrow("launcher end acknowledgement missing");
+  expect(old.authority.snapshot().physical).toBe("release_failed");
+  let replacementStarts = 0;
+  await expect(sessions.getOrCreateAfterOwnerRetirement("new-execution", "same-owner", () => {
+    replacementStarts += 1;
+    throw new Error("replacement must not start");
+  })).rejects.toThrow("launcher end acknowledgement missing");
+  expect(replacementStarts).toBe(0);
 });
 
 test("persistent turn result journal restores exact final replay records without reasoning", () => {
