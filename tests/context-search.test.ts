@@ -161,6 +161,46 @@ test("an empty query still browses the history in order", async () => {
   });
 });
 
+test("a searched history reference never resolves to another record after a snapshot replacement", async () => {
+  const socketPath = endpoint(`cgw-context-stable-${process.pid}-${Date.now()}`);
+  const broker = TurnBroker.forSocket(socketPath);
+  const original = { messages: [
+    { role: "user" as const, content: "alpha", timestamp: 1 },
+    { role: "user" as const, content: "beta", timestamp: 2 },
+  ] };
+  const token = await broker.register(environment, 60_000, "stable-reference", original);
+  const retrieve = (action: "search" | "read", arguments_: Record<string, unknown>) =>
+    callTurnBroker<Record<string, unknown>>(socketPath, {
+      method: "context_read", token, contextAction: action, arguments: arguments_,
+    });
+  try {
+    const first = await retrieve("search", { query: "beta" });
+    const beta = (first.messages as Array<{ message_index: number }>)[0]!.message_index;
+    broker.updateContext(token, { messages: [original.messages[1]!,
+      { role: "user", content: "gamma", timestamp: 3 },
+    ] });
+    const betaRead = await retrieve("read", { message_indices: [beta] });
+    expect(betaRead.messages).toEqual([{
+      message_index: beta, message: original.messages[1],
+    }]);
+    const gamma = await retrieve("search", { query: "gamma" });
+    const gammaRef = (gamma.messages as Array<{ message_index: number }>)[0]!.message_index;
+    expect(gammaRef).not.toBe(beta);
+    broker.updateContext(token, { messages: [
+      { role: "user", content: "gamma", timestamp: 3 },
+    ] });
+    expect(retrieve("read", { message_indices: [beta] })).rejects.toThrow(/stale|expired/i);
+    const gammaRead = await retrieve("read", { message_indices: [gammaRef] });
+    expect(gammaRead.messages).toEqual([{
+      message_index: gammaRef,
+      message: { role: "user", content: "gamma", timestamp: 3 },
+    }]);
+  } finally {
+    broker.revoke(token);
+    await broker.close();
+  }
+});
+
 test("a search that found nothing, and one never followed by a read, are counted apart", async () => {
   await withSearch("telemetry", async (search, read) => {
     recordChatGptContextOmitted("telemetry", 40);

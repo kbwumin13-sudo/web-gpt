@@ -10,6 +10,8 @@ export type ChatGptRetainedMissCause =
   | "model_changed"
   | "reasoning_changed"
   | "system_prompt_changed"
+  | "workspace_changed"
+  | "runtime_contract_changed"
   | "compaction_epoch_changed"
   | "conversation_lost";
 
@@ -109,6 +111,8 @@ function rotatedCauses(
   if (previous.model !== current.model) causes.push("model_changed");
   if (previous.reasoning !== current.reasoning) causes.push("reasoning_changed");
   if (previous.systemPrompt !== current.systemPrompt) causes.push("system_prompt_changed");
+  if (previous.workspace !== current.workspace) causes.push("workspace_changed");
+  if (previous.runtimeContract !== current.runtimeContract) causes.push("runtime_contract_changed");
   if (previous.compaction !== current.compaction) causes.push("compaction_epoch_changed");
   return causes;
 }

@@ -78,6 +78,7 @@ interface TurnChannel {
   externalOwner: boolean;
   environment: PendingTurn;
   context?: ChatGptTurnContextSnapshot;
+  contextReferences?: ContextReferences;
   bindingId?: string;
   queuedCallIds: string[];
   deliveredCallIds: Set<string>;
@@ -261,6 +262,52 @@ function cloneContextSnapshot(value: ChatGptTurnContextSnapshot | undefined): Ch
   });
 }
 
+/** Public message_index values are stable for a turn token, even when Codex rebuilds its history. */
+interface ContextReferences {
+  readonly handles: readonly number[];
+  readonly positions: ReadonlyMap<number, number>;
+  readonly signatures: ReadonlyMap<number, string>;
+  readonly nextHandle: number;
+}
+
+const MAX_CONTEXT_HANDLE = 50_000;
+
+function contextRecordSignature(message: CodexMessage): string {
+  return createHash("sha256").update(JSON.stringify(message)).digest("hex");
+}
+
+function contextReferences(
+  snapshot: ChatGptTurnContextSnapshot,
+  previous?: ContextReferences,
+): ContextReferences {
+  const reusable = new Map<string, { handles: number[]; next: number }>();
+  for (const handle of previous?.handles ?? []) {
+    const signature = previous!.signatures.get(handle)!;
+    const queue = reusable.get(signature) ?? { handles: [], next: 0 };
+    queue.handles.push(handle);
+    reusable.set(signature, queue);
+  }
+  const handles: number[] = [];
+  const positions = new Map<number, number>();
+  const signatures = new Map<number, string>();
+  let nextHandle = previous?.nextHandle ?? 0;
+  for (const [index, message] of snapshot.messages.entries()) {
+    const signature = contextRecordSignature(message);
+    const queue = reusable.get(signature);
+    const old = queue && queue.next < queue.handles.length
+      ? queue.handles[queue.next++]
+      : undefined;
+    const handle = old ?? nextHandle++;
+    if (handle > MAX_CONTEXT_HANDLE) {
+      throw new Error("Codex context reference capacity is exhausted for this turn; start a new turn");
+    }
+    handles.push(handle);
+    positions.set(handle, index);
+    signatures.set(handle, signature);
+  }
+  return { handles, positions, signatures, nextHandle };
+}
+
 function contextMessageText(message: CodexMessage): string {
   if (typeof message.content === "string") return message.content;
   return message.content.map(part => {
@@ -313,6 +360,7 @@ function contextSearchTerms(query: string): string[] {
 
 interface ContextSearchEntry {
   index: number;
+  position: number;
   message: CodexMessage;
   text: string;
   haystack: string;
@@ -330,6 +378,7 @@ function contextSearchResult(entry: ContextSearchEntry, previewChars: number): R
 function contextSearch(
   snapshot: ChatGptTurnContextSnapshot,
   arguments_: Record<string, unknown>,
+  references: ContextReferences,
 ): Record<string, unknown> & { total: number } {
   const query = typeof arguments_.query === "string" ? arguments_.query.trim().toLowerCase() : "";
   const offset = Number.isSafeInteger(arguments_.offset) && (arguments_.offset as number) >= 0
@@ -340,7 +389,7 @@ function contextSearch(
     : 10;
   const entries: ContextSearchEntry[] = snapshot.messages.map((message, index) => {
     const text = redactContextText(contextMessageText(message));
-    return { index, message, text, haystack: `${message.role}\n${text}`.toLowerCase() };
+    return { index: references.handles[index]!, position: index, message, text, haystack: `${message.role}\n${text}`.toLowerCase() };
   });
   const page = (matched: ContextSearchEntry[]) => {
     const window = matched.slice(offset, offset + limit);
@@ -375,7 +424,7 @@ function contextSearch(
     // Whole-phrase matches stay ahead of term matches, in their original order, so a query that
     // already worked returns exactly what it returned before with the weaker matches behind it.
     return [{ entry, exactPhrase, matchedTerms, score: (exactPhrase ? terms.length + 1 : 0) + matchedTerms.length }];
-  }).sort((left, right) => right.score - left.score || left.entry.index - right.entry.index);
+  }).sort((left, right) => right.score - left.score || left.entry.position - right.entry.position);
 
   if (ranked.length === 0) {
     return {
@@ -412,21 +461,27 @@ function contextSearch(
 function contextRead(
   snapshot: ChatGptTurnContextSnapshot,
   arguments_: Record<string, unknown>,
+  references: ContextReferences,
 ): Record<string, unknown> {
   if (!Array.isArray(arguments_.message_indices) || arguments_.message_indices.length === 0) {
     throw new Error("codex_context_read requires one or more message_indices");
   }
   const indices = [...new Set(arguments_.message_indices)]
-    .filter((value): value is number => Number.isSafeInteger(value) && value >= 0 && value < snapshot.messages.length)
+    .filter((value): value is number => Number.isSafeInteger(value) && value >= 0 && value <= MAX_CONTEXT_HANDLE)
     .slice(0, 20);
   if (indices.length === 0) throw new Error("codex_context_read message_indices are invalid");
+  const positions = indices.map(index => {
+    const position = references.positions.get(index);
+    if (position === undefined) throw new Error(`Codex context reference ${index} is stale or expired; search again`);
+    return position;
+  });
   const includeSystem = arguments_.include_system === true;
   const maxChars = Number.isSafeInteger(arguments_.max_chars) && (arguments_.max_chars as number) > 0
     ? Math.min(arguments_.max_chars as number, 500_000)
     : 100_000;
-  const selected = indices.map(index => ({
+  const selected = indices.map((index, offset) => ({
     message_index: index,
-    message: snapshot.messages[index],
+    message: snapshot.messages[positions[offset]!],
   }));
   const response: Record<string, unknown> = {
     ...(includeSystem ? { system: snapshot.systemPrompt ?? [] } : {}),
@@ -539,7 +594,10 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel: TurnChannel = {
       traceId,
       externalOwner,
-      ...(context ? { context: cloneContextSnapshot(context) } : {}),
+      ...(context ? (() => {
+        const snapshot = cloneContextSnapshot(context)!;
+        return { context: snapshot, contextReferences: contextReferences(snapshot) };
+      })() : {}),
       environment: {
         ...environment,
         ...(ttlMs !== undefined ? { expiresAt: Date.now() + ttlMs } : {}),
@@ -635,7 +693,10 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
     if (channel.safe?.state === "revoked") throw new Error("Zero Risk turn is already terminal");
-    channel.context = cloneContextSnapshot(context);
+    const snapshot = cloneContextSnapshot(context)!;
+    const references = contextReferences(snapshot, channel.contextReferences);
+    channel.context = snapshot;
+    channel.contextReferences = references;
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -1188,7 +1249,7 @@ export class TurnBroker implements TurnBrokerOwner {
       const channel = this.channels.get(request.token);
       if (!channel) throw new Error("turn token is invalid or expired");
       this.assertSafeHarnessRunning(channel);
-      if (!channel.context) throw new Error("Codex context retrieval is unavailable for this turn");
+      if (!channel.context || !channel.contextReferences) throw new Error("Codex context retrieval is unavailable for this turn");
       const arguments_ = request.arguments ?? {};
       // The compact bootstrap is a bet that the Web model retrieves what it was not sent. Without
       // this line the bet is unobservable: a model that never retrieves looks the same as one that
@@ -1199,13 +1260,13 @@ export class TurnBroker implements TurnBrokerOwner {
       if (request.contextAction === "search") {
         // Recorded after the search rather than before it, because how many records it matched is
         // the part that says whether retrieval worked.
-        const found = contextSearch(channel.context, arguments_);
+        const found = contextSearch(channel.context, arguments_, channel.contextReferences);
         recordChatGptContextRetrieval(channel.traceId, "search", found.total);
         return found;
       }
       if (request.contextAction === "read") {
         recordChatGptContextRetrieval(channel.traceId, "read");
-        return contextRead(channel.context, arguments_);
+        return contextRead(channel.context, arguments_, channel.contextReferences);
       }
       throw new Error("Codex context retrieval action is invalid");
     }

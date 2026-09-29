@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest } from "../../types";
-import { extractChatGptTurnIdentity } from "./environment";
+import { extractChatGptTurnIdentity, type ChatGptTurnEnvironment } from "./environment";
+import { CHATGPT_RUNTIME_CONTRACT_VERSION, chatGptTaskScope } from "./task-scope";
 
 function messageText(item: Record<string, unknown>): string | undefined {
   const content = item.content;
@@ -50,6 +51,7 @@ function compactionEpoch(input: unknown[] | undefined): unknown {
 export function chatGptConversationKey(
   parsed: CodexParsedRequest,
   namespace: string,
+  environment?: ChatGptTurnEnvironment,
 ): string | undefined {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId) return undefined;
@@ -57,6 +59,8 @@ export function chatGptConversationKey(
   return createHash("sha256").update(JSON.stringify({
     namespace,
     threadId: identity.threadId,
+    workspace: environment ? chatGptTaskScope(identity.threadId, namespace, environment).workspaceFingerprint : null,
+    runtimeContract: CHATGPT_RUNTIME_CONTRACT_VERSION,
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,
     // Resume prompts intentionally omit the full system bootstrap. If it changes, rotate the
@@ -83,6 +87,8 @@ export function chatGptCompactionEpochFingerprint(parsed: CodexParsedRequest): s
 /** One fingerprint per key component, so a retained miss can name what actually rotated. */
 export interface ChatGptConversationKeyComponents {
   threadId: string;
+  workspace?: string;
+  runtimeContract?: string;
   model: string;
   reasoning: string;
   systemPrompt: string;
@@ -91,11 +97,14 @@ export interface ChatGptConversationKeyComponents {
 
 export function chatGptConversationKeyComponents(
   parsed: CodexParsedRequest,
+  environment?: ChatGptTurnEnvironment,
 ): ChatGptConversationKeyComponents | undefined {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId) return undefined;
   return {
     threadId: identity.threadId,
+    ...(environment ? { workspace: chatGptTaskScope(identity.threadId, "web", environment).workspaceFingerprint } : {}),
+    runtimeContract: componentFingerprint(CHATGPT_RUNTIME_CONTRACT_VERSION),
     model: componentFingerprint(parsed.modelId),
     reasoning: componentFingerprint(parsed.options.reasoning),
     systemPrompt: componentFingerprint(parsed.context.systemPrompt ?? []),
