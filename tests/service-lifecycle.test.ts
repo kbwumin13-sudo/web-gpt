@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendServiceDefinition, backendServiceDefinitionMatches, backendStartupGatePath, gatewayServiceDefinition, negotiateDrain, releaseBackendStartupGate, waitForPortReleased, writeBackendStartupGate } from "../src/service";
 import { defaultConfig } from "../src/config";
-import { armCandidateRuntime, backendCutoverIdle, candidateClosed, candidateRollbackSafe, gatewayCandidateIdentity } from "../scripts/install-local-candidate";
+import { armCandidateRuntime, backendCutoverIdle, candidateClosed, candidateRollbackSafe, gatewayCandidateIdentity, gatewayPreviousIdentity } from "../scripts/install-local-candidate";
 
 describe("service drain lifecycle", () => {
   test("candidate gate persists until the matching bundle releases it", () => {
@@ -48,6 +48,14 @@ describe("service drain lifecycle", () => {
     expect(candidateClosed({ ...backend, accepting_turns: true }, next)).toBeFalse();
     expect(gatewayCandidateIdentity(gateway, backend, 123, old, next)).toBeTrue();
     expect(gatewayCandidateIdentity({ ...gateway, pid: 124 }, backend, 123, old, next)).toBeFalse();
+  });
+
+  test("a second backend-only upgrade accepts the older preserved gateway", () => {
+    const gateway = { service: "codex-chatgpt-web-gateway", pid: 123,
+      build: { bundleId: "gateway-v1" }, backend_build: { bundleId: "backend-v2" } };
+    expect(gatewayPreviousIdentity(gateway, "backend-v2")).toBeTrue();
+    expect(gatewayPreviousIdentity(gateway, "gateway-v1")).toBeFalse();
+    expect(gatewayPreviousIdentity({ ...gateway, pid: undefined }, "backend-v2")).toBeFalse();
   });
 
   test("native Codex traffic through the preserved gateway does not block a Web backend cutover", () => {

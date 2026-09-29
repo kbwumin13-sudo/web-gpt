@@ -54,6 +54,14 @@ export function gatewayCandidateIdentity(gateway: Health, backend: Health, gatew
     && bundle(backend) === candidateBundle;
 }
 
+/** A previously preserved gateway may be older than the currently installed Web backend. */
+export function gatewayPreviousIdentity(gateway: Health, previousBackendBundle: string): boolean {
+  return gateway.service === "codex-chatgpt-web-gateway"
+    && Number.isSafeInteger(gateway.pid) && (gateway.pid as number) > 0
+    && typeof bundle(gateway) === "string"
+    && bundle(gateway, "backend_build") === previousBackendBundle;
+}
+
 /** The shared gateway keeps serving native Codex requests while only Web backend turns drain. */
 export function backendCutoverIdle(gateway: Health, backend: Health): boolean {
   return gateway.service === "codex-chatgpt-web-gateway"
@@ -168,7 +176,7 @@ async function main(): Promise<void> {
     let gateway = await health(current.nativeGatewayPort);
     gatewayPid = gateway.pid as number;
     originalGatewayBundle = bundle(gateway);
-    if (!Number.isSafeInteger(gatewayPid) || !originalGatewayBundle || originalGatewayBundle !== oldManifest.bundleId) {
+    if (!gatewayPreviousIdentity(gateway, oldManifest.bundleId) || !originalGatewayBundle) {
       throw new Error("Cannot prove original gateway package/process identity");
     }
     // Wake the old backend while the stable link still points at its package.
