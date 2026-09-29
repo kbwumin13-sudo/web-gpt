@@ -7,6 +7,7 @@ import { loadConfig } from "../src/config";
 import { startService, stopService, waitForBackendReady } from "../src/service";
 import { AppServerClient } from "./smoke-installed";
 import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-evidence";
+import { acceptanceRedSquarePng } from "./acceptance-fixtures";
 
 type Tier = "light" | "medium" | "high" | "extra-high";
 type Kind = "remember" | "recall" | "retrieval" | "tool" | "coding" | "image" | "retained-compaction" | "lost-session-compaction";
@@ -64,7 +65,6 @@ const markers: Record<Tier, string> = {
   light: "STABILITY_LIME_618", medium: "STABILITY_COBALT_527",
   high: "STABILITY_GARNET_904", "extra-high": "STABILITY_IVORY_263",
 };
-const redPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAfElEQVR4nNXOQREAMAjAsK7+PTMRPLhGQd7QJnESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ES53Vg6wNShQF/fRSLfgAAAABJRU5ErkJggg==", "base64");
 type Owner = { client: AppServerClient; threadId: string; workspace: string; tier: Tier };
 const owners = new Map<Tier, Owner>();
 let passed = 0;
@@ -90,7 +90,7 @@ async function ownerFor(tier: Tier): Promise<Owner> {
   const workspace = mkdtempSync(join(tmpdir(), `codex-web-stability-${tier}-`));
   const marker = markers[tier];
   writeFileSync(join(workspace, "input.txt"), `${marker}\n`, { mode: 0o600 });
-  writeFileSync(join(workspace, "red.png"), redPng, { mode: 0o600 });
+  writeFileSync(join(workspace, "red.png"), acceptanceRedSquarePng, { mode: 0o600 });
   const pending = { client, threadId: "", workspace, tier };
   owners.set(tier, pending);
   await client.request("initialize", { clientInfo: { name: "codex-web-retained-stability", version: "1" }, capabilities: { experimentalApi: true } });

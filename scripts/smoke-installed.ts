@@ -7,6 +7,7 @@ import { getCodexConfigPath, inspectCodexIntegration } from "../src/codex-integr
 import { loadConfig } from "../src/config";
 import { InstalledTurnEvidence, visibleFinalText } from "./installed-turn-evidence";
 import { requireChatGptWebModelRoute } from "../src/chatgpt-web-models";
+import { acceptanceRedSquarePng } from "./acceptance-fixtures";
 
 type RpcMessage = {
   id?: number;
@@ -269,10 +270,7 @@ async function main(): Promise<void> {
       liveWorkspace = workspace;
       if (liveWorkspaceTask || liveToolRead) writeFileSync(join(workspace, "input.txt"), "alpha\n", { mode: 0o600 });
       const redImagePath = join(workspace, "red.png");
-      if (liveImage) writeFileSync(redImagePath, Buffer.from(
-        "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAfElEQVR4nNXOQREAMAjAsK7+PTMRPLhGQd7QJnESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ESJ3ES53Vg6wNShQF/fRSLfgAAAABJRU5ErkJggg==",
-        "base64",
-      ), { mode: 0o600 });
+      if (liveImage) writeFileSync(redImagePath, acceptanceRedSquarePng, { mode: 0o600 });
       const started = await client.request("thread/start", {
         cwd: workspace,
         model: liveModel,
