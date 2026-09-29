@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { atomicWriteFile } from "../../config";
 import type { AdapterEvent } from "../../types";
+import type { ChatGptTaskScope } from "./task-scope";
 
 export interface TurnResultRecord {
   readonly executionKey: string;
@@ -9,6 +10,7 @@ export interface TurnResultRecord {
   readonly events: readonly AdapterEvent[];
   readonly reasoning: readonly string[];
   readonly fingerprint: string;
+  readonly taskScope?: ChatGptTaskScope;
   createdAt: number;
 }
 
@@ -36,10 +38,18 @@ interface StoredTurnResultRecord {
   answer: string;
   events: AdapterEvent[];
   createdAt: number;
+  taskScope?: ChatGptTaskScope;
 }
 
 interface StoredSendIntent {
   executionKey: string;
+  createdAt: number;
+  epoch?: string;
+}
+
+interface StoredHandoffAuthorization {
+  executionKey: string;
+  sourceEpoch: string;
   createdAt: number;
 }
 
@@ -52,6 +62,7 @@ interface StoredSendIntent {
 export class TurnResultJournal {
   private records = new Map<string, TurnResultRecord>();
   private intents = new Map<string, StoredSendIntent>();
+  private handoffs = new Map<string, StoredHandoffAuthorization>();
   private statePath: string | undefined;
   private writeSnapshot: (path: string, data: string) => void;
 
@@ -74,17 +85,20 @@ export class TurnResultJournal {
     const previousPath = this.statePath;
     const previousRecords = this.records;
     const previousIntents = this.intents;
+    const previousHandoffs = this.handoffs;
     const previousWriteSnapshot = this.writeSnapshot;
     this.statePath = statePath;
     this.writeSnapshot = writeSnapshot;
     this.records = new Map();
     this.intents = new Map();
+    this.handoffs = new Map();
     try {
       if (statePath) this.load();
     } catch (error) {
       this.statePath = previousPath;
       this.records = previousRecords;
       this.intents = previousIntents;
+      this.handoffs = previousHandoffs;
       this.writeSnapshot = previousWriteSnapshot;
       throw error;
     }
@@ -95,6 +109,7 @@ export class TurnResultJournal {
     answer: string,
     events: readonly AdapterEvent[] = [],
     reasoning: readonly string[] = [],
+    taskScope?: ChatGptTaskScope,
   ): TurnResultRecordOutcome {
     if (!executionKey.trim()) throw new Error("Turn result execution key is required");
     const normalizedAnswer = answer.trim();
@@ -117,34 +132,57 @@ export class TurnResultJournal {
       reasoning: [...reasoning],
       fingerprint,
       createdAt: Date.now(),
+      ...(taskScope ? { taskScope: structuredClone(taskScope) } : {}),
     };
     records.set(executionKey, record);
     const intents = new Map(this.intents);
     intents.delete(executionKey);
-    this.commit(records, intents);
+    const handoffs = new Map(this.handoffs);
+    handoffs.delete(executionKey);
+    this.commit(records, intents, handoffs);
     return { kind: "recorded", record };
   }
 
   /** Persist before allowing a normal browser Send; an unknown post-crash result must not replay. */
-  beginSend(executionKey: string): "recorded" | "duplicate" {
+  beginSend(executionKey: string, epoch = "legacy"): "recorded" | "duplicate" {
     if (!executionKey.trim()) throw new Error("Turn send execution key is required");
     if (this.records.has(executionKey)) throw new Error("Completed Codex turn cannot be sent again");
     if (this.intents.has(executionKey)) return "duplicate";
-    if (this.intents.size >= this.maxEntries) {
+    const authorization = this.handoffs.get(executionKey);
+    if (authorization && authorization.sourceEpoch === epoch) return "duplicate";
+    if (!authorization && this.intents.size + this.handoffs.size >= this.maxEntries) {
       throw new Error("Turn send intent journal is full; unresolved submissions were preserved");
     }
     const intents = new Map(this.intents);
-    intents.set(executionKey, { executionKey, createdAt: Date.now() });
-    this.commit(new Map(this.records), intents);
+    const handoffs = new Map(this.handoffs);
+    handoffs.delete(executionKey);
+    intents.set(executionKey, { executionKey, epoch, createdAt: Date.now() });
+    this.commit(new Map(this.records), intents, handoffs);
     return "recorded";
   }
 
-  hasUnresolvedSend(executionKey: string): boolean {
-    return this.intents.has(executionKey) && !this.records.has(executionKey);
+  /** A committed handoff retires one known send and authorizes exactly one later epoch. */
+  authorizeHandoff(executionKey: string, sourceEpoch: string): void {
+    const intent = this.intents.get(executionKey);
+    if (!intent || intent.epoch !== sourceEpoch || this.records.has(executionKey)) {
+      throw new Error("Accepted handoff does not match the current durable send intent");
+    }
+    const intents = new Map(this.intents);
+    const handoffs = new Map(this.handoffs);
+    intents.delete(executionKey);
+    handoffs.set(executionKey, { executionKey, sourceEpoch, createdAt: Date.now() });
+    this.commit(new Map(this.records), intents, handoffs);
+  }
+
+  hasUnresolvedSend(executionKey: string, epoch = "legacy"): boolean {
+    if (this.records.has(executionKey)) return false;
+    if (this.intents.has(executionKey)) return true;
+    const authorization = this.handoffs.get(executionKey);
+    return authorization !== undefined && authorization.sourceEpoch === epoch;
   }
 
   unresolvedSendCount(): number {
-    return this.intents.size;
+    return this.intents.size + this.handoffs.size;
   }
 
   get(executionKey: string): TurnResultRecord | undefined {
@@ -168,7 +206,7 @@ export class TurnResultJournal {
   }
 
   clear(): void {
-    this.commit(new Map(), new Map());
+    this.commit(new Map(), new Map(), new Map());
   }
 
   private load(): void {
@@ -182,7 +220,7 @@ export class TurnResultJournal {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("Turn result journal snapshot is invalid");
     }
-    const snapshot = parsed as { version?: unknown; records?: unknown; intents?: unknown };
+    const snapshot = parsed as { version?: unknown; records?: unknown; intents?: unknown; handoffs?: unknown };
     if (snapshot.version !== 1 || !Array.isArray(snapshot.records)) {
       throw new Error("Turn result journal snapshot is invalid");
     }
@@ -208,21 +246,42 @@ export class TurnResultJournal {
       const intent = value as Partial<StoredSendIntent>;
       if (typeof intent.executionKey !== "string" || !intent.executionKey.trim()
         || typeof intent.createdAt !== "number" || !Number.isFinite(intent.createdAt)
+        || (intent.epoch !== undefined && (typeof intent.epoch !== "string" || !intent.epoch.trim()))
         || intents.has(intent.executionKey) || records.has(intent.executionKey)) {
         throw new Error("Turn result journal snapshot is invalid");
       }
-      intents.set(intent.executionKey, { executionKey: intent.executionKey, createdAt: intent.createdAt });
+      intents.set(intent.executionKey, { executionKey: intent.executionKey, createdAt: intent.createdAt,
+        ...(intent.epoch ? { epoch: intent.epoch } : {}) });
     }
+    if (snapshot.handoffs !== undefined && (!Array.isArray(snapshot.handoffs)
+      || snapshot.handoffs.length > this.maxEntries)) throw new Error("Turn result journal snapshot is invalid");
+    const handoffs = new Map<string, StoredHandoffAuthorization>();
+    for (const value of snapshot.handoffs ?? []) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Turn result journal snapshot is invalid");
+      const item = value as Partial<StoredHandoffAuthorization>;
+      if (typeof item.executionKey !== "string" || !item.executionKey.trim()
+        || typeof item.sourceEpoch !== "string" || !item.sourceEpoch.trim()
+        || typeof item.createdAt !== "number" || !Number.isFinite(item.createdAt)
+        || handoffs.has(item.executionKey) || intents.has(item.executionKey) || records.has(item.executionKey)) {
+        throw new Error("Turn result journal snapshot is invalid");
+      }
+      handoffs.set(item.executionKey, { executionKey: item.executionKey,
+        sourceEpoch: item.sourceEpoch, createdAt: item.createdAt });
+    }
+    if (intents.size + handoffs.size > this.maxEntries) throw new Error("Turn result journal snapshot is invalid");
     this.records = records;
     this.intents = intents;
+    this.handoffs = handoffs;
   }
 
-  private commit(records: Map<string, TurnResultRecord>, intents = this.intents): void {
+  private commit(records: Map<string, TurnResultRecord>, intents = this.intents,
+    handoffs = this.handoffs): void {
     if (this.statePath) {
       const snapshot = JSON.stringify({
         version: 1,
         records: [...records.values()].map(storedRecord),
         ...(intents.size > 0 ? { intents: [...intents.values()] } : {}),
+        ...(handoffs.size > 0 ? { handoffs: [...handoffs.values()] } : {}),
       });
       try {
         this.writeSnapshot(this.statePath, snapshot);
@@ -232,6 +291,7 @@ export class TurnResultJournal {
     }
     this.records = records;
     this.intents = intents;
+    this.handoffs = handoffs;
   }
 
   private prune(now = Date.now()): void {
@@ -266,6 +326,7 @@ function storedRecord(record: TurnResultRecord): StoredTurnResultRecord {
     answer: record.answer,
     events: visibleEvents(record.events),
     createdAt: record.createdAt,
+    ...(record.taskScope ? { taskScope: record.taskScope } : {}),
   };
 }
 
@@ -287,6 +348,13 @@ function parseStoredRecord(value: unknown): TurnResultRecord {
       ? { phase: text.phase as Extract<AdapterEvent, { type: "text_delta" }>["phase"] } : {}) }];
   });
   const answer = record.answer.trim();
+  const scope = record.taskScope;
+  if (scope !== undefined && (!scope || typeof scope !== "object" || Array.isArray(scope)
+    || typeof scope.threadId !== "string" || !scope.threadId
+    || typeof scope.namespace !== "string" || !scope.namespace
+    || typeof scope.workspaceFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(scope.workspaceFingerprint))) {
+    throw new Error("Turn result journal snapshot is invalid");
+  }
   return {
     executionKey: record.executionKey,
     answer,
@@ -294,6 +362,7 @@ function parseStoredRecord(value: unknown): TurnResultRecord {
     reasoning: [],
     fingerprint: resultFingerprint(answer, events),
     createdAt,
+    ...(scope ? { taskScope: scope } : {}),
   };
 }
 

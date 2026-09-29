@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { WebTurnAuthority } from "../src/adapters/chatgpt-web/web-turn-authority";
 import { chatGptSessionBinding, chatGptTaskScope } from "../src/adapters/chatgpt-web/task-scope";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 
 test("a tool result and broker fence must settle before a Web final can commit", () => {
   const owner = new WebTurnAuthority("execution-1");
@@ -32,6 +34,23 @@ test("a broker completion fence may settle before the browser serializes its Mar
   expect(owner.snapshot().terminal).toBeUndefined();
   expect(owner.dispatch({ type: "final_candidate", answer: "[result](/absolute/path)", source: "wire" }))
     .toEqual([{ type: "commit_final", answer: "[result](/absolute/path)" }]);
+});
+
+test("a committed final survives a later browser cleanup error", async () => {
+  let rejectBrowser!: (error: Error) => void;
+  const text = new ChatGptTextFeed();
+  const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+  const session = new ChatGptTurnSession({ mode: "tools", token: Promise.resolve("turn-token"),
+    externalProgress: new ChatGptExternalTurnProgress(), browser,
+    physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text, cancel() {} });
+  session.authority.dispatch({ type: "send_activated" });
+  session.authority.dispatch({ type: "submitted" });
+  session.authority.dispatch({ type: "final_candidate", answer: "committed answer", source: "wire" });
+  session.authority.dispatch({ type: "fence_begun", revision: 1 });
+  session.authority.dispatch({ type: "fence_committed", revision: 1, committed: true });
+  rejectBrowser(new Error("late storageState failure"));
+  expect(await session.browserOutcome).toEqual({ type: "final", answer: "committed answer" });
+  expect(text.value()).toBe("committed answer");
 });
 
 test("cancel and an accepted compaction handoff survive late browser events and cleanup failure", () => {

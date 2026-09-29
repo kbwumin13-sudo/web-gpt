@@ -308,6 +308,7 @@ export class ChatGptTurnSession {
   }>();
   readonly authority: WebTurnAuthority;
   readonly restoredFromJournal: boolean;
+  replayTaskScope?: import("./task-scope").ChatGptTaskScope;
 
   constructor(
     readonly runtime: ChatGptTurnRuntime,
@@ -333,6 +334,16 @@ export class ChatGptTurnSession {
       .then(answer => ({ type: "final", answer }) as ChatGptBrowserOutcome)
       .catch(error => ({ type: "error", error: error instanceof Error ? error : new Error(String(error)) }) as ChatGptBrowserOutcome)
       .then(outcome => {
+      const committed = this.authority.snapshot().terminal;
+      if (outcome.type === "error" && committed?.kind === "final") {
+        const alreadyPublished = runtime.text.value();
+        if (!committed.answer.startsWith(alreadyPublished)) {
+          throw new Error("Committed Web final conflicts with previously published Markdown", { cause: outcome.error });
+        }
+        const missing = committed.answer.slice(alreadyPublished.length);
+        if (missing) runtime.text.push(missing);
+        outcome = { type: "final", answer: committed.answer };
+      }
       this.settledBrowserOutcome = outcome;
       if (outcome.type === "error") {
         this.authority.dispatch({ type: "failed", reason: outcome.error.message });
@@ -366,6 +377,7 @@ export class ChatGptTurnSession {
       new WebTurnAuthority(record.executionKey), true);
     session.setFinalReasoning([...record.reasoning]);
     session.setFinalEvents([...record.events]);
+    session.replayTaskScope = record.taskScope;
     return session;
   }
 
@@ -571,21 +583,25 @@ export class ChatGptTurnSessions {
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: string,
+    compactionEpoch = "legacy",
+    expectedTaskScope?: import("./task-scope").ChatGptTaskScope,
   ): ChatGptTurnSession {
     this.prune();
     const existing = this.entries.get(key);
     if (existing) {
       if (existing.supersededError) throw existing.supersededError;
+      this.assertTaskScope(existing, expectedTaskScope);
       existing.touch();
       return existing;
     }
     const replay = chatGptTurnResultJournal.get(key);
     if (replay) {
       const session = ChatGptTurnSession.fromResult(replay);
+      this.assertTaskScope(session, expectedTaskScope);
       this.entries.set(key, session);
       return session;
     }
-    if (chatGptTurnResultJournal.hasUnresolvedSend(key)) {
+    if (chatGptTurnResultJournal.hasUnresolvedSend(key, compactionEpoch)) {
       throw new ChatGptWebAdapterError(
         "The previous ChatGPT submission may have run before this backend restarted. Inspect its workspace effects before starting a new Codex turn; the same turn will not be sent again.",
         { status: 409, errorType: "invalid_request_error", code: "submission_outcome_unknown", retryable: false },
@@ -615,12 +631,15 @@ export class ChatGptTurnSessions {
     nativeTurnId?: string,
     nativeThreadId?: string,
     instruction?: ChatGptInstructionLineage,
+    compactionEpoch = "legacy",
+    expectedTaskScope?: import("./task-scope").ChatGptTaskScope,
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const existing = this.entries.get(key);
       if (existing) {
         if (existing.supersededError) throw existing.supersededError;
+        this.assertTaskScope(existing, expectedTaskScope);
         existing.touch();
         return existing;
       }
@@ -653,7 +672,8 @@ export class ChatGptTurnSessions {
         continue;
       }
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-      return this.getOrCreate(key, start, traceId, ownerKey, nativeTurnId, nativeThreadId, instruction?.current);
+      return this.getOrCreate(key, start, traceId, ownerKey, nativeTurnId, nativeThreadId,
+        instruction?.current, compactionEpoch, expectedTaskScope);
     }
   }
 
@@ -661,6 +681,20 @@ export class ChatGptTurnSessions {
     const session = this.entries.get(key);
     session?.touch();
     return session;
+  }
+
+  private assertTaskScope(
+    session: ChatGptTurnSession,
+    expected?: import("./task-scope").ChatGptTaskScope,
+  ): void {
+    if (!expected) return;
+    const actual = session.authority.sessionBinding()?.task ?? session.replayTaskScope;
+    if (actual?.threadId !== expected.threadId || actual.namespace !== expected.namespace
+      || actual.workspaceFingerprint !== expected.workspaceFingerprint) {
+      throw new ChatGptWebAdapterError("Web result replay cannot prove the current trusted workspace scope", {
+        status: 409, errorType: "invalid_request_error", code: "task_scope_mismatch", retryable: false,
+      });
+    }
   }
 
   findConversationHead(conversationKey: string): ChatGptTurnSession | undefined {

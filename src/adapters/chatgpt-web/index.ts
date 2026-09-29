@@ -53,6 +53,7 @@ import {
   chatGptTurnResultJournal,
   configureChatGptTurnResultJournal,
   TurnResultJournalPersistenceError,
+  type TurnResultJournal,
 } from "./turn-result-journal";
 import {
   canonicalizeCompactionHandoff,
@@ -353,14 +354,27 @@ function recordCompletedWebTurn(
   answer: string,
   events: readonly AdapterEvent[],
   reasoning: readonly string[],
+  taskScope?: import("./task-scope").ChatGptTaskScope,
 ): void {
   // A retained compaction can preserve an ordinary final already journaled under this exact key.
   // Keep its original replay batch rather than overwriting it with the continuation's event shape.
   if (chatGptTurnResultJournal.get(executionKey)?.answer === answer.trim()) return;
-  const outcome = chatGptTurnResultJournal.record(executionKey, answer, events, reasoning);
+  const outcome = chatGptTurnResultJournal.record(executionKey, answer, events, reasoning, taskScope);
   if (outcome.kind === "conflict") {
     throw new Error("Completed ChatGPT answer conflicts with the durable Codex turn result");
   }
+}
+
+/** Persist the accepted control handoff before retiring the old physical browser owner. */
+export function authorizeAcceptedChatGptCompactionSuccessor(
+  source: ChatGptTurnSession,
+  executionKey: string,
+  journal: TurnResultJournal = chatGptTurnResultJournal,
+): void {
+  const sourceEpoch = source.authority.sessionBinding()?.compactionEpoch;
+  if (!sourceEpoch) throw new Error("Compacted Web source has no trusted send epoch");
+  journal.authorizeHandoff(executionKey, sourceEpoch);
+  source.authority.dispatch({ type: "compaction_handoff_accepted", reason: "checkpoint accepted" });
 }
 
 function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Error {
@@ -648,7 +662,8 @@ export function createChatGptWebAdapter(
     const submissionLifecycle = {
       ...(!parsed._compactionRequest ? {
         onSendActivated: () => {
-          const outcome = chatGptTurnResultJournal.beginSend(executionKey);
+          const outcome = chatGptTurnResultJournal.beginSend(executionKey,
+            chatGptCompactionEpochFingerprint(parsed));
           if (outcome === "duplicate") {
             throw new ChatGptWebAdapterError("This Codex turn already authorized a browser submission", {
               status: 409,
@@ -1281,6 +1296,7 @@ export function createChatGptWebAdapter(
                   };
                   let source: ChatGptTurnSession | undefined;
                   let preserveFinalResponse = false;
+                  let handoffAuthorized = false;
                   try {
                     if (compactionMode === "fresh") {
                       return await runFreshCompactionFallback("managed_browser_no_retained_surface");
@@ -1381,6 +1397,11 @@ export function createChatGptWebAdapter(
                       selector: compactionSelector,
                       summary,
                     });
+                    if (!preserveFinalResponse && source.runtime.mode === "tools"
+                      && !source.runtime.manualControl) {
+                      authorizeAcceptedChatGptCompactionSuccessor(source, compactedSourceExecutionKey);
+                      handoffAuthorized = true;
+                    }
                     armTransportDeadline();
                     await withAbort(structuredCompactionCore.cleanup(
                       compactionSelector,
@@ -1403,6 +1424,10 @@ export function createChatGptWebAdapter(
                     const committed = structuredCompactionCore.state(selector);
                     if ((committed.phase === "committed" || committed.phase === "cleaning" || committed.phase === "settled")
                       && committed.summary) {
+                      if (!preserveFinalResponse && source?.runtime.mode === "tools"
+                        && !source.runtime.manualControl && !handoffAuthorized) {
+                        authorizeAcceptedChatGptCompactionSuccessor(source, compactedSourceExecutionKey);
+                      }
                       console.warn("[chatgpt-web] compaction cleanup failed after commit; preserving committed summary");
                       return committed.summary;
                     }
@@ -1508,6 +1533,10 @@ export function createChatGptWebAdapter(
           nativeTurnId,
           nativeIdentity.threadId,
           chatGptInstructionLineage(parsed),
+          chatGptCompactionEpochFingerprint(parsed),
+          environment && nativeIdentity.threadId
+            ? chatGptTaskScope(nativeIdentity.threadId, executionNamespace, environment)
+            : undefined,
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
@@ -1582,6 +1611,7 @@ export function createChatGptWebAdapter(
                   settled.answer,
                   session.eventsForFinalReplay(),
                   session.reasoningForFinalReplay(),
+                  session.authority.sessionBinding()?.task,
                 );
               }
               emitRoundBatch(buffer => emitBrowserCompletion(
@@ -1659,6 +1689,13 @@ export function createChatGptWebAdapter(
                   }
                   if (requests.length > 0) {
                     const revision = externalProgress.recordToolBatch(requests.length);
+                    // A broker claim can prove this Send before the page's submission observer
+                    // calls onSubmitted. Admit the proven tool batch in the same authority state
+                    // before the browser acknowledges its text boundary.
+                    if (session.authority.snapshot().submission === "send_activated") {
+                      session.authority.dispatch({ type: "submitted" });
+                      if (session.runtime.submission) session.runtime.submission.phase = "accepted";
+                    }
                     if (session.authority.snapshot().submission === "accepted") {
                       session.authority.dispatch({ type: "tool_batch",
                         callIds: requests.map(request => request.callId), revision });
@@ -1718,6 +1755,7 @@ export function createChatGptWebAdapter(
                     completedOutcome.answer,
                     session.eventsForFinalReplay(),
                     session.reasoningForFinalReplay(),
+                    session.authority.sessionBinding()?.task,
                   );
                 }
                 emitRoundBatch(buffer => emitBrowserCompletion(

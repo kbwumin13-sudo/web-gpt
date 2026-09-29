@@ -27,6 +27,7 @@ import {
   retainedConversationResumeRequest,
 } from "../src/adapters/chatgpt-web/conversation-key";
 import {
+  authorizeAcceptedChatGptCompactionSuccessor,
   chatGptWebExecutionNamespace,
   createChatGptWebAdapter,
 } from "../src/adapters/chatgpt-web/index";
@@ -1238,6 +1239,81 @@ test("a durable send intent prevents crash recovery from treating an unknown tur
     const completed = new TurnResultJournal(60_000, 256, { statePath });
     expect(completed.hasUnresolvedSend("execution_unknown")).toBeFalse();
     expect(completed.get("execution_unknown")?.answer).toBe("Verified final");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an accepted handoff durably authorizes only the next physical send epoch", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-handoff-intent-"));
+  const statePath = join(root, "turn-results.json");
+  try {
+    const original = new TurnResultJournal(60_000, 256, { statePath });
+    expect(original.beginSend("logical-execution", "epoch-one")).toBe("recorded");
+    expect(original.hasUnresolvedSend("logical-execution", "epoch-two")).toBeTrue();
+    original.authorizeHandoff("logical-execution", "epoch-one");
+    const restored = new TurnResultJournal(60_000, 256, { statePath });
+    expect(restored.hasUnresolvedSend("logical-execution", "epoch-one")).toBeTrue();
+    expect(restored.hasUnresolvedSend("logical-execution", "epoch-two")).toBeFalse();
+    expect(restored.unresolvedSendCount()).toBe(1);
+    expect(restored.beginSend("logical-execution", "epoch-one")).toBe("duplicate");
+    expect(restored.beginSend("logical-execution", "epoch-two")).toBe("recorded");
+    const sent = new TurnResultJournal(60_000, 256, { statePath });
+    expect(sent.hasUnresolvedSend("logical-execution", "epoch-two")).toBeTrue();
+    sent.record("logical-execution", "verified answer");
+    expect(new TurnResultJournal(60_000, 256, { statePath }).unresolvedSendCount()).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepted handoff derives its durable successor authorization from the source binding", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-bound-handoff-"));
+  const statePath = join(root, "turn-results.json");
+  const journal = new TurnResultJournal(60_000, 256, { statePath });
+  const key = "same-logical-execution";
+  const source = new ChatGptTurnSession({ mode: "read-only", browser: Promise.resolve("checkpoint"),
+    physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), cancel() {} });
+  source.authority.attachBinding({ task: { threadId: "thread", namespace: "web",
+    workspaceFingerprint: "a".repeat(64) }, modelId: "gpt-5.6-sol", reasoning: "high",
+    compactionEpoch: "epoch-one", browserGeneration: 0 });
+  try {
+    journal.beginSend(key, "epoch-one");
+    authorizeAcceptedChatGptCompactionSuccessor(source, key, journal);
+    expect(source.authority.snapshot().terminal).toEqual({ kind: "compaction", reason: "checkpoint accepted" });
+    const recovered = new TurnResultJournal(60_000, 256, { statePath });
+    expect(recovered.hasUnresolvedSend(key, "epoch-one")).toBeTrue();
+    expect(recovered.hasUnresolvedSend(key, "epoch-two")).toBeFalse();
+    expect(recovered.beginSend(key, "epoch-two")).toBe("recorded");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a completed turn cannot replay into a different trusted workspace", () => {
+  const key = `scope-replay-${process.pid}-${Date.now()}`;
+  const first = { threadId: "thread", namespace: "web", workspaceFingerprint: "a".repeat(64) };
+  const moved = { ...first, workspaceFingerprint: "b".repeat(64) };
+  try {
+    chatGptTurnResultJournal.record(key, "answer from A", [], [], first);
+    const sessions = new ChatGptTurnSessions();
+    expect(() => sessions.getOrCreate(key, () => { throw new Error("must not start"); },
+      undefined, undefined, undefined, undefined, undefined, "epoch", moved))
+      .toThrow("current trusted workspace scope");
+  } finally {
+    chatGptTurnResultJournal.delete(key);
+  }
+});
+
+test("trusted replay scope survives journal restart and malformed scope fails closed", () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-scope-journal-"));
+  const statePath = join(root, "turn-results.json");
+  const scope = { threadId: "thread", namespace: "web", workspaceFingerprint: "a".repeat(64) };
+  try {
+    new TurnResultJournal(60_000, 256, { statePath }).record("scoped", "answer", [], [], scope);
+    expect(new TurnResultJournal(60_000, 256, { statePath }).get("scoped")?.taskScope).toEqual(scope);
+    const snapshot = JSON.parse(readFileSync(statePath, "utf8")) as { records: Array<Record<string, unknown>> };
+    snapshot.records[0]!.taskScope = null;
+    writeFileSync(statePath, JSON.stringify(snapshot));
+    expect(() => new TurnResultJournal(60_000, 256, { statePath })).toThrow("invalid");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
