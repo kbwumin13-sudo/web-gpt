@@ -46,6 +46,8 @@ if (recordFlag >= 0 && (!args[recordFlag + 1] || args[recordFlag + 1]!.startsWit
 mkdirSync(dirname(recordPath), { recursive: true, mode: 0o700 });
 const record = (entry: Record<string, unknown>): void => appendFileSync(recordPath, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
 const config = loadConfig();
+startService();
+await waitForBackendReady(config);
 const executable = process.env.CODEX_APP_SERVER_EXECUTABLE?.trim() || Bun.which("codex") || resolve("/Applications/ChatGPT.app/Contents/Resources/codex");
 const backendUrl = `http://${config.host}:${config.port}/healthz`;
 const gatewayUrl = `http://${config.host}:${config.nativeGatewayPort}/healthz`;
