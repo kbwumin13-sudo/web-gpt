@@ -331,6 +331,8 @@ observations from another execution or a retired page, tracks outstanding tool c
 final only after the broker confirms its completion fence. The broker still owns the tool capability,
 real tool queue and atomic activity leases. The Launcher helper reports observations and release
 acknowledgements; it does not own a second completion policy.
+The Runtime emits factual commentary at each authorized local tool batch and after its results
+return, so progress remains visible even when the Web model supplies no commentary text.
 
 Before an automatic Send, the Runtime durably records its execution intent and acknowledges the
 helper only after that write succeeds. A crash with an intent but no recorded final is an unknown

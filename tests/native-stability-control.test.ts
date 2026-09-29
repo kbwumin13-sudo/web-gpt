@@ -169,6 +169,8 @@ async function earlyTool() {
     const first=await run(f.adapter,parsed);
     const tool=first.find(e=>e.type==="tool_call_start");
     assert.ok(tool);
+    const toolIndex=first.findIndex(e=>e.type==="tool_call_start");
+    assert.ok(first.slice(0,toolIndex).some(e=>e.type==="text_delta"&&e.phase==="commentary"));
     const session=f.session(parsed);
     assert.equal(session.authority.snapshot().toolBatchRevision,1);
     const follow=structuredClone(parsed);
@@ -177,6 +179,7 @@ async function earlyTool() {
     const second=await run(f.adapter,follow);
     assert.deepEqual(await session.browserOutcome, { type: "final", answer: "tool completed" });
     assert.ok(second.some(e=>e.type==="done"&&e.endTurn));
+    assert.ok(second.some(e=>e.type==="text_delta"&&e.phase==="commentary"));
     assert.equal(session.authority.snapshot().terminal?.kind,"final");
   } finally {await f.close();}
 }
