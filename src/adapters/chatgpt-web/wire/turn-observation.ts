@@ -6,6 +6,7 @@ import {
   type ChatGptPatch,
 } from "./conversation-events";
 import type { ChatGptWireStream } from "./wire-collector";
+import { decodeSseStream, type SseFrame } from "./sse-frames";
 
 /**
  * Folds conversation events into what a turn produced.
@@ -35,6 +36,8 @@ interface MessageState {
   role?: string;
   channel?: string;
   hidden: boolean;
+  hiddenByMessage: boolean;
+  hiddenByMetadata: boolean;
   recipient?: string;
   contentType?: string;
   parts: string[];
@@ -63,6 +66,7 @@ export interface ChatGptWireObservation {
   /** An error the server reported inside the stream. */
   error?: string;
   conversationId?: string;
+  inputMessageIds: string[];
   messageIds: string[];
   counts: ChatGptConversationEventCounts;
   /** Patches whose target or operation this fold does not understand. Zero means the schema is covered. */
@@ -70,7 +74,8 @@ export interface ChatGptWireObservation {
 }
 
 function emptyMessage(): MessageState {
-  return { parts: [], priorSegments: [], endTurn: false, hidden: false };
+  return { parts: [], priorSegments: [], endTurn: false, hidden: false,
+    hiddenByMessage: false, hiddenByMetadata: false };
 }
 
 /**
@@ -124,6 +129,8 @@ function messageFromValue(value: unknown): MessageState | undefined {
     ...(typeof author?.role === "string" ? { role: author.role } : {}),
     ...(typeof record.channel === "string" ? { channel: record.channel } : {}),
     hidden: record.is_hidden === true || metadata?.is_visually_hidden_from_conversation === true,
+    hiddenByMessage: record.is_hidden === true,
+    hiddenByMetadata: metadata?.is_visually_hidden_from_conversation === true,
     ...(typeof record.recipient === "string" ? { recipient: record.recipient } : {}),
     ...(typeof content?.content_type === "string" ? { contentType: content.content_type } : {}),
     parts,
@@ -143,8 +150,20 @@ function applyMessageField(message: MessageState, path: string, value: unknown):
     message.channel = value;
     return true;
   }
-  if ((path === "/message/is_hidden" || path === "/message/metadata/is_visually_hidden_from_conversation") && typeof value === "boolean") {
-    message.hidden = value;
+  if (path === "/message/is_hidden" && typeof value === "boolean") {
+    message.hiddenByMessage = value;
+    message.hidden = message.hiddenByMessage || message.hiddenByMetadata;
+    return true;
+  }
+  if (path === "/message/metadata/is_visually_hidden_from_conversation" && typeof value === "boolean") {
+    message.hiddenByMetadata = value;
+    message.hidden = message.hiddenByMessage || message.hiddenByMetadata;
+    return true;
+  }
+  if (path === "/message/metadata" && value && typeof value === "object" && !Array.isArray(value)) {
+    const hidden = (value as { is_visually_hidden_from_conversation?: unknown }).is_visually_hidden_from_conversation;
+    if (typeof hidden === "boolean") message.hiddenByMetadata = hidden;
+    message.hidden = message.hiddenByMessage || message.hiddenByMetadata;
     return true;
   }
   if (path === "/message/status" && typeof value === "string") {
@@ -186,6 +205,7 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
   const messages: MessageState[] = [];
   let current: MessageState | undefined;
   let conversationId: string | undefined;
+  const inputMessageIds: string[] = [];
   let error: string | undefined;
   let sawDone = false;
   let unappliedDeltas = 0;
@@ -205,6 +225,8 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
           parts: message.parts.length > 0 ? message.parts : existing.parts,
           role: message.role ?? existing.role,
           channel: message.channel ?? existing.channel,
+          hiddenByMessage: message.hiddenByMessage || existing.hiddenByMessage,
+          hiddenByMetadata: message.hiddenByMetadata || existing.hiddenByMetadata,
           hidden: message.hidden || existing.hidden,
           // A re-announcement restates the message, not the segments it already closed.
           priorSegments: existing.priorSegments,
@@ -247,6 +269,7 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     if (event.kind === "control") {
       if (event.type === STREAM_COMPLETE) sawDone = true;
       conversationId ??= event.conversationId;
+      if (event.inputMessageId) inputMessageIds.push(event.inputMessageId);
       continue;
     }
     if (event.kind === "error") {
@@ -298,7 +321,7 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     // commentary rather than the answer, and Codex renders commentary separately, so they are kept
     // there instead of being dropped.
     if (message.role === "assistant" && message.contentType !== "thoughts") reasoning.push(...message.priorSegments.filter(segment => segment.length > 0));
-    if (message.role === "assistant" && message.channel === "commentary") {
+    if (message.role === "assistant" && message.channel === "commentary" && !isReasoning(message)) {
       for (const [segmentIndex, segment] of message.priorSegments.entries()) {
         if (!segment) continue;
         commentaryBlocks.push({ id: `${message.id ?? `position:${position}`}:segment:${segmentIndex}`,
@@ -330,6 +353,7 @@ export function observeConversationEvents(events: readonly ChatGptConversationEv
     ...(error === undefined ? {} : { error }),
     ...(conversationId === undefined ? {} : { conversationId }),
     messageIds,
+    inputMessageIds,
     counts: countConversationEvents(events),
     unappliedDeltas,
   };
@@ -345,5 +369,34 @@ export function observeWireStream(stream: ChatGptWireStream): ChatGptWireObserva
     return { ...observation, error: `ChatGPT conversation request returned HTTP ${stream.status}` };
   }
   if (stream.error !== undefined) return { ...observation, error: stream.error };
+  return observation;
+}
+
+/** A handoff continues one patch document; replay and live observation must fold it identically. */
+export function observeHandoffContinuation(
+  prefix: readonly SseFrame[],
+  continuationSse: string,
+): ChatGptWireObservation | undefined {
+  const suffix = decodeSseStream(continuationSse).map(parseConversationFrame);
+  const tail = observeConversationEvents(suffix);
+  if (!tail.sawDone || tail.error !== undefined) return undefined;
+  const seen = new Map<number, string>();
+  const events: ChatGptConversationEvent[] = [];
+  for (const event of [...prefix.map(parseConversationFrame), ...suffix]) {
+    if (event.kind === "patch" && event.sequence !== undefined) {
+      const encoded = JSON.stringify(event);
+      const previous = seen.get(event.sequence);
+      if (previous !== undefined) {
+        if (previous !== encoded) return undefined;
+        continue;
+      }
+      seen.set(event.sequence, encoded);
+    }
+    events.push(event);
+  }
+  const observation = observeConversationEvents(events);
+  if (observation.error !== undefined || observation.counts.unrecognized > 0
+    || observation.unappliedDeltas > 0 || !observation.endedTurn
+    || !observation.sawDone || !observation.answer.trim()) return undefined;
   return observation;
 }

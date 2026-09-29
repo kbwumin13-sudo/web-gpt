@@ -1,12 +1,10 @@
 import type { Page } from "playwright-core";
-import { observeWireStream, type ChatGptWireObservation } from "./turn-observation";
+import { observeHandoffContinuation, observeWireStream, type ChatGptWireObservation } from "./turn-observation";
 import { buildWireTranscript, wireTranscriptsEnabled, writeWireTranscript } from "./transcript-store";
 import { ChatGptWireCollector, type ChatGptWireStream } from "./wire-collector";
 import { attachChatGptWireTap } from "./cdp-wire-tap";
 import { handoffBinding, resumeHandoffStream, STREAM_HANDOFF } from "./handoff";
-import { decodeSseStream, type SseFrame } from "./sse-frames";
-import { parseConversationFrame } from "./conversation-events";
-import { observeConversationEvents } from "./turn-observation";
+import type { SseFrame } from "./sse-frames";
 
 /**
  * Runs the wire observer alongside the DOM one without giving it any authority.
@@ -290,6 +288,8 @@ function completeEnoughToRescue(wire: ChatGptWireObservation): boolean {
  */
 export class ChatGptWireShadowSession {
   private lastTurnFrameAt: number | undefined;
+  private requestIdsBeforeSend?: Set<string>;
+  private expectedInputMessageId?: string;
   private readonly collector = new ChatGptWireCollector({
     onFrame: (stream, frame) => {
       if (carriesTurnProgress(stream, frame)) {
@@ -327,6 +327,19 @@ export class ChatGptWireShadowSession {
     return this.attached;
   }
 
+  /** A reused page may already carry old conversation requests before this Send is authorized. */
+  beginSubmission(): void {
+    this.requestIdsBeforeSend = new Set(this.collector.snapshot().map(stream => stream.id));
+    this.expectedInputMessageId = undefined;
+  }
+
+  bindSubmittedUserIdentity(identity: string): boolean {
+    const normalized = identity.startsWith("search:user:") ? identity.slice("search:user:".length) : identity;
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(normalized)) return false;
+    this.expectedInputMessageId = normalized;
+    return true;
+  }
+
   /** Install the observer. Never throws: shadow observation must not be able to fail a turn. */
   async attach(page: Page, onFault?: (message: string) => void): Promise<boolean> {
     try {
@@ -351,9 +364,10 @@ export class ChatGptWireShadowSession {
    * SSE frames is not evidence: usage and notification streams can have frames and even 403s.
    * When several attributed requests exist, the final attempt is the one that answered.
    */
-  private conversationStream(): ChatGptWireStream | undefined {
-    const streams = this.collector.snapshot().filter(stream => stream.method.toUpperCase() === "POST");
-    const attributed = streams.filter(stream => {
+  private conversationStreams(): ChatGptWireStream[] {
+    const streams = this.collector.snapshot().filter(stream => stream.method.toUpperCase() === "POST"
+      && !this.requestIdsBeforeSend?.has(stream.id));
+    return streams.filter(stream => {
       if (conversationPath(stream.url)) return true;
       if (stream.frames.length === 0) return false;
       const observation = observeWireStream(stream);
@@ -363,7 +377,10 @@ export class ChatGptWireShadowSession {
         || observation.conversationId !== undefined
         || observation.counts.controlTypes.includes(STREAM_HANDOFF);
     });
-    return attributed.at(-1);
+  }
+
+  private conversationStream(): ChatGptWireStream | undefined {
+    return this.conversationStreams().at(-1);
   }
 
   /** Validated current-turn network projection, before any DOM comparison or terminal decision. */
@@ -371,14 +388,20 @@ export class ChatGptWireShadowSession {
     if (!this.attached || this.collector.counts().evictedWithFrames > 0 || (this.overflowed?.() ?? 0) > 0) {
       return undefined;
     }
-    const stream = this.conversationStream();
+    // A per-page tap can also see unrelated POSTs. Without an exact request binding, more than
+    // one conversation request is ambiguous and must leave content selection to the DOM.
+    const candidates = this.conversationStreams();
+    if (candidates.length !== 1) return undefined;
+    const stream = candidates[0];
     if (!stream || stream.frames.length === 0) return undefined;
     const direct = observeWireStream(stream);
     if (direct.error !== undefined || direct.counts.unrecognized > 0 || direct.unappliedDeltas > 0) return undefined;
+    if (this.requestIdsBeforeSend && (!this.expectedInputMessageId
+      || !direct.inputMessageIds.includes(this.expectedInputMessageId))) return undefined;
     if (direct.counts.controlTypes.includes(STREAM_HANDOFF)) {
       return this.followHandoff(stream);
     }
-    return direct;
+    return direct.conversationId ? direct : undefined;
   }
 
   /**
@@ -400,14 +423,8 @@ export class ChatGptWireShadowSession {
       if (resumed.conflict) return undefined;
       const sse = resumed.stream;
       if (sse.length === 0) continue;
-      // The handoff transports the rest of the same response. Patches on the socket can refer to
-      // an assistant message created in the SSE prefix, so fold both streams in one context.
-      const observation = observeConversationEvents([
-        ...chosen.frames.map(parseConversationFrame),
-        ...decodeSseStream(sse).map(parseConversationFrame),
-      ]);
-      if (observation.counts.unrecognized > 0 || observation.unappliedDeltas > 0) continue;
-      if (!observation.endedTurn || !observation.sawDone || observation.answer.length === 0) continue;
+      const observation = observeHandoffContinuation(chosen.frames, sse);
+      if (!observation) continue;
       matches.push(observation);
     }
     return matches.length === 1 ? matches[0] : undefined;

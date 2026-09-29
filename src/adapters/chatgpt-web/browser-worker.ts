@@ -4925,6 +4925,7 @@ export class ChatGptBrowserWorker {
     // The attributed, complete network reply is the primary final Markdown source. The DOM still
     // operates the page and supplies an answer when the network projection is unavailable.
     const wireShadow = new ChatGptWireShadowSession(turn.traceId, join(dirname(diagnosticsRoot), "wire-transcripts"));
+    let wireUserBound = false;
     let browserEpoch = 0;
     let sourceSequence = 0;
     const reportBrowserFact = (event: import("./web-turn-authority").WebBrowserFact): void => {
@@ -4935,7 +4936,7 @@ export class ChatGptBrowserWorker {
       const observation = wireShadow.currentObservation();
       // ChatGPT citation placeholders require a content-reference renderer not represented in
       // plain Markdown. Let the DOM projection handle those rather than emitting private glyphs.
-      return observation?.endedTurn && observation.sawDone && observation.answer.trim()
+      return observation?.error === undefined && observation?.endedTurn && observation.sawDone && observation.answer.trim()
         && !/[\uE200-\uE20F]/u.test(observation.answer)
         ? observation.answer : undefined;
     };
@@ -4943,7 +4944,8 @@ export class ChatGptBrowserWorker {
     const domCommentaryDelivered = new Set<string>();
     let latestDomCommentary = "";
     const emitDomCommentary = (value: string, continuation?: boolean): void => {
-      if (wireShadow.currentObservation()?.commentaryBlocks?.length) return;
+      if (wireShadow.currentObservation()?.commentaryBlocks?.some(block => block.complete
+        && (!latestDomCommentary || block.text.startsWith(latestDomCommentary)))) return;
       latestDomCommentary = continuation ? latestDomCommentary + value : value;
       domCommentaryDelivered.add(latestDomCommentary);
       turn.onCommentary?.(value, continuation);
@@ -4955,6 +4957,9 @@ export class ChatGptBrowserWorker {
         if (block.text === previous) continue;
         if (!block.text.startsWith(previous)) {
           throw new Error("ChatGPT changed wire commentary after it was relayed to Codex");
+        }
+        if (!previous && latestDomCommentary && !block.text.startsWith(latestDomCommentary)) {
+          continue;
         }
         wireCommentaryDelivered.set(block.id, block.text);
         if (domCommentaryDelivered.has(block.text)) continue;
@@ -5079,6 +5084,20 @@ export class ChatGptBrowserWorker {
       await wireShadow.attach(page, message => console.info(
         `[chatgpt-web] wire shadow trace=${turn.traceId} not attached: ${redactChatGptUiDiagnostic(message)}`,
       ));
+      const bindWireSubmittedUser = async (baseline: ChatGptSubmissionBaseline): Promise<void> => {
+        if (wireUserBound || !wireShadow.isAttached()) return;
+        try {
+          const state = await this.submissionDomState(page, baseline.domCache, turn.abortSignal);
+          const initial = new Set(baseline.initialTurnIdentities);
+          const submitted = state.userIdentities.filter(identity => !initial.has(identity));
+          if (submitted.length === 1) {
+            wireUserBound = wireShadow.bindSubmittedUserIdentity(submitted[0]!);
+          }
+        } catch {
+          // A page that cannot yet expose its submitted user identity leaves network output
+          // untrusted; the existing DOM observer still owns the fallback path.
+        }
+      };
       cloudflareWatch.observe(page);
       const rebindLauncherPage = async (
         attempt: number,
@@ -5409,7 +5428,11 @@ export class ChatGptBrowserWorker {
           checkpoint => diagnostics.capture(page, checkpoint),
           turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
           turn.externalProgress,
-          turn,
+          { onSendActivated: async () => {
+            wireShadow.beginSubmission();
+            wireUserBound = false;
+            await turn.onSendActivated?.();
+          }, onSubmitted: () => turn.onSubmitted?.() },
           completionTracker,
           launcherObservationRecovery
             ? async (...args) => {
@@ -5423,6 +5446,7 @@ export class ChatGptBrowserWorker {
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
+      await bindWireSubmittedUser(submissionBaseline);
       // An accepted message whose assistant turn the reader cannot find is the signature of a
       // reshaped page: record the page's structure while that turn is still unbound.
       const unboundTurnDiagnostic = setTimeout(() => {
@@ -5597,7 +5621,7 @@ export class ChatGptBrowserWorker {
             checkpoint => diagnostics.capture(page, `tool-final-continuation-${checkpoint}`),
             turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
             turn.externalProgress,
-            undefined,
+            { onSendActivated: () => { wireShadow.beginSubmission(); wireUserBound = false; } },
             completionTracker,
             launcherObservationRecovery
               ? async (...args) => {
@@ -5646,6 +5670,7 @@ export class ChatGptBrowserWorker {
         return true;
       };
       for (;;) {
+        await bindWireSubmittedUser(submissionBaseline);
         emitNetworkCommentary();
         const networkAnswer = completedWireAnswer();
         if (responseTurn.wireOnly && networkAnswer === undefined) {

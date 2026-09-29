@@ -393,3 +393,28 @@ test("a batch patch does not move the sticky position for the frames after it", 
   expect(observation.unappliedDeltas).toBe(0);
   expect(observation.messageIds).toEqual(["u1", "a1"]);
 });
+
+test("independent hidden flags and parent metadata keep a final message out of output", () => {
+  const message = { id: "private", author: { role: "assistant" }, recipient: "all", channel: "final",
+    is_hidden: true, metadata: { is_visually_hidden_from_conversation: true }, end_turn: true,
+    content: { content_type: "text", parts: ["private answer"] } };
+  const observation = observe(
+    addMessage(message),
+    { p: "/message/is_hidden", o: "replace", v: false },
+    { p: "/message/metadata", o: "replace", v: { is_visually_hidden_from_conversation: true } },
+    "[DONE]",
+  );
+  expect(observation.answer).toBe("");
+  expect(observation.endedTurn).toBeFalse();
+});
+
+test("closed thoughts segments never enter commentary", () => {
+  const observation = observe(
+    addMessage({ id: "private-thought", author: { role: "assistant" }, recipient: "all",
+      channel: "commentary", end_turn: false,
+      content: { content_type: "thoughts", parts: ["private thought"] } }),
+    { p: "/message/end_turn", o: "replace", v: false },
+  );
+  expect(observation.commentaryBlocks).toEqual([]);
+  expect(observation.reasoning).toBe("");
+});

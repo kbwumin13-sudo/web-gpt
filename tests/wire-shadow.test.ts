@@ -75,6 +75,7 @@ test("agreement is decided on normalised length, because the two paths format Ma
     endedTurn: true,
     sawDone: true,
     messageIds: [],
+    inputMessageIds: [],
     unappliedDeltas: 0,
     counts: {
       total: 0,
@@ -114,7 +115,8 @@ test("a complete attributed network answer remains available before DOM renderin
   const session = new ChatGptWireShadowSession("trace_network_first", temporaryDirectory(), attachTap);
   expect(session.currentObservation()).toBeUndefined();
   await session.attach(page);
-  emitStream(emit, answerStream("[result](</absolute/output file.txt>)"));
+  emitStream(emit, `data: ${JSON.stringify({ type: "message_marker", conversation_id: "conv_1" })}\n\n`
+    + answerStream("[result](</absolute/output file.txt>)"));
   expect(session.currentObservation()).toMatchObject({
     answer: "[result](</absolute/output file.txt>)",
     endedTurn: true,
@@ -241,6 +243,101 @@ test("a WebSocket patch continues the assistant message created in the SSE prefi
     `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`).join(""));
   expect(session.currentObservation()?.answer).toBe("prefix and suffix");
   expect(session.conclude({ answer: "prefix and suffix", failed: false }).comparison).toBe("agreed");
+});
+
+test("network priority rejects two unrelated final POST requests", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  for (const [id, answer] of [["first", "intended"], ["second", "unrelated"]]) {
+    emit({ kind: "request", id, method: "POST", url: "https://chatgpt.com/backend-api/f/conversation", at: 1 });
+    emit({ kind: "response", id, status: 200, at: 2 });
+    emit({ kind: "chunk", id, text: answerStream(answer), at: 3 });
+    emit({ kind: "end", id, at: 4 });
+  }
+  expect(session.currentObservation()).toBeUndefined();
+});
+
+test("a retained page binds network priority to requests opened after this Send", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  emitStream(emit, answerStream("old answer"));
+  session.beginSubmission();
+  expect(session.bindSubmittedUserIdentity("search:user:input-msg-1")).toBeTrue();
+  emit({ kind: "request", id: "current", method: "POST", url: "https://chatgpt.com/backend-api/f/conversation", at: 5 });
+  emit({ kind: "response", id: "current", status: 200, at: 6 });
+  emit({ kind: "chunk", id: "current", at: 7,
+    text: `data: ${JSON.stringify({ type: "input_message", conversation_id: "current-conv",
+      input_message: { id: "input-msg-1" } })}\n\n`
+      + answerStream("current answer") });
+  emit({ kind: "end", id: "current", at: 8 });
+  expect(session.currentObservation()?.answer).toBe("current answer");
+});
+
+test("a handed-off stream error cannot become a final answer", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://chatgpt.com/ws", at: 1 });
+  const tail = [
+    { p: "", o: "add", v: { message: { id: "m", author: { role: "assistant" },
+      recipient: "all", content: { content_type: "text", parts: ["failed answer"] }, end_turn: true } } },
+    { error: "generation failed" }, "[DONE]",
+  ].map(value => `data: ${typeof value === "string" ? value : JSON.stringify(value)}\n\n`).join("");
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "message", topic_id: "topic", offset: "1-0",
+    payload: { type: "conversation-turn-stream", payload: {
+      type: "stream-item", conversation_id: "conv", turn_id: "web-turn", encoded_item: tail,
+    } } }), at: 2 });
+  emitStream(emit, `data: ${JSON.stringify({ type: "stream_handoff", conversation_id: "conv",
+    turn_exchange_id: "exchange", options: [{ type: "subscribe_ws_topic", topic_id: "topic" }] })}\n\n`);
+  expect(session.currentObservation()).toBeUndefined();
+});
+
+test("SSE and WebSocket replay of one patch is applied once", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  const append = { c: 2, p: "/message/content/parts/0", o: "append", v: "B" };
+  const tail = [append, { c: 3, p: "/message/end_turn", o: "replace", v: true }, "[DONE]"]
+    .map(value => `data: ${typeof value === "string" ? value : JSON.stringify(value)}\n\n`).join("");
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://chatgpt.com/ws", at: 1 });
+  emit({ kind: "chunk", id: "ws", text: JSON.stringify({ type: "message", topic_id: "topic", offset: "1-0",
+    payload: { type: "conversation-turn-stream", payload: {
+      type: "stream-item", conversation_id: "conv", turn_id: "web-turn", encoded_item: tail,
+    } } }), at: 2 });
+  const prefix = [
+    { c: 1, p: "", o: "add", v: { message: { id: "m", author: { role: "assistant" },
+      recipient: "all", content: { content_type: "text", parts: ["A"] } } } },
+    append,
+    { type: "stream_handoff", conversation_id: "conv", turn_exchange_id: "exchange",
+      options: [{ type: "subscribe_ws_topic", topic_id: "topic" }] },
+  ];
+  emitStream(emit, prefix.map(value => `data: ${JSON.stringify(value)}\n\n`).join(""));
+  expect(session.currentObservation()?.answer).toBe("AB");
+});
+
+test("a conflicting cross-transport patch sequence rejects the wire candidate", async () => {
+  const { page, emit, attachTap } = fakePage();
+  const session = new ChatGptWireShadowSession("trace_1", temporaryDirectory(), attachTap);
+  await session.attach(page);
+  emit({ kind: "request", id: "ws", method: "WS", url: "wss://chatgpt.com/ws", at: 1 });
+  const tail = [
+    { c: 2, p: "/message/content/parts/0", o: "append", v: "conflict" },
+    { c: 3, p: "/message/end_turn", o: "replace", v: true }, "[DONE]",
+  ].map(value => `data: ${typeof value === "string" ? value : JSON.stringify(value)}\n\n`).join("");
+  emit({ kind: "chunk", id: "ws", at: 2, text: JSON.stringify({ type: "message", topic_id: "topic",
+    offset: "1-0", payload: { type: "conversation-turn-stream", payload: {
+      type: "stream-item", conversation_id: "conv", turn_id: "web-turn", encoded_item: tail,
+    } } }) });
+  emitStream(emit, [
+    { c: 1, p: "", o: "add", v: { message: { id: "m", author: { role: "assistant" },
+      recipient: "all", content: { content_type: "text", parts: ["A"] } } } },
+    { c: 2, p: "/message/content/parts/0", o: "append", v: "B" },
+    { type: "stream_handoff", conversation_id: "conv", turn_exchange_id: "exchange",
+      options: [{ type: "subscribe_ws_topic", topic_id: "topic" }] },
+  ].map(value => `data: ${JSON.stringify(value)}\n\n`).join(""));
+  expect(session.currentObservation()).toBeUndefined();
 });
 
 test("a conflicting WS offset cannot rescue a handed-off turn", async () => {

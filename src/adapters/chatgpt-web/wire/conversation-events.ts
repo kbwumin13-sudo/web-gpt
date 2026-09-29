@@ -35,7 +35,7 @@ export type ChatGptConversationEvent =
   /** The bare protocol marker that opens a stream. */
   | { kind: "protocol"; version: string }
   /** A typed control envelope: stream completion, markers, tokens, conversation metadata. */
-  | { kind: "control"; type: string; conversationId?: string }
+  | { kind: "control"; type: string; conversationId?: string; inputMessageId?: string }
   /**
    * One or more patches against the document.
    *
@@ -130,10 +130,13 @@ export function parseConversationFrame(frame: SseFrame): ChatGptConversationEven
   if (failure !== undefined) return { kind: "error", message: failure };
   const type = stringField(payload, "type");
   if (type !== undefined) {
+    const input = isRecord(payload.input_message) ? payload.input_message : undefined;
     return {
       kind: "control",
       type,
       ...(stringField(payload, "conversation_id") ? { conversationId: stringField(payload, "conversation_id") } : {}),
+      ...(type === "input_message" && stringField(input, "id")
+        ? { inputMessageId: stringField(input, "id") } : {}),
     };
   }
   if ("v" in payload) {

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { decodeSseStream } from "./sse-frames";
-import { observeConversationEvents, type ChatGptWireObservation } from "./turn-observation";
+import { observeConversationEvents, observeHandoffContinuation, type ChatGptWireObservation } from "./turn-observation";
 import { parseConversationFrame } from "./conversation-events";
 import { handoffBinding, resumeHandoffStream } from "./handoff";
 
@@ -79,12 +79,8 @@ export function replayWireCapture(contents: string): WireReplay {
         const resumed = resumeHandoffStream(companion.raw, binding);
         if (resumed.conflict) conflict = true;
         if (resumed.conflict || !resumed.stream) return [];
-        const result = observeConversationEvents([
-          ...prefix.map(parseConversationFrame),
-          ...decodeSseStream(resumed.stream).map(parseConversationFrame),
-        ]);
-        return result.endedTurn && result.sawDone && result.answer && result.counts.unrecognized === 0
-          && result.unappliedDeltas === 0 ? [result] : [];
+        const result = observeHandoffContinuation(prefix, resumed.stream);
+        return result ? [result] : [];
       });
       if (!conflict && candidates.length === 1) observation = candidates[0]!;
     }
