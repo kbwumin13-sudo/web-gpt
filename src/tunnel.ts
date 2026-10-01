@@ -6,12 +6,18 @@ import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { macOsLaunchdProxyEnvironment, runCommand, runChecked } from "./process";
 
-export const TUNNEL_VERSION = "0.0.12";
-const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
+export const TUNNEL_VERSION = "0.0.15";
+const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10", "0.0.12"]);
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const TUNNEL_READY_TIMEOUT_MS = 120_000;
+// Prove connectivity before the gateway's 20-second backend startup budget.
+// Only the first empty poll is shortened; normal polls retain their configured timeout.
+export const TUNNEL_INITIAL_POLL_TIMEOUT = "1s";
 const TUNNEL_STATUS_POLL_INTERVAL_MS = 1_000;
+// Default polls wait 30 seconds, with a 5-second deadline guardrail and at most
+// 10 seconds of retry backoff. Allow that recovery window without accepting old success forever.
+export const TUNNEL_POLL_MAX_AGE_MS = 60_000;
 
 interface TunnelInstallManifest {
   version: 1;
@@ -265,7 +271,7 @@ export function connectTunnel(config: AppConfig): void {
     "--json",
   ], {
     timeout: TUNNEL_READY_TIMEOUT_MS,
-    env: macOsLaunchdProxyEnvironment(),
+    env: { ...macOsLaunchdProxyEnvironment(), CONTROL_PLANE_INITIAL_POLL_TIMEOUT: TUNNEL_INITIAL_POLL_TIMEOUT },
   });
   const structuredOutput = result.stdout.trim();
   const launchError = structuredOutput
@@ -323,7 +329,7 @@ export interface TunnelRuntimeStatus {
    * terminated session, while this check says the tunnel is fine. `tunnel-client` separates the two,
    * so the distinction is read from it rather than inferred.
    */
-  controlPlane?: { state: string; reason?: string };
+  controlPlane?: { state: string; reason?: string; lastSuccessUnixSeconds?: number };
   detail: string;
 }
 
@@ -370,6 +376,24 @@ export function tunnelHealthFileFromInventory(
   }
 }
 
+function pollHealthFromMetrics(metrics: string, now = Date.now()): NonNullable<TunnelRuntimeStatus["controlPlane"]> {
+  const match = /^commands_poll_last_successful_timestamp_seconds(?:\{[^\r\n]*\})?\s+(\S+)(?:\s+\S+)?\s*$/m.exec(metrics);
+  const lastSuccess = match ? Number(match[1]) : NaN;
+  if (!Number.isFinite(lastSuccess) || lastSuccess <= 0) {
+    return { state: "unknown", reason: "No successful control-plane poll observed" };
+  }
+  const ageMs = now - lastSuccess * 1_000;
+  if (ageMs < -5_000) {
+    return { state: "unknown", reason: "Control-plane poll timestamp is in the future" };
+  }
+  const ageSeconds = Math.max(0, Math.floor(ageMs / 1_000));
+  return {
+    state: ageMs <= TUNNEL_POLL_MAX_AGE_MS ? "healthy" : "unhealthy",
+    reason: `Last successful poll ${ageSeconds}s ago (maximum ${TUNNEL_POLL_MAX_AGE_MS / 1_000}s)`,
+    lastSuccessUnixSeconds: lastSuccess,
+  };
+}
+
 async function localTunnelStatus(config: AppConfig): Promise<TunnelRuntimeStatus | undefined> {
   const settings = tunnel(config);
   const inventory = runCommand(
@@ -397,18 +421,24 @@ async function localTunnelStatus(config: AppConfig): Promise<TunnelRuntimeStatus
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2_500);
     try {
-      const [health, ready] = await Promise.all([
+      const [health, ready, controlPlane] = await Promise.all([
         fetch(`${baseUrl}/healthz`, { signal: controller.signal }),
         fetch(`${baseUrl}/readyz`, { signal: controller.signal }),
+        fetch(`${baseUrl}/metrics`, { signal: controller.signal })
+          .then(async response => response.ok
+            ? pollHealthFromMetrics(await response.text())
+            : { state: "unknown", reason: `Control-plane metrics HTTP ${response.status}` })
+          .catch(error => ({ state: "unknown", reason: safeTunnelDetail(error instanceof Error ? error.message : error) })),
       ]);
-      const ok = health.ok && ready.ok;
+      const ok = health.ok && ready.ok && controlPlane.state === "healthy";
       return {
         ok,
         processRunning: true,
         healthy: health.ok,
         ready: ready.ok,
+        controlPlane,
         state: ok ? "ready" : "degraded",
-        detail: `local healthz=${health.status} readyz=${ready.status}`,
+        detail: `local healthz=${health.status} readyz=${ready.status}; control_plane_poll=${controlPlane.state} (${controlPlane.reason})`,
       };
     } finally {
       clearTimeout(timeout);
@@ -557,14 +587,24 @@ export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
   return parseTunnelStatus(tunnelCommandOutput(result), result.status);
 }
 
+/** Startup and operator checks require a recent successful poll from the current runtime. */
+export async function inspectTunnelReadiness(config: AppConfig): Promise<TunnelRuntimeStatus> {
+  const local = await localTunnelStatus(config);
+  if (local) return local;
+  const status = tunnelStatus(config);
+  if (!status.ok) return status;
+  // The CLI's legacy "ready" booleans and historical success alone cannot prove freshness.
+  return { ...status, ok: false, state: "degraded",
+    controlPlane: { state: "unknown", reason: "Current control-plane poll metrics are unavailable" },
+    detail: `${status.detail}; current control-plane poll metrics are unavailable` };
+}
+
 export async function waitForTunnelReady(
   config: AppConfig,
   timeoutMs = TUNNEL_READY_TIMEOUT_MS,
 ): Promise<TunnelRuntimeStatus> {
   const deadline = Date.now() + timeoutMs;
-  const observe = async (): Promise<TunnelRuntimeStatus> => (
-    await localTunnelStatus(config) ?? tunnelStatus(config)
-  );
+  const observe = (): Promise<TunnelRuntimeStatus> => inspectTunnelReadiness(config);
   let status = await observe();
   while (!status.ok && Date.now() < deadline) {
     await new Promise(resolveWait => setTimeout(resolveWait, TUNNEL_STATUS_POLL_INTERVAL_MS));

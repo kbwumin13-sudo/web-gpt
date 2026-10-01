@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { AppConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { macOsSystemProxyEnvironment, runCommand, runChecked } from "./process";
+import { TUNNEL_INITIAL_POLL_TIMEOUT } from "./tunnel";
 
 const LABEL = "io.github.codex-chatgpt-web.tunnel";
 
@@ -51,7 +52,8 @@ function assertMacOs(): void {
 export function tunnelServiceDefinition(config: AppConfig): string {
   const tunnel = settings(config);
   const logDir = join(getConfigDir(), "logs");
-  const args = [tunnel.binaryPath, "run", "--profile-dir", tunnel.profileDir, "--profile", tunnel.profileName];
+  const args = [tunnel.binaryPath, "run", "--profile-dir", tunnel.profileDir, "--profile", tunnel.profileName,
+    "--control-plane.initial-poll-timeout", TUNNEL_INITIAL_POLL_TIMEOUT];
   const environment = macOsSystemProxyEnvironment();
   const proxyEnvironment = ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
     .flatMap(key => typeof environment[key] === "string" && environment[key]!.trim()

@@ -355,6 +355,23 @@ export class ChatGptWireShadowSession {
     return true;
   }
 
+  /** Confirm this authorized Send from an exact request/response input-id match, even before DOM rendering. */
+  acceptSubmittedRequest(): boolean {
+    if (!this.attached || !this.requestIdsBeforeSend
+      || this.collector.counts().evictedWithFrames > 0 || (this.overflowed?.() ?? 0) > 0) return false;
+    const candidates = this.conversationStreams();
+    if (candidates.length !== 1) return false;
+    const stream = candidates[0]!;
+    if (!conversationPath(stream.url) || stream.status !== 200 || stream.error
+      || stream.inputMessageIds?.length !== 1) return false;
+    const id = stream.inputMessageIds[0]!;
+    const observed = observeWireStream(stream);
+    if (observed.error || !observed.conversationId || observed.inputMessageIds.length !== 1
+      || observed.inputMessageIds[0] !== id
+      || (this.expectedInputMessageId !== undefined && this.expectedInputMessageId !== id)) return false;
+    return this.bindSubmittedUserIdentity(id);
+  }
+
   /** Install the observer. Never throws: shadow observation must not be able to fail a turn. */
   async attach(page: Page, onFault?: (message: string) => void): Promise<boolean> {
     try {

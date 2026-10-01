@@ -1,5 +1,26 @@
 import { expect, spyOn, test } from "bun:test";
+import { brotliCompressSync } from "node:zlib";
 import { forwardNativeCodexRequest } from "../src/native-passthrough";
+
+test("native search survives a compressed upstream response across the HTTP proxy", async () => {
+  const body = JSON.stringify({ results: [{ title: "fixture result" }] });
+  const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(
+    brotliCompressSync(Buffer.from(body)),
+    { headers: { "content-type": "application/json", "content-encoding": "br" } },
+  ) });
+  const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request =>
+    forwardNativeCodexRequest(request, "alpha/search", () => fetch(upstream.url)) });
+  try {
+    const response = await fetch(new URL("/v1/alpha/search", proxy.url), {
+      method: "POST", headers: { authorization: "Bearer fixture", "content-type": "application/json" }, body: "{}",
+    });
+    expect(await response.text()).toBe(body);
+    expect(response.headers.get("content-encoding")).toBeNull();
+  } finally {
+    proxy.stop(true);
+    upstream.stop(true);
+  }
+});
 
 test("forwards native Codex requests verbatim to the official backend", async () => {
   const originalBody = Bun.zstdCompressSync(Buffer.from('{"model":"gpt-5.6-sol","stream":true}'));

@@ -37,6 +37,29 @@ afterEach(() => {
 
 type TapAttacher = typeof attachChatGptWireTap;
 
+test.each(["matched", "mismatched", "missing-request-id", "pre-send", "ambiguous", "unrelated"])(
+  "submission uses the server echo of this Send's request identity (%s)", async scenario => {
+    const { page, emit, attachTap } = fakePage();
+    const session = new ChatGptWireShadowSession("submission", temporaryDirectory(), attachTap);
+    await session.attach(page);
+    if (scenario !== "pre-send") session.beginSubmission();
+    const request = (id: string) => emit({ kind: "request", id, method: "POST", at: 1,
+      url: `https://chatgpt.com/backend-api/${scenario === "unrelated" ? "notifications" : "f/conversation"}`,
+      ...(scenario === "missing-request-id" ? {} : { inputMessageIds: ["user-input-123"] }),
+    });
+    request("current");
+    if (scenario === "pre-send") session.beginSubmission();
+    emit({ kind: "response", id: "current", status: 200, at: 2 });
+    emit({ kind: "chunk", id: "current", at: 3, text: `data: ${JSON.stringify({
+      type: "input_message", conversation_id: "current-conversation",
+      input_message: { id: scenario === "mismatched" ? "other-user-123" : "user-input-123" },
+    })}\n\n` });
+    if (scenario === "ambiguous") request("other");
+    expect(session.acceptSubmittedRequest()).toBe(scenario === "matched");
+    expect(session.currentObservation() !== undefined).toBe(scenario === "matched");
+  },
+);
+
 /**
  * A page whose records go straight to the collector the session attached, the way the real tap
  * routes a page's traffic to the current turn. The protocol side is covered in cdp-wire-tap.test.ts.

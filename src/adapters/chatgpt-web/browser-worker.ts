@@ -1378,7 +1378,7 @@ export function chatGptTurnIsComplete(state: {
     && state.completionActionVisible;
 }
 
-export type ChatGptSubmissionEvidence = "user_turn" | "assistant_turn" | "generation_running" | "mcp_tool_call";
+export type ChatGptSubmissionEvidence = "user_turn" | "assistant_turn" | "generation_running" | "mcp_tool_call" | "network_input_message";
 
 export function chatGptSubmissionEvidence(state: {
   initialTurnIdentities: readonly string[];
@@ -3037,10 +3037,12 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
     agentCommentary?: ChatGptAgentCommentaryRelay,
     toolBoundaryObserved?: (revision: number) => void,
+    wireSubmissionAccepted?: () => boolean,
   ): Promise<ChatGptSubmissionEvidence> {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (wireSubmissionAccepted?.()) return "network_input_message";
       const progress = externalProgress?.snapshot();
       if (progress
         && externalProgress
@@ -3879,6 +3881,7 @@ export class ChatGptBrowserWorker {
     recoverObservation?: ChatGptObservationRecovery,
     agentCommentary?: ChatGptAgentCommentaryRelay,
     toolBoundaryObserved?: (revision: number) => void,
+    wireSubmissionAccepted?: () => boolean,
   ): Promise<ChatGptSubmissionEvidence> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3894,6 +3897,7 @@ export class ChatGptBrowserWorker {
           completionTracker,
           agentCommentary,
           toolBoundaryObserved,
+          wireSubmissionAccepted,
         );
         return evidence;
       } catch (error) {
@@ -3935,6 +3939,7 @@ export class ChatGptBrowserWorker {
     recoverObservation?: ChatGptObservationRecovery,
     agentCommentary?: ChatGptAgentCommentaryRelay,
     toolBoundaryObserved?: (revision: number) => void,
+    wireSubmissionAccepted?: () => boolean,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -3976,6 +3981,7 @@ export class ChatGptBrowserWorker {
       recoverObservation,
       agentCommentary,
       toolBoundaryObserved,
+      wireSubmissionAccepted,
     );
     submissionLifecycle?.onSubmitted?.();
     return evidence;
@@ -5448,6 +5454,7 @@ export class ChatGptBrowserWorker {
             : undefined,
           agentCommentary,
           revision => reportBrowserFact({ type: "tool_boundary_observed", revision }),
+          () => wireShadow.acceptSubmittedRequest(),
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
@@ -5493,7 +5500,8 @@ export class ChatGptBrowserWorker {
       let capturedResponse = false;
       let sentAt = Date.now();
       let visibleTrace = new ChatGptVisibleTraceTracker();
-      let markdownBuffer = new ChatGptMarkdownBuffer();
+      const deferDomOutput = wireShadow.isAttached() && !turn.captureLunaCheckpoint;
+      let markdownBuffer = new ChatGptMarkdownBuffer(undefined, undefined, deferDomOutput);
       let domCommitted = "";
       let publishedAnswer = "";
       let answerSource: "wire" | "dom" | undefined;
@@ -5637,6 +5645,8 @@ export class ChatGptBrowserWorker {
               }
               : undefined,
             continuationCommentary,
+            undefined,
+            () => wireShadow.acceptSubmittedRequest(),
           ),
         );
         responseTurn = await this.waitForNewAssistantTurn(
@@ -5662,7 +5672,7 @@ export class ChatGptBrowserWorker {
         );
         submissionBaseline = continuationBaseline;
         visibleTrace = new ChatGptVisibleTraceTracker();
-        markdownBuffer = new ChatGptMarkdownBuffer();
+        markdownBuffer = new ChatGptMarkdownBuffer(undefined, undefined, deferDomOutput);
         domCommitted = "";
         domHealthTracker = new ChatGptTurnDomHealthTracker();
         responseDomCache.key = undefined;

@@ -29,7 +29,7 @@ import { startGateway } from "./gateway";
 import { startServer } from "./server";
 import { assertServiceIdle, cancelActiveTurns, getGatewayServiceStatus, getServiceStatus, installGatewayService, installService, interruptActiveTurn, restartService, startGatewayService, startService, stopGatewayService, stopService, uninstallGatewayService, uninstallService, waitForBackendReady, waitForGatewayReady } from "./service";
 import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions } from "./setup";
-import { installRuntimeKeyBytes, managedRuntimeKeyPath, readerMcpCommand, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
+import { inspectTunnelReadiness, installRuntimeKeyBytes, managedRuntimeKeyPath, readerMcpCommand, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { buildProvenance, describeBuild } from "./build-provenance";
 import { formatWireReplay, readWireCapture } from "./adapters/chatgpt-web/wire/replay";
@@ -715,10 +715,11 @@ async function tunnelCommand(args: string[]): Promise<void> {
   else if (action !== "status") throw new Error(`Unknown tunnel action: ${action}`);
   const status = action === "start" || action === "restart"
     ? await waitForTunnelReady(config)
-    : tunnelStatus(config);
+    : action === "stop" ? tunnelStatus(config) : await inspectTunnelReadiness(config);
   const service = getTunnelServiceStatus();
   stdout.write(`${JSON.stringify({ service, runtime: status }, null, 2)}\n`);
-  if (action !== "stop" && (!service.running || !status.ok)) process.exitCode = 1;
+  // Backend Host owns the runtime without an independent tunnel LaunchAgent.
+  if (action !== "stop" && !status.ok) process.exitCode = 1;
 }
 
 async function openCommand(args: string[]): Promise<void> {

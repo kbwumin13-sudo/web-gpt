@@ -36,6 +36,25 @@ const tempRoot = join(tmpdir(), `codex-chatgpt-web-harness-${process.pid}-${Date
 mkdirSync(tempRoot, { recursive: true });
 afterAll(() => rmSync(tempRoot, { recursive: true, force: true }));
 
+test.each([true, false])("unpublished DOM blocks accept citation hydration while retaining a virtualized prefix (ranges=%s)", ranges => {
+  const buffer = new ChatGptMarkdownBuffer(undefined, 100, true);
+  const segment = (start: number, text: string, html = `<p>${text}</p>`) => ({
+    key: `${start}:p`, tag: "p", ...(ranges ? { sourceStart: start, sourceEnd: start + 150 } : {}), html, text, streamable: true,
+  });
+  const prefix = segment(0, "Retained prefix");
+  const initial = segment(200, "a".repeat(135));
+  expect(buffer.observe([prefix, initial], 0)).toBe("");
+  expect(buffer.observe([prefix, initial], 100)).toBe("");
+  const hydrated = segment(200, "a".repeat(131));
+  expect(buffer.observe([hydrated], 200)).toBe("");
+  // Link hydration can change HTML even when the rendered text stays identical.
+  const linked = segment(200, hydrated.text, `<p><a href="https://example.com/">${hydrated.text}</a></p>`);
+  expect(buffer.observe([linked], 300)).toBe("");
+  const final = buffer.finish();
+  expect(final.markdown).toBe(`Retained prefix\n\n[${hydrated.text}](https://example.com/)`);
+  expect(final.delta).toBe(final.markdown);
+});
+
 test("current-turn MCP progress tracks active calls without claiming completion", async () => {
   const progress = new ChatGptExternalTurnProgress();
   expect(chatGptExternalProgressIsLive(progress.snapshot(), 1_000, 60_000)).toBeFalse();

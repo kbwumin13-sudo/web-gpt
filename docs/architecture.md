@@ -115,6 +115,12 @@ includes the persistent `data-turn-id-container` wrappers of virtualized history
 messages therefore cannot count as a new submission or another user's turn. Missing or duplicate
 logical identities fail explicitly; accepted messages are never resent to repair their DOM.
 
+A delayed page can also confirm submission through the network: exactly one conversation POST
+opened after the authorized Send must receive a successful server acknowledgement echoing its
+user message ID. The observer retains only request message IDs for this binding. While final DOM
+text is withheld in favor of the network projection, citation hydration may revise cached blocks;
+text already published to Codex remains append-only.
+
 Automatic production sign-in uses the backend-managed Chrome profile and persists only its validated
 storage state. Manual/DEV sign-in uses the persistent Electron partition; ChatGPT login pages and
 allowed identity-provider popups are adopted into a temporary `WebContentsView` inside the launcher.
@@ -340,8 +346,9 @@ observations from another execution or a retired page, tracks outstanding tool c
 final only after the broker confirms its completion fence. The broker still owns the tool capability,
 real tool queue and atomic activity leases. The Launcher helper reports observations and release
 acknowledgements; it does not own a second completion policy.
-The Runtime emits factual commentary at each authorized local tool batch and after its results
-return, so progress remains visible even when the Web model supplies no commentary text.
+Local tool progress reaches Codex as its native tool items, which Codex renders with their own
+running and completed states and groups when adjacent. The Runtime adds no commentary of its own
+around a tool batch; commentary between calls is the Web model's, relayed in order.
 
 Before an automatic Send, the Runtime durably records its execution intent and acknowledges the
 helper only after that write succeeds. A crash with an intent but no recorded final is an unknown

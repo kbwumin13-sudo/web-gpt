@@ -6,6 +6,7 @@ import { managedProfileIsVerified } from "../src/browser-login";
 import { TurnResultJournal } from "../src/adapters/chatgpt-web/turn-result-journal";
 import { backendStartupGatePath, getGatewayServiceStatus, getServiceStatus, negotiateDrain, releaseBackendStartupGate, startService, stopService, waitForBackendReady, writeBackendStartupGate, type DrainLease } from "../src/service";
 import { VERSION } from "../src/version";
+import { installTunnelClient } from "../src/tunnel";
 
 const require = createRequire(import.meta.url);
 const { ensurePackagedRuntime, validateRuntimeBundle } = require("../launcher/electron/runtime-install.cjs") as {
@@ -138,6 +139,9 @@ async function main(): Promise<void> {
   let gateWritten = false;
   let candidateWasReleased = false;
   let candidateMayHaveStarted = false;
+  let previousTunnelBinary: Buffer | undefined;
+  let previousTunnelManifest: Buffer | undefined;
+  let tunnelUpgraded = false;
   let candidateBundleId: string | undefined;
   let next: AppConfig = current;
   let oldDrain: DrainLease | undefined;
@@ -169,6 +173,10 @@ async function main(): Promise<void> {
     if (checkOnly) {
       process.stdout.write(`LOCAL_CANDIDATE_PREFLIGHT_OK ${VERSION} ${manifest.bundleId}\n`);
       return;
+    }
+    if (current.tunnel) {
+      previousTunnelBinary = readFileSync(current.tunnel.binaryPath);
+      previousTunnelManifest = readFileSync(join(dirname(current.tunnel.binaryPath), "tunnel-client-manifest.json"));
     }
     const appRunning = Bun.spawnSync(["pgrep", "-x", "Codex Web GPT"], { stdout: "pipe", stderr: "pipe" });
     if (appRunning.exitCode === 0) throw new Error("Quit the Settings app before updating it");
@@ -232,6 +240,12 @@ async function main(): Promise<void> {
     candidateMayHaveStarted = true;
     await stopService(current);
     oldDrain = undefined;
+    // The old client must stop its owned runtime before replacement. New clients reject
+    // legacy live-process records without stable identity rather than signal a bare PID.
+    if (current.tunnel) {
+      await installTunnelClient();
+      tunnelUpgraded = true;
+    }
     renameSync(appPath, oldAppPath);
     try { renameSync(stagedAppPath, appPath); } catch (error) { renameSync(oldAppPath, appPath); throw error; }
     appSwapped = true;
@@ -285,6 +299,13 @@ async function main(): Promise<void> {
           rollbackErrors.push("candidate send intents changed or journal became invalid after drain; downgrade denied");
         }
         if (rollbackErrors.length === 0) {
+          try {
+            if (tunnelUpgraded && current.tunnel && previousTunnelBinary && previousTunnelManifest) {
+              atomicWriteFile(current.tunnel.binaryPath, previousTunnelBinary, { mode: 0o700 });
+              atomicWriteFile(join(dirname(current.tunnel.binaryPath), "tunnel-client-manifest.json"), previousTunnelManifest);
+              tunnelUpgraded = false;
+            }
+          } catch (cause) { rollbackErrors.push(`restore tunnel binary: ${String(cause)}`); }
           try { if (linkSwapped && oldLink) swapLink(stableLink, oldLink); } catch (cause) { rollbackErrors.push(`restore runtime link: ${String(cause)}`); }
           try { if (configChanged && oldConfigBytes) atomicWriteFile(getConfigPath(), oldConfigBytes.toString("utf8")); } catch (cause) { rollbackErrors.push(`restore config: ${String(cause)}`); }
           try {

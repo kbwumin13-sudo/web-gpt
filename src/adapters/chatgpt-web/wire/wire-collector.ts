@@ -33,6 +33,8 @@ export interface ChatGptWireStream {
   truncated: boolean;
   /** Total observed length, including anything past the cap. */
   observedLength: number;
+  /** User message identities extracted from the request, without its prompt or credentials. */
+  inputMessageIds?: string[];
 }
 
 export interface ChatGptWireCollectorOptions {
@@ -92,7 +94,7 @@ export class ChatGptWireCollector {
       return;
     }
     if (record.kind === "request") {
-      this.open(record.id, record.method, record.url, record.at);
+      this.open(record.id, record.method, record.url, record.at, record.inputMessageIds);
       return;
     }
     const stream = this.streams.get(record.id);
@@ -137,7 +139,7 @@ export class ChatGptWireCollector {
     return { ...this.counters };
   }
 
-  private open(id: string, method: string, url: string, at: number): void {
+  private open(id: string, method: string, url: string, at: number, inputMessageIds?: string[]): void {
     if (this.streams.has(id)) {
       this.counters.unmatchedRecords += 1;
       return;
@@ -154,6 +156,7 @@ export class ChatGptWireCollector {
       raw: "",
       truncated: false,
       observedLength: 0,
+      ...(inputMessageIds?.length ? { inputMessageIds: [...inputMessageIds] } : {}),
       ...(framing === "sse" ? { decoder: new SseFrameDecoder() } : {}),
     });
     this.order.push(id);

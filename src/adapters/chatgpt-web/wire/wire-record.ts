@@ -6,7 +6,7 @@
  * same code a live turn runs.
  */
 export type ChatGptWireRecord =
-  | { kind: "request"; id: string; method: string; url: string; at: number }
+  | { kind: "request"; id: string; method: string; url: string; at: number; inputMessageIds?: string[] }
   | { kind: "response"; id: string; status: number; at: number }
   | { kind: "chunk"; id: string; text: string; at: number }
   | { kind: "end"; id: string; at: number }

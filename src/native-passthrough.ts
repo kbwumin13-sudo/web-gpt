@@ -267,8 +267,9 @@ export async function forwardNativeCodexRequest(
     })}`);
   }
   const responseHeaders = endToEndHeaders(upstream.headers);
-  // fetch exposes decompressed image JSON; retaining gzip/br would make Codex decode it twice.
-  if (imageRequest) responseHeaders.delete("content-encoding");
+  // fetch decompresses every upstream response, including search JSON and Responses streams.
+  // Forwarding its encoding header would make the next HTTP client decode the body twice.
+  responseHeaders.delete("content-encoding");
   const isEventStream = (upstream.headers.get("content-type") ?? "")
     .toLowerCase()
     .includes("text/event-stream");

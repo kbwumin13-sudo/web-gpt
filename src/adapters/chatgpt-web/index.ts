@@ -1660,13 +1660,6 @@ export function createChatGptWebAdapter(
                   session.runtime.externalProgress.recordToolResult();
                   session.markResultDelivered(message.toolCallId);
                 }
-                if (session.runtime.submission?.phase === "accepted") {
-                  emitRoundBatch(buffer => {
-                    buffer({ type: "assistant_boundary" });
-                    buffer({ type: "text_delta", phase: "commentary",
-                      text: `${results.length} local tool${results.length === 1 ? "" : "s"} completed.` });
-                  });
-                }
               }
             } else if (session.outstanding().length > 0) {
               throw new Error("Read-only ChatGPT Web runtime cannot own local tool calls");
@@ -1824,13 +1817,9 @@ export function createChatGptWebAdapter(
                   return;
                 }
                 validateBatchTools(parsed, next.requests);
-                if (session.runtime.submission?.phase === "accepted") {
-                  emitRoundBatch(buffer => {
-                    buffer({ type: "assistant_boundary" });
-                    buffer({ type: "text_delta", phase: "commentary",
-                      text: `Running ${next.requests.length} local tool${next.requests.length === 1 ? "" : "s"}.` });
-                  });
-                }
+                // Codex renders the tool items themselves with running and completed states, and
+                // groups adjacent ones. Runtime-authored commentary around a batch would split
+                // every call into its own group, so progress stays in the native items.
                 session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
                 emitRoundBatch(buffer => emitToolBatch(
                   next.requests,

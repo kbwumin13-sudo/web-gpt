@@ -1,14 +1,47 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 import { tunnelRuntimeCheck } from "../src/doctor";
 import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError, tunnelHealthFileFromInventory, tunnelStopReachedTerminalState } from "../src/tunnel";
 import { macOsSystemProxyEnvironment } from "../src/process";
 
 test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
-  expect(TUNNEL_VERSION).toBe("0.0.12");
-  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
+  expect(TUNNEL_VERSION).toBe("0.0.15");
+  expect(tunnelClientInstallAction("0.0.15")).toBe("reuse");
+  expect(tunnelClientInstallAction("0.0.12")).toBe("upgrade");
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
+
+describe("live tunnel readiness evidence", () => {
+  for (const scenario of ["never", "stale", "missing", "future", "fresh", "recovery"] as const) {
+    test(`startup uses current upstream poll evidence: ${scenario}`, async () => {
+      // Each child isolates the CLI mock from the other suites while exercising the real
+      // waitForTunnelReady path and its HTTP requests, including the formerly false-ready case.
+      const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "fixtures/tunnel-readiness-probe.ts"), scenario], {
+        stdout: "pipe", stderr: "pipe",
+      });
+      const [output, errors, exitCode] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      expect(errors).toBe("");
+      expect(exitCode).toBe(0);
+      const result = JSON.parse(output) as {
+        status: { ok: boolean; processRunning: boolean; controlPlane?: { state: string } };
+        requests: string[];
+        metricsReads: number;
+        initialPollTimeout: string;
+      };
+      expect(result.status.processRunning).toBeTrue();
+      expect(result.initialPollTimeout).toBe("1s");
+      expect(result.requests).toContain("/metrics");
+      expect(result.status.ok).toBe(scenario === "fresh" || scenario === "recovery");
+      expect(result.status.controlPlane?.state).toBe(
+        scenario === "fresh" || scenario === "recovery" ? "healthy" : scenario === "stale" ? "unhealthy" : "unknown",
+      );
+      if (scenario === "recovery") expect(result.metricsReads).toBeGreaterThan(1);
+    });
+  }
 });
 
 test("CLI tunnel startup derives the active macOS HTTPS proxy without overriding explicit settings", () => {
@@ -180,6 +213,8 @@ test("a failing control-plane poll is not reported as a healthy tunnel", () => {
   expect(status.controlPlane).toEqual({ state: "unhealthy", reason: "poll timed out; backing off" });
   expect(status.detail).toContain("control_plane_poll=unhealthy");
   expect(tunnelRuntimeCheck(status).status).toBe("error");
+  // A still-running tunnel with failed polls is not an intentionally stopped idle runtime.
+  expect(tunnelRuntimeCheck(status, false).status).toBe("error");
 });
 
 test("a tunnel that is down because the backend is idle is not reported as a failure", () => {

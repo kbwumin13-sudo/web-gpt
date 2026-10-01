@@ -2,7 +2,8 @@
 set -eu
 
 REPOSITORY="${CODEX_CHATGPT_WEB_REPOSITORY:-kbwumin13-sudo/web-gpt}"
-VERSION="${CODEX_CHATGPT_WEB_VERSION:-5.0.7-local.73}"
+VERSION="${CODEX_CHATGPT_WEB_VERSION:-2.30.0}"
+RELEASE_TAG="${CODEX_CHATGPT_WEB_RELEASE_TAG:-v2.30.0}"
 BIN_DIR="${CODEX_CHATGPT_WEB_BIN_DIR:-$HOME/.local/bin}"
 LIB_DIR="${CODEX_CHATGPT_WEB_LIB_DIR:-$HOME/.local/lib/codex-chatgpt-web}"
 DOC_DIR="${CODEX_CHATGPT_WEB_DOC_DIR:-$HOME/.local/share/doc/codex-chatgpt-web}"
@@ -19,7 +20,7 @@ case "$(uname -m)" in
 esac
 
 ASSET="codex-chatgpt-web-darwin-$ARCH.tar.gz"
-BASE_URL="https://github.com/$REPOSITORY/releases/download/v$VERSION"
+BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-chatgpt-web.XXXXXX")"
 STAGE_DIR="$LIB_DIR/.stage-$VERSION-$$"
 TARGET_DIR="$LIB_DIR/$VERSION"

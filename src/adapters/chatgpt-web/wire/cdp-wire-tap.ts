@@ -47,7 +47,7 @@ export interface WireTapSession {
   on(event: string, listener: (params: never) => void): unknown;
 }
 
-interface RequestWillBeSent { requestId: string; type?: string; request: { url: string; method: string } }
+interface RequestWillBeSent { requestId: string; type?: string; request: { url: string; method: string; postData?: string } }
 interface ResponseReceived { requestId: string; response: { status: number } }
 interface DataReceived { requestId: string; data?: string }
 interface LoadingFinished { requestId: string }
@@ -80,6 +80,18 @@ function observedPath(url: string): boolean {
 
 function describe(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, MAX_ERROR_MESSAGE_CHARS);
+}
+
+function requestInputMessageIds(postData?: string): string[] | undefined {
+  if (!postData) return undefined;
+  try {
+    const body = JSON.parse(postData);
+    if (!Array.isArray(body?.messages)) return undefined;
+    const messages: Array<{ id?: unknown; author?: { role?: unknown } } | null> = body.messages;
+    const ids = messages.filter(message => message?.author?.role === "user").map(message => message?.id);
+    return ids.length > 0 && ids.every((id: unknown) => typeof id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(id))
+      ? ids as string[] : undefined;
+  } catch { return undefined; }
 }
 
 /** Turns DevTools network events into wire records. Holds no browser object, only what it was handed. */
@@ -129,7 +141,10 @@ export class ChatGptCdpWireTranslator {
       responded: false,
       streaming: false,
     });
-    this.emit({ kind: "request", id: event.requestId, method: event.request.method, url: event.request.url, at: this.now() });
+    const inputMessageIds = event.request.method === "POST" ? requestInputMessageIds(event.request.postData) : undefined;
+    this.emit({ kind: "request", id: event.requestId, method: event.request.method, url: event.request.url, at: this.now(),
+      ...(inputMessageIds ? { inputMessageIds } : {}),
+    });
   }
 
   responseReceived(event: ResponseReceived): void {
@@ -282,7 +297,7 @@ export async function attachChatGptWireTap(
       tap.current.record(record);
     });
     translator.listen(protocol);
-    await session.send("Network.enable");
+    await session.send("Network.enable", { maxPostDataSize: 2 * 1024 * 1024 });
     taps.set(page, tap);
     return { attached: true, overflowed: () => tap.overflowed };
   } catch (error) {

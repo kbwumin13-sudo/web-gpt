@@ -11,6 +11,21 @@ import type { ChatGptWireRecord } from "../src/adapters/chatgpt-web/wire/wire-re
 
 const b64 = (text: string): string => Buffer.from(text, "utf8").toString("base64");
 
+test("request attribution retains only valid user message ids, never prompt or headers", () => {
+  const { session, records } = harness();
+  session.fire("Network.requestWillBeSent", {
+    requestId: "current", type: "Fetch", request: {
+      url: "https://chatgpt.com/backend-api/f/conversation", method: "POST",
+      postData: JSON.stringify({ messages: [
+        { id: "assistant-id", author: { role: "assistant" }, content: { parts: ["PRIVATE"] } },
+        { id: "user-input-123", author: { role: "user" }, content: { parts: ["PRIVATE"] } },
+      ] }), headers: { authorization: "PRIVATE" },
+    },
+  });
+  expect(records[0]).toMatchObject({ kind: "request", inputMessageIds: ["user-input-123"] });
+  expect(JSON.stringify(records)).not.toContain("PRIVATE");
+});
+
 /** Only reads: the observer must never run anything in, or inject anything into, the page. */
 const READ_ONLY_METHODS = new Set(["Network.enable", "Network.streamResourceContent", "Network.getResponseBody"]);
 

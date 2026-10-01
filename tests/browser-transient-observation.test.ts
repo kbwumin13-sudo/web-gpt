@@ -7,6 +7,18 @@ function worker() {
 const hidden = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
 const page = { isClosed: () => false, locator: () => hidden };
 
+test("attributed network acceptance releases the send stage while the DOM is empty", async () => {
+  const w = worker();
+  let probes = 0;
+  w.currentSubmissionEvidence = async () => { probes++; return undefined; };
+  w.waitForTurnDomOrExternalProgress = async () => { throw new Error("send would time out waiting for DOM"); };
+  const evidence = await w.waitForSubmissionAcceptedWithRecovery(
+    page, {}, undefined, undefined, 0, undefined, undefined, undefined, undefined, () => true,
+  );
+  expect(evidence).toBe("network_input_message");
+  expect(probes).toBe(0);
+});
+
 test("managed browser retains an accepted turn across one transient DOM timeout", async () => {
   const w = worker();
   let probes = 0;

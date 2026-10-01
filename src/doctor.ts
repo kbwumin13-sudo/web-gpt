@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath, managedProfileIsVerified } from "./browser-login";
 import { getGatewayServiceStatus, getServiceStatus } from "./service";
-import { tunnelStatus, type TunnelRuntimeStatus } from "./tunnel";
+import { inspectTunnelReadiness, type TunnelRuntimeStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
   inspectLauncherBrowserHost,
@@ -77,7 +77,7 @@ function launcherOwnershipError(config: AppConfig, health: Record<string, unknow
  */
 export function tunnelRuntimeCheck(runtime: TunnelRuntimeStatus, backendReady?: boolean): DoctorCheck {
   if (!runtime.ok) {
-    if (backendReady === false) {
+    if (backendReady === false && !runtime.processRunning) {
       return {
         id: "tunnel-runtime",
         status: "warning",
@@ -364,7 +364,7 @@ export async function runDoctor(): Promise<DoctorReport> {
           }
         : { id: "tunnel-service", status: "ok", message: "Backend Host owns the tunnel runtime" });
     }
-    const runtime = tunnelStatus(config);
+    const runtime = await inspectTunnelReadiness(config);
     checks.push(tunnelRuntimeCheck(runtime, proxy.backendReady));
     checks.push({
       id: "connector",

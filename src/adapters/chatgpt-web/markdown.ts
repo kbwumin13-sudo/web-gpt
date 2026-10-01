@@ -246,6 +246,8 @@ interface CommittedChatGptMarkdownSegment {
   text: string;
   sourceStart?: number;
   sourceEnd?: number;
+  html: string;
+  group?: string;
 }
 
 export class ChatGptMarkdownConsistencyError extends Error {
@@ -284,6 +286,9 @@ export class ChatGptMarkdownBuffer {
   constructor(
     private readonly transform: (markdown: string) => string = markdown => markdown,
     private readonly stabilityMs = 750,
+    // A wire-backed turn holds DOM output until completion. Its cached blocks may still hydrate;
+    // only externally published append-only text must reject those revisions.
+    private readonly deferOutput = false,
   ) {
     if (!Number.isFinite(stabilityMs) || stabilityMs < 0) {
       throw new Error("ChatGPT Markdown stability window must be a non-negative finite number");
@@ -340,7 +345,7 @@ export class ChatGptMarkdownBuffer {
       committedCount += 1;
     }
     this.latest = this.latest.slice(committedCount);
-    return delta;
+    return this.deferOutput ? "" : delta;
   }
 
   finish(): { markdown: string; delta: string } {
@@ -352,7 +357,7 @@ export class ChatGptMarkdownBuffer {
     }
     this.candidates.clear();
     this.latest = [];
-    return { markdown: this.markdown, delta };
+    return { markdown: this.markdown, delta: this.deferOutput ? this.markdown : delta };
   }
 
   currentSnapshotIsConsistent(): boolean {
@@ -371,6 +376,8 @@ export class ChatGptMarkdownBuffer {
     const lastCommittedEnd = lastRangedCommitted?.sourceEnd;
     let highestCommittedIndex = -1;
     let sawPending = false;
+    let committedChanged = false;
+    const revisedCommitted = new Map<number, CommittedChatGptMarkdownSegment>();
     let previousSourceStart: number | undefined;
 
     for (const segment of segments) {
@@ -385,12 +392,17 @@ export class ChatGptMarkdownBuffer {
       const committedIndex = this.committedIndex(segment, highestCommittedIndex, sawPending);
       if (committedIndex !== undefined) {
         const committed = this.committed[committedIndex]!;
-        if (sawPending || committedIndex < highestCommittedIndex || committed.text !== segment.text) {
+        if (sawPending || committedIndex < highestCommittedIndex
+          || (!this.deferOutput && committed.text !== segment.text)) {
           return this.changedCommittedBlockError(
             sawPending || committedIndex < highestCommittedIndex ? "block_order_changed" : "text_changed",
             segment,
             committed,
           );
+        }
+        if (this.deferOutput) {
+          committedChanged ||= committed.html !== segment.html || committed.group !== segment.group;
+          revisedCommitted.set(committedIndex, this.committedSegment(segment));
         }
         highestCommittedIndex = committedIndex;
         continue;
@@ -415,6 +427,12 @@ export class ChatGptMarkdownBuffer {
       pending.push(segment);
     }
 
+    for (const [index, segment] of revisedCommitted) this.committed[index] = segment;
+    if (committedChanged) {
+      this.markdown = "";
+      this.lastGroup = undefined;
+      for (const segment of this.committed) this.commit(segment);
+    }
     return pending;
   }
 
@@ -472,6 +490,8 @@ export class ChatGptMarkdownBuffer {
       key: segment.key,
       ...(segment.tag ? { tag: segment.tag } : {}),
       text: segment.text,
+      html: segment.html,
+      ...(segment.group ? { group: segment.group } : {}),
       ...(segment.sourceStart !== undefined ? { sourceStart: segment.sourceStart } : {}),
       ...(segment.sourceEnd !== undefined ? { sourceEnd: segment.sourceEnd } : {}),
     };
@@ -496,7 +516,7 @@ export class ChatGptMarkdownBuffer {
     );
   }
 
-  private commit(segment: ChatGptMarkdownSegment): string {
+  private commit(segment: Pick<ChatGptMarkdownSegment, "html" | "group">): string {
     const block = this.transform(chatGptHtmlToMarkdown(segment.html));
     if (!block) return "";
     const separator = this.markdown
